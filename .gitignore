@@ -1,0 +1,7 @@
+build/
+build-*/
+.zig-cache/
+zig-out/
+*.o
+*.a
+.DS_Store
