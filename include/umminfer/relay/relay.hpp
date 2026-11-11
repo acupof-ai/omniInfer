@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Transfer relays with bounded credits: host shared memory always, device IPC
-// when the build sets OMNIINFER_WITH_CUDA.
+// when the build sets UMMINFER_WITH_CUDA.
 //
 // nccl, nixl and mooncake are not available in this build.
 #pragma once
@@ -18,10 +18,10 @@
 #include <string>
 #include <vector>
 
-#include "omniinfer/proto/messages.hpp"
-#include "omniinfer/proto/wire.hpp"
+#include "umminfer/proto/messages.hpp"
+#include "umminfer/proto/wire.hpp"
 
-namespace omniinfer {
+namespace umminfer {
 
 // One in-flight transfer. Completion means the receiver consumed the block.
 class RelayOperation {
@@ -97,4 +97,4 @@ std::unique_ptr<Relay> create_relay(const std::string& type,
 // Removes a POSIX shm name; exposed for the receiver side and for tests.
 void shm_unlink_quiet(const std::string& name);
 
-}  // namespace omniinfer
+}  // namespace umminfer

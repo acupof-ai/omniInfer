@@ -26,18 +26,18 @@
 #include <string>
 #include <vector>
 
-#include "omniinfer/relay/relay.hpp"
-#include "omniinfer/proto/wire.hpp"
+#include "umminfer/relay/relay.hpp"
+#include "umminfer/proto/wire.hpp"
 
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
 #include <cuda_runtime_api.h>
 #endif
 
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
 #include <cuda_runtime.h>
 #endif
 
-using namespace omniinfer;
+using namespace umminfer;
 
 namespace {
 
@@ -230,7 +230,7 @@ bool wait_bounded(pid_t pid, int seconds) {
 }
 
 void print_hardware(bool direct_available) {
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
   int devices = 0;
   if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
     std::cout << "# gpu_count=" << devices << " (two devices required)\n";
@@ -258,17 +258,17 @@ void print_hardware(bool direct_available) {
   (void)direct_available;
 #else
   (void)direct_available;
-  std::cout << "# built without OMNIINFER_WITH_CUDA\n";
+  std::cout << "# built without UMMINFER_WITH_CUDA\n";
 #endif
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-#if !defined(OMNIINFER_WITH_CUDA)
+#if !defined(UMMINFER_WITH_CUDA)
   (void)argc;
   (void)argv;
-  std::cerr << "cuda_bench: built without OMNIINFER_WITH_CUDA\n";
+  std::cerr << "cuda_bench: built without UMMINFER_WITH_CUDA\n";
   return 2;
 #else
   ::signal(SIGPIPE, SIG_IGN);
@@ -291,8 +291,8 @@ int main(int argc, char** argv) {
   std::cout << "# build=debug\n";
 #endif
   std::cout << "# warmup=" << kWarmup << " measured=" << kMeasured << "\n";
-  const char* git = std::getenv("OMNIINFER_BENCH_GIT");
-  const char* cmd = std::getenv("OMNIINFER_BENCH_CMD");
+  const char* git = std::getenv("UMMINFER_BENCH_GIT");
+  const char* cmd = std::getenv("UMMINFER_BENCH_CMD");
   std::cout << "# git=" << (git ? git : "unknown") << "\n";
   std::cout << "# cmd=" << (cmd ? cmd : "cuda_bench") << "\n";
   print_hardware(true);

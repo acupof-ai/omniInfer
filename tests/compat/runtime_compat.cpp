@@ -10,13 +10,13 @@
 #include <unistd.h>
 #include <vector>
 
-#include "omniinfer/comm/comm.hpp"
-#include "omniinfer/pipeline/pipeline.hpp"
-#include "omniinfer/relay/relay.hpp"
-#include "omniinfer/scheduling/simple_scheduler.hpp"
-#include "omniinfer/serve/openai_api.hpp"
+#include "umminfer/comm/comm.hpp"
+#include "umminfer/pipeline/pipeline.hpp"
+#include "umminfer/relay/relay.hpp"
+#include "umminfer/scheduling/simple_scheduler.hpp"
+#include "umminfer/serve/openai_api.hpp"
 
-using namespace omniinfer;
+using namespace umminfer;
 
 namespace {
 

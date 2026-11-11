@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/serve/openai_api.hpp"
+#include "umminfer/serve/openai_api.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -14,7 +14,7 @@
 #include <mutex>
 #include <thread>
 
-namespace omniinfer {
+namespace umminfer {
 namespace {
 
 using json = nlohmann::json;
@@ -160,7 +160,7 @@ class OpenAIApi::Impl {
       json body = {{"object", "list"},
                    {"data", {{{"id", config_.served_model_name},
                               {"object", "model"},
-                              {"owned_by", "omniInfer"}}}}};
+                              {"owned_by", "ummInfer"}}}}};
       res.set_content(body.dump(), "application/json");
     });
 
@@ -494,4 +494,4 @@ bool OpenAIApi::listen() { return impl_->listen(); }
 void OpenAIApi::stop() { impl_->stop(); }
 int OpenAIApi::bound_port() const { return impl_->bound_port(); }
 
-}  // namespace omniinfer
+}  // namespace umminfer

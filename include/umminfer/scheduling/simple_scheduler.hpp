@@ -18,9 +18,9 @@
 #include <thread>
 #include <vector>
 
-#include "omniinfer/proto/wire.hpp"
+#include "umminfer/proto/wire.hpp"
 
-namespace omniinfer {
+namespace umminfer {
 
 using IncomingMessageType = std::string;  // new_request, abort, stop, wakeup, ...
 
@@ -140,4 +140,4 @@ class SimpleScheduler {
   std::atomic<bool> running_{false};
 };
 
-}  // namespace omniinfer
+}  // namespace umminfer

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HTTP and process smoke checks for a built omni-infer binary."""
+"""HTTP and process smoke checks for a built umm-infer binary."""
 
 import concurrent.futures
 import http.client
@@ -270,7 +270,7 @@ def check_cli_errors(binary, root):
 
 def main():
     if len(sys.argv) != 2:
-        raise SystemExit("usage: http_smoke.py /path/to/omni-infer")
+        raise SystemExit("usage: http_smoke.py /path/to/umm-infer")
     binary = os.path.abspath(sys.argv[1])
     with tempfile.TemporaryDirectory(prefix="omni-http-") as root:
         with open(os.path.join(root, "processes.log"), "w") as log:

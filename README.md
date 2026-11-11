@@ -1,8 +1,8 @@
-# omniInfer
+# ummInfer
 
-omniInfer is a C++20 pipeline runtime with MessagePack control messages,
-ZeroMQ transport, POSIX shared-memory payload relay, and an OpenAI-compatible
-HTTP API.
+ummInfer is an inference runtime for **Unified Multimodal Models (UMM)**.
+It provides a C++20 pipeline with MessagePack control messages, ZeroMQ
+transport, POSIX shared-memory payload relay, and an OpenAI-compatible HTTP API.
 
 ## Implemented
 
@@ -35,7 +35,7 @@ brew install zig libzmq msgpack cpp-httplib nlohmann-json
 ## Build and test
 
 Use `-Ddeps-prefix` when dependencies are outside the system include and
-library paths. The output is `zig-out/bin/omni-infer`.
+library paths. The output is `zig-out/bin/umm-infer`.
 
 ```sh
 zig build -Doptimize=ReleaseFast -Ddeps-prefix=/opt/homebrew
@@ -77,7 +77,7 @@ python3 tests/cuda_sanitize.py --ipc zig-out/bin/cuda_ipc_test \
 Start the in-process demo:
 
 ```sh
-./zig-out/bin/omni-infer serve --demo --port 30000 --ipc-dir /tmp/omni-demo
+./zig-out/bin/umm-infer serve --demo --port 30000 --ipc-dir /tmp/omni-demo
 
 curl -s localhost:30000/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -87,15 +87,15 @@ curl -s localhost:30000/v1/chat/completions \
 Start a coordinator and two external stages in separate terminals:
 
 ```sh
-./zig-out/bin/omni-infer serve --port 30000 --entry entry \
+./zig-out/bin/umm-infer serve --port 30000 --entry entry \
   --entry-endpoint ipc:///tmp/omni/entry \
   --completion ipc:///tmp/omni/completion --abort ipc:///tmp/omni/abort
 
-./zig-out/bin/omni-infer stage --name entry --recv ipc:///tmp/omni/entry \
+./zig-out/bin/umm-infer stage --name entry --recv ipc:///tmp/omni/entry \
   --coordinator ipc:///tmp/omni/completion --abort ipc:///tmp/omni/abort \
   --next worker=ipc:///tmp/omni/worker
 
-./zig-out/bin/omni-infer stage --name worker --recv ipc:///tmp/omni/worker \
+./zig-out/bin/umm-infer stage --name worker --recv ipc:///tmp/omni/worker \
   --coordinator ipc:///tmp/omni/completion --abort ipc:///tmp/omni/abort \
   --peer entry=ipc:///tmp/omni/entry
 ```
@@ -109,12 +109,12 @@ Two stages on one host can move payloads through CUDA IPC. Declare each stage's
 device, and give the sender the device of the stage it sends to:
 
 ```sh
-./zig-out/bin/omni-infer stage --name entry --gpu-id 0 \
+./zig-out/bin/umm-infer stage --name entry --gpu-id 0 \
   --recv ipc:///tmp/omni/entry --coordinator ipc:///tmp/omni/completion \
   --abort ipc:///tmp/omni/abort --next worker=ipc:///tmp/omni/worker \
   --peer worker=ipc:///tmp/omni/worker --peer-gpu worker=1
 
-./zig-out/bin/omni-infer stage --name worker --gpu-id 1 \
+./zig-out/bin/umm-infer stage --name worker --gpu-id 1 \
   --recv ipc:///tmp/omni/worker --coordinator ipc:///tmp/omni/completion \
   --abort ipc:///tmp/omni/abort --peer entry=ipc:///tmp/omni/entry
 ```
@@ -124,7 +124,7 @@ device, and give the sender the device of the stage it sends to:
 - The sender checks peer access in both directions before selecting CUDA IPC.
 - Two stages on the same device use CUDA IPC without peer access.
 - If peer access is unavailable, the payload exceeds the slot limit, or
-  `OMNIINFER_DISABLE_CUDA_IPC=1` is set, the edge uses POSIX shared memory.
+  `UMMINFER_DISABLE_CUDA_IPC=1` is set, the edge uses POSIX shared memory.
   The fallback is logged once per edge.
 
 ## Compatibility and limits
@@ -159,7 +159,7 @@ create it and remove stale socket files for configured endpoints.
 
 ```text
 build.zig
-include/omniinfer/{proto,relay,comm,scheduling,pipeline,serve}
+include/umminfer/{proto,relay,comm,scheduling,pipeline,serve}
 src/{proto,relay,comm,scheduling,pipeline,serve}
 src/main.cpp
 tests/self_check.cpp

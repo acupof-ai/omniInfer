@@ -2,9 +2,9 @@
 #include <iostream>
 #include <string>
 
-#include "omniinfer/proto/messages.hpp"
+#include "umminfer/proto/messages.hpp"
 
-using namespace omniinfer;
+using namespace umminfer;
 
 namespace {
 

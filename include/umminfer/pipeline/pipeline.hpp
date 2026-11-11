@@ -18,11 +18,11 @@
 #include <thread>
 #include <vector>
 
-#include "omniinfer/comm/comm.hpp"
-#include "omniinfer/proto/messages.hpp"
-#include "omniinfer/scheduling/simple_scheduler.hpp"
+#include "umminfer/comm/comm.hpp"
+#include "umminfer/proto/messages.hpp"
+#include "umminfer/scheduling/simple_scheduler.hpp"
 
-namespace omniinfer {
+namespace umminfer {
 
 struct RequestInfo {
   std::string request_id;
@@ -159,4 +159,4 @@ class Coordinator {
   std::atomic<bool> running_{false};
 };
 
-}  // namespace omniinfer
+}  // namespace umminfer

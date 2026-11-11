@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/scheduling/simple_scheduler.hpp"
+#include "umminfer/scheduling/simple_scheduler.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <iostream>
 
-namespace omniinfer {
+namespace umminfer {
 
 SimpleScheduler::SimpleScheduler(ComputeFn compute_fn,
                                  BatchComputeFn batch_compute_fn,
@@ -284,4 +284,4 @@ void SimpleScheduler::stop() {
   if (callback) callback();
 }
 
-}  // namespace omniinfer
+}  // namespace umminfer

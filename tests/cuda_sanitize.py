@@ -13,7 +13,7 @@ test [5] deliberately opens a corrupted IPC handle. The second run keeps the
 default API checking: it must exit 99 and report cudaIpcOpenMemHandle, which
 proves the child process that opened the handle was tracked.
 
-Large stress cases stay out: this script never sets OMNIINFER_CUDA_TEST_STRESS.
+Large stress cases stay out: this script never sets UMMINFER_CUDA_TEST_STRESS.
 
 Exit codes: 0 clean, 1 problem, 2 compute-sanitizer not found.
 """
@@ -180,7 +180,7 @@ def main():
               file=sys.stderr)
         return 2
 
-    os.environ.pop("OMNIINFER_CUDA_TEST_STRESS", None)
+    os.environ.pop("UMMINFER_CUDA_TEST_STRESS", None)
     os.makedirs(args.log_dir, exist_ok=True)
     failures = []
 

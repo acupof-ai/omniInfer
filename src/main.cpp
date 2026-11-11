@@ -12,12 +12,12 @@
 #include <thread>
 #include <vector>
 
-#include "omniinfer/pipeline/pipeline.hpp"
-#include "omniinfer/serve/openai_api.hpp"
+#include "umminfer/pipeline/pipeline.hpp"
+#include "umminfer/serve/openai_api.hpp"
 
 namespace {
 
-using namespace omniinfer;
+using namespace umminfer;
 
 std::atomic<bool> g_running{true};
 
@@ -116,12 +116,12 @@ Value echo_compute(const Value& payload) {
 int usage() {
   std::cerr
       << "usage:\n"
-      << "  omni-infer serve --port 30000 [--host 0.0.0.0] [--model omni] "
+      << "  umm-infer serve --port 30000 [--host 0.0.0.0] [--model omni] "
          "[--api-key K]\n"
       << "      [--entry name --entry-endpoint ipc:///tmp/x/in] "
          "[--completion ipc:///tmp/x/done] [--abort ipc:///tmp/x/abort]\n"
       << "      [--demo]  run one in-process echo stage (development only)\n"
-      << "  omni-infer stage --name N --recv EP --coordinator EP --abort EP "
+      << "  umm-infer stage --name N --recv EP --coordinator EP --abort EP "
          "[--next name=EP ...] [--peer name=EP ...]\n"
          "      [--gpu-id N --peer-gpu name=N ...]  staged CUDA IPC\n";
   return 2;
@@ -174,7 +174,7 @@ int run_demo(const Flags& flags) {
       server_failed = true;
     }
   });
-  std::cout << "omni-infer demo serving on http://" << api_config.host << ":"
+  std::cout << "umm-infer demo serving on http://" << api_config.host << ":"
             << api.bound_port() << " (model " << api_config.model << ")" << std::endl;
   while (g_running) std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -226,7 +226,7 @@ int run_serve(const Flags& flags) {
     }
   });
 
-  std::cout << "omni-infer serving on " << api_config.host << ":" << api.bound_port()
+  std::cout << "umm-infer serving on " << api_config.host << ":" << api.bound_port()
             << std::endl;
   while (g_running) std::this_thread::sleep_for(std::chrono::milliseconds(100));
 

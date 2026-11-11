@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/relay/relay.hpp"
+#include "umminfer/relay/relay.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -14,11 +14,11 @@
 #include <map>
 #include <random>
 
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
 #include <cuda_runtime_api.h>
 #endif
 
-namespace omniinfer {
+namespace umminfer {
 namespace {
 
 std::string fresh_shm_name(const std::string& engine_id) {
@@ -29,7 +29,7 @@ std::string fresh_shm_name(const std::string& engine_id) {
   std::lock_guard<std::mutex> lock(rng_mu);
   const uint64_t tag = std::hash<std::string>{}(engine_id);
   char buf[32];
-  std::snprintf(buf, sizeof(buf), "/omni_%08x_%016llx", static_cast<uint32_t>(tag),
+  std::snprintf(buf, sizeof(buf), "/umm_%08x_%016llx", static_cast<uint32_t>(tag),
                 static_cast<unsigned long long>(rng()));
   return buf;
 }
@@ -143,7 +143,7 @@ class ShmPutOperation : public ShmOperation {
   std::atomic<bool> released_{false};
 };
 
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
 
 void cuda_check(cudaError_t rc, const char* what) {
   if (rc == cudaSuccess) return;
@@ -487,7 +487,7 @@ class CudaIpcRelay : public Relay {
   std::shared_ptr<CudaIpcShared> shared_;
 };
 
-#endif  // OMNIINFER_WITH_CUDA
+#endif  // UMMINFER_WITH_CUDA
 
 }  // namespace
 
@@ -604,7 +604,7 @@ std::unique_ptr<Relay> create_relay(const std::string& type,
                                       int_or("credits", 2));
   }
   if (type == "cuda_ipc") {
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
     auto it = config.find("engine_id");
     const std::string engine_id = it == config.end() ? "relay" : it->second.as_str();
     return std::make_unique<CudaIpcRelay>(
@@ -612,11 +612,11 @@ std::unique_ptr<Relay> create_relay(const std::string& type,
         int_or("slot_size_mb", 512));
 #else
     throw ProtocolError(
-        "cuda_ipc relay requires a build with OMNIINFER_WITH_CUDA");
+        "cuda_ipc relay requires a build with UMMINFER_WITH_CUDA");
 #endif
   }
   throw ProtocolError("Unknown relay type: '" + type +
                       "'. Available types: [shm, cuda_ipc]");
 }
 
-}  // namespace omniinfer
+}  // namespace umminfer

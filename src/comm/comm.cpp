@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/comm/comm.hpp"
+#include "umminfer/comm/comm.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -10,11 +10,11 @@
 #include <set>
 #include <thread>
 
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
 #include <cuda_runtime_api.h>
 #endif
 
-namespace omniinfer {
+namespace umminfer {
 
 void* ControlPlaneContext::ctx_ = nullptr;
 std::mutex ControlPlaneContext::mu_;
@@ -434,7 +434,7 @@ void CoordinatorControlPlane::close() {
 const Platform& Platform::current() {
   static const Platform platform = [] {
     Platform detected;
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
     int count = 0;
     if (cudaGetDeviceCount(&count) == cudaSuccess && count > 0) {
       detected.device_type = "cuda";
@@ -452,7 +452,7 @@ const Platform& Platform::current() {
 namespace {
 
 bool cuda_ipc_disabled_by_env() {
-  const char* value = std::getenv("OMNIINFER_DISABLE_CUDA_IPC");
+  const char* value = std::getenv("UMMINFER_DISABLE_CUDA_IPC");
   return value != nullptr && *value != '\0' && std::string(value) != "0";
 }
 
@@ -504,7 +504,7 @@ bool CommRouter::cuda_ipc_peer_available(const std::string& target) {
                                ? it->second[0]
                                : -1;
     warn_cuda_ipc_fallback(target, placement_gpu_id_.value_or(-1), target_gpu,
-                           "disabled by OMNIINFER_DISABLE_CUDA_IPC");
+                           "disabled by UMMINFER_DISABLE_CUDA_IPC");
     cuda_ipc_peer_cache_[target] = false;
     return false;
   }
@@ -530,7 +530,7 @@ bool CommRouter::cuda_ipc_peer_available(const std::string& target) {
     cuda_ipc_peer_cache_[target] = true;
     return true;
   }
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
   // The receiver opens the sender's handle from the target device, so both
   // directions must be available. Cache only a complete positive answer.
   auto accessible = [](int from, int to, std::string& reason) {
@@ -876,4 +876,4 @@ std::set<std::string> tensor_devices(const Value& obj) {
   return out;
 }
 
-}  // namespace omniinfer
+}  // namespace umminfer
