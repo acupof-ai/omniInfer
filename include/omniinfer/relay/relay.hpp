@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Host shared-memory relay with bounded transfer credits.
+// Transfer relays with bounded credits: host shared memory always, device IPC
+// when the build sets OMNIINFER_WITH_CUDA.
 //
-// cuda_ipc, nccl, nixl and mooncake are not available in this build.
+// nccl, nixl and mooncake are not available in this build.
 #pragma once
 
 #include <atomic>
@@ -33,6 +34,12 @@ class RelayOperation {
     (void)error;
     throw ProtocolError("no receiver ack");
   }
+  // The sender gave up waiting (timeout, shutdown, abort). The receiver may
+  // still be reading the block, so a relay that owns a device buffer must not
+  // free it here. Relays without such a buffer treat this as a failure.
+  virtual void mark_receiver_abandoned(const std::string& error) {
+    mark_receiver_failed(error);
+  }
 };
 
 class Relay {
@@ -40,7 +47,8 @@ class Relay {
   virtual ~Relay() = default;
   virtual std::unique_ptr<RelayOperation> put(const Tensor& tensor,
                                               const std::string& request_id) = 0;
-  // Copies the block named by metadata into dest. dest.bytes is resized first.
+  // Copies the block named by metadata into dest.bytes, which the caller sizes
+  // from the DataRef length; a smaller destination is rejected.
   virtual void get(const Value& metadata, Tensor& dest) = 0;
   virtual void cleanup(const std::string& request_id) { (void)request_id; }
   virtual void close() {}
@@ -52,13 +60,17 @@ class CreditAllocator {
  public:
   CreditAllocator(int credits, std::optional<int64_t> slot_size = std::nullopt);
 
+  // Throws ProtocolError once close() has been called, so a waiter unblocks
+  // instead of hanging through shutdown.
   int64_t acquire();
   void release(int64_t credit);
+  void close();
 
  private:
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<int64_t> free_;
+  bool closed_ = false;
 };
 
 // POSIX shared-memory relay for host tensors.

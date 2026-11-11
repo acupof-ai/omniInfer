@@ -5,3 +5,7 @@ zig-out/
 *.o
 *.a
 .DS_Store
+__pycache__/
+*.pyc
+cuda-stress-logs/
+cuda-sanitize-logs/
