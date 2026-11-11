@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/proto/messages.hpp"
+#include "umminfer/proto/messages.hpp"
 
 #include <memory>
 #include <utility>
 
-namespace omniinfer {
+namespace umminfer {
 namespace {
 
 Value opt_str(const std::optional<std::string>& v) {
@@ -934,4 +934,4 @@ Message deserialize_message(const std::string& data) {
   return parse_message(unpack(data));
 }
 
-}  // namespace omniinfer
+}  // namespace umminfer

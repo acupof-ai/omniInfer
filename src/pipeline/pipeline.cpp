@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/pipeline/pipeline.hpp"
+#include "umminfer/pipeline/pipeline.hpp"
 
 #include <chrono>
 #include <exception>
 #include <iostream>
 
-namespace omniinfer {
+namespace umminfer {
 namespace {
 
 // One DataRef per payload. The payload is msgpack bytes, so every edge moves one
@@ -717,4 +717,4 @@ bool Coordinator::release(const std::string& request_id) {
   return requests_.erase(request_id) > 0;
 }
 
-}  // namespace omniinfer
+}  // namespace umminfer

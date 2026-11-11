@@ -14,9 +14,9 @@
 #include <variant>
 #include <vector>
 
-#include "omniinfer/proto/wire.hpp"
+#include "umminfer/proto/wire.hpp"
 
-namespace omniinfer {
+namespace umminfer {
 
 // ---- data_ref.py ---------------------------------------------------------
 
@@ -335,4 +335,4 @@ const char* message_type_name(const Message& msg);
 std::string serialize_message(const Message& msg);
 Message deserialize_message(const std::string& data);
 
-}  // namespace omniinfer
+}  // namespace umminfer

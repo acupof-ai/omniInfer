@@ -12,10 +12,10 @@
 #include <string>
 #include <vector>
 
-#include "omniinfer/proto/messages.hpp"
-#include "omniinfer/relay/relay.hpp"
+#include "umminfer/proto/messages.hpp"
+#include "umminfer/relay/relay.hpp"
 
-namespace omniinfer {
+namespace umminfer {
 
 // Shared ZMQ context, one per process.
 class ControlPlaneContext {
@@ -250,4 +250,4 @@ class CommRouter {
 // Set of device types in a payload, as tensor_devices() computes it.
 std::set<std::string> tensor_devices(const Value& obj);
 
-}  // namespace omniinfer
+}  // namespace umminfer

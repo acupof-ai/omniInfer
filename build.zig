@@ -10,7 +10,7 @@ fn configure(mod: *std.Build.Module, b: *std.Build, deps_prefix: ?[]const u8, cu
         mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib64" }) });
     }
-    if (cuda) mod.addCMacro("OMNIINFER_WITH_CUDA", "1");
+    if (cuda) mod.addCMacro("UMMINFER_WITH_CUDA", "1");
     if (link_deps) {
         mod.linkSystemLibrary("zmq", .{ .use_pkg_config = .no });
         mod.linkSystemLibrary("msgpackc", .{ .use_pkg_config = .no });
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
     const cuda = b.option(bool, "cuda", "Enable the CUDA IPC relay") orelse (cuda_prefix != null);
 
     const core = b.addLibrary(.{
-        .name = "omni_core",
+        .name = "umm_core",
         .linkage = .static,
         .root_module = module(b, target, optimize),
     });
@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "omni-infer",
+        .name = "umm-infer",
         .root_module = module(b, target, optimize),
     });
     configure(exe.root_module, b, deps_prefix, cuda_prefix, cuda, true);

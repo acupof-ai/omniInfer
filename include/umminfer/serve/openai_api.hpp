@@ -9,9 +9,9 @@
 #include <memory>
 #include <string>
 
-#include "omniinfer/pipeline/pipeline.hpp"
+#include "umminfer/pipeline/pipeline.hpp"
 
-namespace omniinfer {
+namespace umminfer {
 
 struct ApiConfig {
   std::string host = "0.0.0.0";
@@ -38,4 +38,4 @@ class OpenAIApi {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace omniinfer
+}  // namespace umminfer

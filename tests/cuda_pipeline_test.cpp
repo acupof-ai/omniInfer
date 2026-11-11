@@ -3,7 +3,7 @@
 //
 // Stage A runs on GPU 0, stage B on GPU 1. The submitted payload carries a CUDA
 // tensor value, so A->B must select the cuda_ipc relay. The same request must
-// still complete over SHM when OMNIINFER_DISABLE_CUDA_IPC=1.
+// still complete over SHM when UMMINFER_DISABLE_CUDA_IPC=1.
 //
 // Stages are spawned with fork+exec, so each CUDA runtime starts from a clean
 // process image instead of inheriting coordinator state.
@@ -21,12 +21,12 @@
 #include <thread>
 #include <vector>
 
-#include "omniinfer/comm/comm.hpp"
-#include "omniinfer/pipeline/pipeline.hpp"
-#include "omniinfer/proto/messages.hpp"
-#include "omniinfer/proto/wire.hpp"
+#include "umminfer/comm/comm.hpp"
+#include "umminfer/pipeline/pipeline.hpp"
+#include "umminfer/proto/messages.hpp"
+#include "umminfer/proto/wire.hpp"
 
-using namespace omniinfer;
+using namespace umminfer;
 
 namespace {
 
@@ -275,8 +275,8 @@ bool run_pipeline(const std::string& tag, TransportKind expected,
 }  // namespace
 
 int main(int argc, char** argv) {
-#if !defined(OMNIINFER_WITH_CUDA)
-  std::cerr << "cuda_pipeline_test: built without OMNIINFER_WITH_CUDA, skipped\n";
+#if !defined(UMMINFER_WITH_CUDA)
+  std::cerr << "cuda_pipeline_test: built without UMMINFER_WITH_CUDA, skipped\n";
   (void)argc;
   (void)argv;
   return 0;
@@ -325,11 +325,11 @@ int main(int argc, char** argv) {
     CHECK(big_ok);
   }
 
-  std::cerr << "[4] A->B over shm with OMNIINFER_DISABLE_CUDA_IPC=1\n";
-  ::setenv("OMNIINFER_DISABLE_CUDA_IPC", "1", 1);
+  std::cerr << "[4] A->B over shm with UMMINFER_DISABLE_CUDA_IPC=1\n";
+  ::setenv("UMMINFER_DISABLE_CUDA_IPC", "1", 1);
   const bool shm_ok = run_pipeline("shm", TransportKind::Shm, bytes);
   CHECK(shm_ok);
-  ::unsetenv("OMNIINFER_DISABLE_CUDA_IPC");
+  ::unsetenv("UMMINFER_DISABLE_CUDA_IPC");
 
   std::cerr << "[5] remapped GPU does not skip the peer decision\n";
   {

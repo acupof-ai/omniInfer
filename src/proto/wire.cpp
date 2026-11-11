@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/proto/wire.hpp"
+#include "umminfer/proto/wire.hpp"
 
 #include <cstdint>
 
-namespace omniinfer {
+namespace umminfer {
 namespace {
 
 // msgpack C API packs strings and binary in two calls: length, then body.
@@ -245,4 +245,4 @@ int64_t require_non_negative_int(const Value& map, const std::string& key) {
   return n;
 }
 
-}  // namespace omniinfer
+}  // namespace umminfer

@@ -15,7 +15,7 @@
 #include <variant>
 #include <vector>
 
-namespace omniinfer {
+namespace umminfer {
 
 // Invalid wire types and schema fields raise ProtocolError.
 class ProtocolError : public std::runtime_error {
@@ -173,4 +173,4 @@ std::string require_str(const Value& map, const std::string& key);
 bool require_bool(const Value& map, const std::string& key);
 int64_t require_non_negative_int(const Value& map, const std::string& key);
 
-}  // namespace omniinfer
+}  // namespace umminfer
