@@ -47,6 +47,13 @@ zig build smoke -Ddeps-prefix=/opt/homebrew
 `smoke` checks HTTP validation, authentication, JSON, SSE, 24 concurrent JSON
 requests, 12 concurrent SSE requests, external stages, and SIGTERM shutdown.
 
+```sh
+TLA2TOOLS_JAR=/path/to/tla2tools.jar python3 -I tests/tla_test.py
+```
+
+This checks the finite request-lifecycle model. It does not prove that the C++
+implementation conforms to the model.
+
 The CPU build is the default. CUDA IPC is an optional build:
 
 ```sh
@@ -165,6 +172,7 @@ src/main.cpp
 tests/self_check.cpp
 tests/compat/{wire_compat.cpp,runtime_compat.cpp}
 tests/{cuda_ipc_test.cpp,cuda_pipeline_test.cpp,cuda_bench.cpp}
-tests/{cuda_stress.py,cuda_sanitize.py,http_smoke.py}
+tests/{cuda_stress.py,cuda_sanitize.py,http_smoke.py,tla_test.py}
+tests/tla/{RequestLifecycle.tla,RequestLifecycle.cfg}
 docs/cuda-ipc.md
 ```
