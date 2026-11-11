@@ -806,6 +806,699 @@ void test_data_ready_checks_target(int& failures) {
   peer.close();
 }
 
+// ---- item 1: untrusted DataRef validation --------------------------------
+
+DataRef make_ref(const std::string& object_id, int64_t length,
+                 TransportKind transport, int64_t tensor_size,
+                 const Value& info) {
+  DataRef ref;
+  ref.version = 1;
+  ref.kind = DataKind::StagePayload;
+  ref.object_id = object_id;
+  ref.transport = transport;
+  ref.layout = DataLayout::PackedTensors;
+  ref.buffer.transport = transport;
+  ref.buffer.info = info;
+  ref.buffer.length = length;
+  TensorMeta meta;
+  meta.path = "";
+  meta.shape = {tensor_size};
+  meta.dtype = "uint8";
+  meta.device = "cpu";
+  meta.offset = 0;
+  meta.size = tensor_size;
+  ref.tensors.push_back(meta);
+  return ref;
+}
+
+void test_data_ready_validation(int& failures) {
+  const std::string base =
+      "/tmp/omni-runtime-validate-" + std::to_string(getpid()) + "-";
+  const std::string b_ep = "ipc://" + base + "b";
+  const std::string peer_ep = "ipc://" + base + "a";
+  const std::string done_ep = "ipc://" + base + "done";
+  const std::string abort_ep = "ipc://" + base + "abort";
+  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
+    std::remove(path.c_str());
+  }
+
+  PullSocket peer(peer_ep, true);
+  peer.start();
+  PullSocket done(done_ep, true);
+  done.start();
+  PubSocket abort(abort_ep);
+  abort.bind();
+  Stage::Config config;
+  config.name = "b";
+  config.recv_endpoint = b_ep;
+  config.coordinator_endpoint = done_ep;
+  config.abort_endpoint = abort_ep;
+  config.peer_endpoints["a"] = peer_ep;
+  // Small bound: the oversized case must fail without allocating 8 KiB.
+  config.max_payload_bytes = 4096;
+  std::atomic<int> calls{0};
+  Stage stage(config, [&](const Value& value) {
+    ++calls;
+    return value;
+  });
+  stage.start();
+  std::thread stage_thread([&] { stage.run(); });
+  PushSocket sender(b_ep);
+  sender.connect();
+
+  auto expect_rejected = [&](const char* name, const DataRef& ref) {
+    DataReadyMessage ready;
+    ready.request_id = ref.object_id;
+    ready.from_stage = "a";
+    ready.to_stage = "b";
+    ready.data_ref = ref.to_value();
+    const auto started = std::chrono::steady_clock::now();
+    sender.send(Message{ready});
+
+    const auto ack_message = peer.recv_timeout(1000);
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+            .count();
+    const bool acked = ack_message &&
+                       std::holds_alternative<DataAckMessage>(*ack_message) &&
+                       !std::get<DataAckMessage>(*ack_message).success &&
+                       std::get<DataAckMessage>(*ack_message).object_id ==
+                           ref.object_id;
+    check(acked, name, failures);
+    const auto done_message = done.recv_timeout(1000);
+    check(done_message && std::holds_alternative<CompleteMessage>(*done_message) &&
+              !std::get<CompleteMessage>(*done_message).success,
+          name, failures);
+    // Settlement must not wait for the 30-second transfer reaper.
+    check(elapsed < 1.0, name, failures);
+    check(calls == 0, name, failures);
+  };
+
+  // Matching transfer_info keeps each case isolated to the check it names.
+  auto shm_info = [](int64_t size) {
+    Value::Map transfer;
+    transfer["size"] = Value(size);
+    Value::Map info;
+    info["transfer_info"] = Value(std::move(transfer));
+    return Value(std::move(info));
+  };
+  expect_rejected("a negative buffer length was accepted",
+                  make_ref("neg-length", -1, TransportKind::Shm, -1, shm_info(-1)));
+  expect_rejected("an oversized buffer length was accepted",
+                  make_ref("huge-length", int64_t{1} << 40, TransportKind::Shm,
+                           int64_t{1} << 40, shm_info(int64_t{1} << 40)));
+  expect_rejected("a conflicting tensor size was accepted",
+                  make_ref("bad-tensor", 64, TransportKind::Shm, 65, shm_info(64)));
+  {
+    // Genuine mismatch: the DataRef says CUDA, the buffer says SHM.
+    DataRef ref = make_ref("bad-transport", 64, TransportKind::Shm, 64,
+                           shm_info(64));
+    ref.transport = TransportKind::CudaIpc;
+    expect_rejected("a transport mismatch was accepted", ref);
+  }
+  {
+    // The ref claims SHM but the buffer advertises CUDA.
+    DataRef ref = make_ref("mixed-transport", 64, TransportKind::Shm, 64,
+                           shm_info(64));
+    ref.buffer.transport = TransportKind::CudaIpc;
+    expect_rejected("a buffer transport mismatch was accepted", ref);
+  }
+  expect_rejected("a payload above the configured limit was accepted",
+                  make_ref("too-large", 8192, TransportKind::Shm, 8192,
+                           shm_info(8192)));
+  expect_rejected("a negative transfer size was accepted",
+                  make_ref("neg-transfer", 64, TransportKind::Shm, 64,
+                           shm_info(-1)));
+  expect_rejected("a short transfer size was accepted",
+                  make_ref("short-transfer", 64, TransportKind::Shm, 64,
+                           shm_info(32)));
+  expect_rejected("a long transfer size was accepted",
+                  make_ref("long-transfer", 64, TransportKind::Shm, 64,
+                           shm_info(128)));
+
+  // A valid transfer still succeeds after the rejected ones.
+  {
+    StagePayload payload;
+    payload.request_id = "valid-after-reject";
+    payload.data = Value("ok");
+    const std::string bytes = pack(payload.to_value());
+    ShmRelay relay("validate_source", 1, 1);
+    Tensor source;
+    source.device = "cpu";
+    source.dtype = "uint8";
+    source.shape = {static_cast<int64_t>(bytes.size())};
+    source.bytes = bytes;
+    auto operation = relay.put(source, payload.request_id);
+    DataRef ref = make_ref("valid-after-reject", static_cast<int64_t>(bytes.size()),
+                           TransportKind::Shm,
+                           static_cast<int64_t>(bytes.size()),
+                           operation->metadata());
+    DataReadyMessage ready;
+    ready.request_id = payload.request_id;
+    ready.from_stage = "a";
+    ready.to_stage = "b";
+    ready.data_ref = ref.to_value();
+    sender.send(Message{ready});
+    const auto ack_message = peer.recv_timeout(1000);
+    check(ack_message && std::holds_alternative<DataAckMessage>(*ack_message) &&
+              std::get<DataAckMessage>(*ack_message).success,
+          "a valid transfer was rejected after malformed ones", failures);
+    const auto done_message = done.recv_timeout(1000);
+    check(done_message && std::holds_alternative<CompleteMessage>(*done_message) &&
+              std::get<CompleteMessage>(*done_message).success,
+          "a valid request did not complete after malformed ones", failures);
+    check(calls == 1, "the valid request did not run compute", failures);
+  }
+
+  stage.stop();
+  stage_thread.join();
+  sender.close();
+  abort.close();
+  done.close();
+  peer.close();
+}
+
+// ---- item 4: send_payload failure paths ----------------------------------
+
+class NoAckOperation : public RelayOperation {
+ public:
+  const Value& metadata() const override { return metadata_; }
+  void wait_for_completion(double) override {}
+
+ private:
+  Value metadata_ = Value::map({});
+};
+
+// Every relay has an operation without an ack protocol, so the base
+// mark_receiver_failed throws. The cleanup path must swallow that.
+class NoAckRelay : public Relay {
+ public:
+  std::unique_ptr<RelayOperation> put(const Tensor&, const std::string&) override {
+    return std::make_unique<NoAckOperation>();
+  }
+  void get(const Value&, Tensor&) override {}
+};
+
+class ThrowingMetadataOperation : public NoAckOperation {
+ public:
+  const Value& metadata() const override {
+    throw ProtocolError("metadata conversion failed");
+  }
+};
+
+class ThrowingMetadataRelay : public NoAckRelay {
+ public:
+  std::unique_ptr<RelayOperation> put(const Tensor&, const std::string&) override {
+    return std::make_unique<ThrowingMetadataOperation>();
+  }
+};
+
+void test_send_payload_faults(int& failures) {
+  struct Case {
+    const char* name;
+    std::shared_ptr<Relay> relay;
+    const char* expected_error;
+  };
+  const Case cases[] = {
+      {"a send failure left the transfer pending", nullptr, "zmq_connect"},
+      // The base cleanup throws; the original send failure must still win.
+      {"cleanup failure replaced the original exception",
+       std::make_shared<NoAckRelay>(), "zmq_connect"},
+      {"a metadata failure settled late", std::make_shared<ThrowingMetadataRelay>(),
+       "metadata conversion failed"},
+  };
+
+  for (const Case& item : cases) {
+    const std::string base = "/tmp/omni-runtime-fault-" +
+                             std::to_string(getpid()) + "-" +
+                             std::to_string(&item - cases) + "-";
+    const std::string a_ep = "ipc://" + base + "a";
+    const std::string done_ep = "ipc://" + base + "done";
+    const std::string abort_ep = "ipc://" + base + "abort";
+    for (const auto& path : {base + "a", base + "done", base + "abort"}) {
+      std::remove(path.c_str());
+    }
+
+    Coordinator coordinator(done_ep, abort_ep);
+    coordinator.register_stage("a", a_ep);
+    coordinator.start();
+    std::thread coordinator_thread([&] { coordinator.run(); });
+
+    Stage::Config config;
+    config.name = "a";
+    config.recv_endpoint = a_ep;
+    config.coordinator_endpoint = done_ep;
+    config.abort_endpoint = abort_ep;
+    // A connect to an unknown protocol fails inside send_to_stage.
+    config.next_stages["b"] = "invalid://broken";
+    config.peer_endpoints["a"] = a_ep;
+    config.injected_relay = item.relay;
+    Stage stage(config, [](const Value& input) { return input; });
+    stage.start();
+    std::thread stage_thread([&] { stage.run(); });
+
+    StagePayload payload;
+    payload.data = Value("x");
+    const std::string request_id = coordinator.submit(payload, "a");
+    const auto started = std::chrono::steady_clock::now();
+    const bool settled = coordinator.wait(request_id, 3.0);
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+            .count();
+    check(settled, item.name, failures);
+    const auto info = coordinator.info(request_id);
+    check(info && info->state == "failed", item.name, failures);
+    if (info) {
+      check(info->error.find(item.expected_error) != std::string::npos,
+            item.name, failures);
+    }
+    check(elapsed < 2.0, item.name, failures);
+
+    stage.stop();
+    coordinator.stop();
+    stage_thread.join();
+    coordinator_thread.join();
+  }
+}
+
+// ---- round 2: F9 abort/reap linearizes with the DataReady send -------------
+
+struct LatchState {
+  std::atomic<bool> entered{false};
+  std::atomic<bool> release{false};
+  std::atomic<int> settled{0};
+};
+
+class LatchOperation : public RelayOperation {
+ public:
+  explicit LatchOperation(std::shared_ptr<LatchState> state)
+      : state_(std::move(state)) {}
+  const Value& metadata() const override {
+    state_->entered = true;
+    while (!state_->release.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return metadata_;
+  }
+  void wait_for_completion(double) override {}
+  void mark_receiver_done() override { ++state_->settled; }
+  void mark_receiver_failed(const std::string&) override { ++state_->settled; }
+  void mark_receiver_abandoned(const std::string&) override { ++state_->settled; }
+
+ private:
+  std::shared_ptr<LatchState> state_;
+  Value metadata_ = Value::map({});
+};
+
+class LatchRelay : public Relay {
+ public:
+  explicit LatchRelay(std::shared_ptr<LatchState> state)
+      : state_(std::move(state)) {}
+  std::unique_ptr<RelayOperation> put(const Tensor&, const std::string&) override {
+    return std::make_unique<LatchOperation>(state_);
+  }
+  void get(const Value&, Tensor&) override {}
+
+ private:
+  std::shared_ptr<LatchState> state_;
+};
+
+// metadata() blocks, the abort thread reaps the transfer, then metadata()
+// returns: no DataReady may reach the next stage, and the operation settles
+// exactly once.
+void test_abort_before_data_ready(int& failures) {
+  const std::string base =
+      "/tmp/omni-runtime-latch-" + std::to_string(getpid()) + "-";
+  const std::string a_ep = "ipc://" + base + "a";
+  const std::string b_ep = "ipc://" + base + "b";
+  const std::string done_ep = "ipc://" + base + "done";
+  const std::string abort_ep = "ipc://" + base + "abort";
+  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
+    std::remove(path.c_str());
+  }
+
+  PullSocket downstream(b_ep, true);
+  downstream.start();
+  PullSocket done(done_ep, true);
+  done.start();
+  PubSocket abort(abort_ep);
+  abort.bind();
+
+  auto state = std::make_shared<LatchState>();
+  Stage::Config config;
+  config.name = "a";
+  config.recv_endpoint = a_ep;
+  config.coordinator_endpoint = done_ep;
+  config.abort_endpoint = abort_ep;
+  config.next_stages["b"] = b_ep;
+  config.peer_endpoints["a"] = a_ep;
+  config.transfer_timeout_ms = 0;
+  config.injected_relay = std::make_shared<LatchRelay>(state);
+  Stage stage(config, [](const Value& input) { return input; });
+  stage.start();
+  std::thread stage_thread([&] { stage.run(); });
+  PushSocket entry(a_ep);
+  entry.connect();
+
+  StagePayload payload;
+  payload.request_id = "latched";
+  payload.data = Value("x");
+  SubmitMessage submit;
+  submit.request_id = "latched";
+  submit.data = payload.to_value();
+  entry.send(Message{submit});
+
+  for (int i = 0; i < 200 && !state->entered.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  check(state->entered.load(), "send_payload never reached metadata()", failures);
+
+  abort.publish(AbortMessage{"latched"});
+  for (int i = 0; i < 200 && state->settled.load() < 1; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  check(state->settled.load() == 1,
+        "the abort did not settle the blocked transfer exactly once", failures);
+
+  state->release = true;
+  const auto ready = downstream.recv_timeout(700);
+  check(!ready, "a reaped transfer still queued DataReady", failures);
+  check(state->settled.load() == 1, "the transfer settled more than once",
+        failures);
+
+  const auto done_message = done.recv_timeout(1000);
+  check(done_message && std::holds_alternative<CompleteMessage>(*done_message) &&
+            !std::get<CompleteMessage>(*done_message).success,
+        "the aborted transfer did not settle as failed", failures);
+
+  stage.stop();  // joins the outbox thread; a hang fails the process alarm
+  stage_thread.join();
+  entry.close();
+  abort.close();
+  done.close();
+  downstream.close();
+}
+
+// ---- round 2: F10 malformed DataRef still NACKs ---------------------------
+
+void test_malformed_data_ref_nack(int& failures) {
+  const std::string base =
+      "/tmp/omni-runtime-nack-" + std::to_string(getpid()) + "-";
+  const std::string b_ep = "ipc://" + base + "b";
+  const std::string peer_ep = "ipc://" + base + "a";
+  const std::string done_ep = "ipc://" + base + "done";
+  const std::string abort_ep = "ipc://" + base + "abort";
+  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
+    std::remove(path.c_str());
+  }
+
+  PullSocket peer(peer_ep, true);
+  peer.start();
+  PullSocket done(done_ep, true);
+  done.start();
+  PubSocket abort(abort_ep);
+  abort.bind();
+  Stage::Config config;
+  config.name = "b";
+  config.recv_endpoint = b_ep;
+  config.coordinator_endpoint = done_ep;
+  config.abort_endpoint = abort_ep;
+  config.peer_endpoints["a"] = peer_ep;
+  std::atomic<int> calls{0};
+  Stage stage(config, [&](const Value& value) {
+    ++calls;
+    return value;
+  });
+  stage.start();
+  std::thread stage_thread([&] { stage.run(); });
+  PushSocket sender(b_ep);
+  sender.connect();
+
+  // One sender credit: the next transfer can start only after the failure ack
+  // settles the operation that owns it.
+  ShmRelay sender_relay("nack_source", 1, 1);
+  Tensor source;
+  source.device = "cpu";
+  source.dtype = "uint8";
+  source.shape = {4};
+  source.bytes = "abcd";
+  auto first = sender_relay.put(source, "req-malformed");
+
+  DataRef ref;
+  ref.version = 1;
+  ref.kind = DataKind::StagePayload;
+  ref.object_id = "obj-malformed";
+  ref.transport = TransportKind::Shm;
+  ref.layout = DataLayout::PackedTensors;
+  ref.buffer.transport = TransportKind::Shm;
+  ref.buffer.info = first->metadata();
+  ref.buffer.length = 4;
+  TensorMeta meta;
+  meta.path = "";
+  meta.shape = {4};
+  meta.dtype = "uint8";
+  meta.device = "cpu";
+  meta.offset = 0;
+  meta.size = 4;
+  ref.tensors.push_back(meta);
+  Value ref_value = ref.to_value();
+  // A valid object_id with a header that fails DataRef decoding.
+  ref_value.as_map_mut()["header"] = Value(int64_t{7});
+
+  DataReadyMessage ready;
+  ready.request_id = "req-malformed";
+  ready.from_stage = "a";
+  ready.to_stage = "b";
+  ready.data_ref = ref_value;
+  const auto started = std::chrono::steady_clock::now();
+  sender.send(Message{ready});
+
+  const auto ack_message = peer.recv_timeout(1000);
+  check(ack_message && std::holds_alternative<DataAckMessage>(*ack_message) &&
+            !std::get<DataAckMessage>(*ack_message).success &&
+            std::get<DataAckMessage>(*ack_message).object_id == "obj-malformed",
+        "a malformed data_ref skipped its failure ack", failures);
+  const auto done_message = done.recv_timeout(1000);
+  const double elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+          .count();
+  check(done_message && std::holds_alternative<CompleteMessage>(*done_message) &&
+            !std::get<CompleteMessage>(*done_message).success,
+        "a malformed data_ref did not fail its request", failures);
+  check(elapsed < 1.0, "a malformed data_ref settlement was not prompt",
+        failures);
+  check(calls == 0, "a malformed data_ref executed compute", failures);
+
+  std::atomic<bool> second_done{false};
+  std::thread second([&] {
+    auto op = sender_relay.put(source, "req-valid");
+    op->mark_receiver_done();
+    second_done = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  check(!second_done, "a single sender credit was not held", failures);
+  first->mark_receiver_failed("header must be bytes or base64 str");
+  second.join();
+  check(second_done, "the failure ack did not release the sender credit",
+        failures);
+
+  stage.stop();
+  stage_thread.join();
+  sender.close();
+  abort.close();
+  done.close();
+  peer.close();
+}
+
+// ---- round 2: F11 unsupported transport rejected before allocation --------
+
+void test_unsupported_transport_rejected(int& failures) {
+  const std::string base =
+      "/tmp/omni-runtime-transport-" + std::to_string(getpid()) + "-";
+  const std::string b_ep = "ipc://" + base + "b";
+  const std::string peer_ep = "ipc://" + base + "a";
+  const std::string done_ep = "ipc://" + base + "done";
+  const std::string abort_ep = "ipc://" + base + "abort";
+  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
+    std::remove(path.c_str());
+  }
+
+  PullSocket peer(peer_ep, true);
+  peer.start();
+  PullSocket done(done_ep, true);
+  done.start();
+  PubSocket abort(abort_ep);
+  abort.bind();
+  Stage::Config config;
+  config.name = "b";
+  config.recv_endpoint = b_ep;
+  config.coordinator_endpoint = done_ep;
+  config.abort_endpoint = abort_ep;
+  config.peer_endpoints["a"] = peer_ep;
+  config.max_payload_bytes = std::numeric_limits<int64_t>::max();
+  std::atomic<int> calls{0};
+  Stage stage(config, [&](const Value& value) {
+    ++calls;
+    return value;
+  });
+  stage.start();
+  std::thread stage_thread([&] { stage.run(); });
+  PushSocket sender(b_ep);
+  sender.connect();
+
+  DataRef ref;
+  ref.version = 1;
+  ref.kind = DataKind::StagePayload;
+  ref.object_id = "local-object";
+  ref.transport = TransportKind::LocalObject;
+  ref.layout = DataLayout::PackedTensors;
+  ref.buffer.transport = TransportKind::LocalObject;
+  ref.buffer.info = Value::map({});
+  ref.buffer.length = std::numeric_limits<int64_t>::max();
+  TensorMeta meta;
+  meta.path = "";
+  meta.shape = {std::numeric_limits<int64_t>::max()};
+  meta.dtype = "uint8";
+  meta.device = "cpu";
+  meta.offset = 0;
+  meta.size = std::numeric_limits<int64_t>::max();
+  ref.tensors.push_back(meta);
+
+  DataReadyMessage ready;
+  ready.request_id = "local-object";
+  ready.from_stage = "a";
+  ready.to_stage = "b";
+  ready.data_ref = ref.to_value();
+  const auto started = std::chrono::steady_clock::now();
+  sender.send(Message{ready});
+
+  const auto ack_message = peer.recv_timeout(1000);
+  check(ack_message && std::holds_alternative<DataAckMessage>(*ack_message) &&
+            !std::get<DataAckMessage>(*ack_message).success,
+        "an unsupported transport skipped its failure ack", failures);
+  const auto done_message = done.recv_timeout(1000);
+  const double elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+          .count();
+  check(done_message && std::holds_alternative<CompleteMessage>(*done_message) &&
+            !std::get<CompleteMessage>(*done_message).success,
+        "an unsupported transport did not fail its request", failures);
+  if (done_message && std::holds_alternative<CompleteMessage>(*done_message)) {
+    const auto& complete = std::get<CompleteMessage>(*done_message);
+    check(complete.error &&
+              complete.error->find("unsupported inbound relay transport") !=
+                  std::string::npos,
+          "an unsupported transport was rejected as a length error", failures);
+  }
+  check(elapsed < 1.0, "an unsupported transport settlement was not prompt",
+        failures);
+  check(calls == 0, "an unsupported transport executed compute", failures);
+
+  stage.stop();
+  stage_thread.join();
+  sender.close();
+  abort.close();
+  done.close();
+  peer.close();
+}
+
+// ---- round 2: F13 close keeps relays alive, rejects new work --------------
+
+void test_router_close_keeps_relays(int& failures) {
+  CommRouter router("a", std::nullopt, std::nullopt, {}, {}, {}, {});
+  Relay& shm = router.relay(TransportKind::Shm);
+  Tensor source;
+  source.device = "cpu";
+  source.dtype = "uint8";
+  source.shape = {3};
+  source.bytes = "abc";
+  auto op = shm.put(source, "req-close");
+
+  router.close();
+
+  bool put_failed = false;
+  try {
+    (void)shm.put(source, "req-after-close");
+  } catch (const ProtocolError&) {
+    put_failed = true;
+  }
+  check(put_failed, "a relay closed by the router accepted new work", failures);
+
+  bool access_failed = false;
+  try {
+    (void)router.relay(TransportKind::Shm);
+  } catch (const ProtocolError&) {
+    access_failed = true;
+  }
+  check(access_failed, "relay access after close returned a live relay", failures);
+
+  bool new_kind_failed = false;
+  try {
+    (void)router.relay(TransportKind::Mooncake);
+  } catch (const ProtocolError&) {
+    new_kind_failed = true;
+  }
+  check(new_kind_failed, "close allowed a new relay kind to be built", failures);
+
+  router.close();  // idempotent
+
+  std::thread churn([&] {
+    for (int i = 0; i < 200; ++i) router.cleanup("req-close");
+  });
+  router.close();
+  churn.join();
+
+  // The old pointer and its operation stay valid after close.
+  op->mark_receiver_done();
+  op.reset();
+}
+
+// ---- round 2: F14 slot_size_mb range -------------------------------------
+
+void test_slot_size_range(int& failures) {
+  const int64_t default_bytes = int64_t{512} * 1024 * 1024;
+  CommRouter plain("a", std::nullopt, std::nullopt, {}, {}, {}, {});
+  check(plain.cuda_slot_bytes() == default_bytes,
+        "the default slot size changed", failures);
+
+  std::map<std::string, Value> comm_config;
+  comm_config["slot_size_mb"] = Value(int64_t{0});
+  CommRouter defaulted("a", std::nullopt, std::nullopt, {}, {}, {}, {},
+                       comm_config);
+  check(defaulted.cuda_slot_bytes() == default_bytes,
+        "a nonpositive slot size did not take the default", failures);
+
+  comm_config["slot_size_mb"] = Value(int64_t{4294967297});
+  CommRouter oversized("a", std::nullopt, std::nullopt, {}, {}, {}, {},
+                       comm_config);
+  bool rejected = false;
+  try {
+    (void)oversized.cuda_slot_bytes();
+  } catch (const ProtocolError& e) {
+    rejected = std::string(e.what()).find("slot_size_mb") != std::string::npos;
+  }
+  check(rejected, "an out-of-int-range slot_size_mb was narrowed", failures);
+
+  bool parser_rejected = false;
+  try {
+    (void)create_relay("shm", {{"slot_size_mb", Value(int64_t{4294967297})}});
+  } catch (const ProtocolError& e) {
+    parser_rejected =
+        std::string(e.what()).find("int range") != std::string::npos;
+  }
+  check(parser_rejected,
+        "create_relay truncated an out-of-range slot_size_mb", failures);
+
+  bool credits_rejected = false;
+  try {
+    (void)create_relay("shm", {{"credits", Value(int64_t{4294967297})}});
+  } catch (const ProtocolError&) {
+    credits_rejected = true;
+  }
+  check(credits_rejected, "create_relay truncated an out-of-range credits value",
+        failures);
+}
+
 }  // namespace
 
 int main() {
@@ -827,5 +1520,12 @@ int main() {
   test_sse_content_and_timeout(failures);
   test_abort_cleans_stage_request(failures);
   test_data_ready_checks_target(failures);
+  test_data_ready_validation(failures);
+  test_send_payload_faults(failures);
+  test_abort_before_data_ready(failures);
+  test_malformed_data_ref_nack(failures);
+  test_unsupported_transport_rejected(failures);
+  test_router_close_keeps_relays(failures);
+  test_slot_size_range(failures);
   return failures == 0 ? 0 : 1;
 }

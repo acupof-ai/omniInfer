@@ -64,6 +64,20 @@ int parse_port(const Flags& flags) {
   return port;
 }
 
+int parse_gpu_id(const std::string& text, const std::string& option) {
+  size_t used = 0;
+  int id;
+  try {
+    id = std::stoi(text, &used);
+  } catch (const std::exception&) {
+    throw ProtocolError("invalid " + option + ": " + text);
+  }
+  if (used != text.size() || id < 0) {
+    throw ProtocolError("invalid " + option + ": " + text);
+  }
+  return id;
+}
+
 // ZMQ binds an ipc path but never creates its parent directory.
 void ensure_ipc_parent(const std::string& endpoint) {
   const std::string prefix = "ipc://";
@@ -108,7 +122,8 @@ int usage() {
          "[--completion ipc:///tmp/x/done] [--abort ipc:///tmp/x/abort]\n"
       << "      [--demo]  run one in-process echo stage (development only)\n"
       << "  omni-infer stage --name N --recv EP --coordinator EP --abort EP "
-         "[--next name=EP ...] [--peer name=EP ...]\n";
+         "[--next name=EP ...] [--peer name=EP ...]\n"
+         "      [--gpu-id N --peer-gpu name=N ...]  staged CUDA IPC\n";
   return 2;
 }
 
@@ -228,6 +243,9 @@ int run_stage(const Flags& flags) {
   config.recv_endpoint = flag(flags, "recv");
   config.coordinator_endpoint = flag(flags, "coordinator");
   config.abort_endpoint = flag(flags, "abort");
+  if (flags.count("gpu-id")) {
+    config.gpu_id = parse_gpu_id(flag(flags, "gpu-id"), "--gpu-id");
+  }
   if (config.name.empty() || config.recv_endpoint.empty() ||
       config.coordinator_endpoint.empty() || config.abort_endpoint.empty()) {
     return usage();
@@ -245,6 +263,25 @@ int run_stage(const Flags& flags) {
     ensure_ipc_parent(endpoint);
     if (key == "next") config.next_stages[target] = endpoint;
     config.peer_endpoints[target] = endpoint;
+  }
+  for (const auto& [key, value] : flags) {
+    if (key != "peer-gpu") continue;
+    const size_t eq = value.find('=');
+    if (eq == std::string::npos || eq == 0 || eq + 1 == value.size()) {
+      throw ProtocolError("--peer-gpu requires name=N");
+    }
+    const std::string target = value.substr(0, eq);
+    if (!config.peer_endpoints.count(target)) {
+      throw ProtocolError("--peer-gpu target needs --next or --peer: " + target);
+    }
+    if (config.stage_gpu_ids.count(target)) {
+      throw ProtocolError("duplicate --peer-gpu target: " + target);
+    }
+    config.stage_gpu_ids[target] = {
+        parse_gpu_id(value.substr(eq + 1), "--peer-gpu")};
+  }
+  if (!config.stage_gpu_ids.empty() && !config.gpu_id) {
+    throw ProtocolError("--peer-gpu requires --gpu-id");
   }
   Stage stage(std::move(config), echo_compute);
   stage.start();

@@ -4,9 +4,15 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <thread>
+
+#if defined(OMNIINFER_WITH_CUDA)
+#include <cuda_runtime_api.h>
+#endif
 
 namespace omniinfer {
 
@@ -426,12 +432,31 @@ void CoordinatorControlPlane::close() {
 // ---- platform ------------------------------------------------------------
 
 const Platform& Platform::current() {
-  // ponytail: no CUDA query in the C++ build. A GPU build substitutes a
-  // platform object built from its own device library; the router logic above
-  // does not change.
-  static Platform platform;
+  static const Platform platform = [] {
+    Platform detected;
+#if defined(OMNIINFER_WITH_CUDA)
+    int count = 0;
+    if (cudaGetDeviceCount(&count) == cudaSuccess && count > 0) {
+      detected.device_type = "cuda";
+      detected.intra_node_transport = TransportKind::CudaIpc;
+    } else {
+      // A driver without devices is not an error; stay on the CPU path.
+      (void)cudaGetLastError();
+    }
+#endif
+    return detected;
+  }();
   return platform;
 }
+
+namespace {
+
+bool cuda_ipc_disabled_by_env() {
+  const char* value = std::getenv("OMNIINFER_DISABLE_CUDA_IPC");
+  return value != nullptr && *value != '\0' && std::string(value) != "0";
+}
+
+}  // namespace
 
 // ---- router --------------------------------------------------------------
 
@@ -442,7 +467,7 @@ CommRouter::CommRouter(std::string stage_name, std::optional<int> gpu_id,
                        std::map<std::string, std::vector<int>> stage_gpu_ids,
                        std::set<std::string> remote_stage_names,
                        std::map<std::string, Value> comm_config,
-                       std::unique_ptr<Relay> injected_relay)
+                       std::shared_ptr<Relay> injected_relay)
     : stage_name_(std::move(stage_name)),
       gpu_id_(gpu_id),
       placement_gpu_id_(placement_gpu_id ? placement_gpu_id : gpu_id),
@@ -472,6 +497,17 @@ bool CommRouter::can_use_direct_cuda_ipc(const std::string& target) const {
 
 bool CommRouter::cuda_ipc_peer_available(const std::string& target) {
   std::lock_guard<std::mutex> lock(cuda_mu_);
+  // The override wins over a warm cache, same-GPU edges and missing mappings.
+  if (cuda_ipc_disabled_by_env()) {
+    auto it = stage_gpu_ids_.find(target);
+    const int target_gpu = (it != stage_gpu_ids_.end() && !it->second.empty())
+                               ? it->second[0]
+                               : -1;
+    warn_cuda_ipc_fallback(target, placement_gpu_id_.value_or(-1), target_gpu,
+                           "disabled by OMNIINFER_DISABLE_CUDA_IPC");
+    cuda_ipc_peer_cache_[target] = false;
+    return false;
+  }
   auto cached = cuda_ipc_peer_cache_.find(target);
   if (cached != cuda_ipc_peer_cache_.end()) return cached->second;
   auto it = stage_gpu_ids_.find(target);
@@ -480,22 +516,57 @@ bool CommRouter::cuda_ipc_peer_available(const std::string& target) {
 
   const int source_gpu = *placement_gpu_id_;
   const int target_gpu = it->second[0];
-  if (source_gpu == target_gpu) {
-    cuda_ipc_peer_cache_[target] = true;
-    return true;
-  }
+  // The relay allocates on gpu_id_ but the peer decision would use
+  // placement_gpu_id_. Reject the remap before the same-GPU shortcut, or a
+  // remapped source would skip the peer query entirely.
   if (!gpu_id_ || *gpu_id_ != source_gpu) {
     warn_cuda_ipc_fallback(target, source_gpu, target_gpu,
                            "source process uses a remapped GPU");
     cuda_ipc_peer_cache_[target] = false;
     return false;
   }
-  // ponytail: peer access needs the CUDA runtime. A build without it falls
-  // back to SHM, which is the same result as an unsupported peer edge.
+  if (source_gpu == target_gpu) {
+    // Cross-process IPC on one GPU needs no peer access.
+    cuda_ipc_peer_cache_[target] = true;
+    return true;
+  }
+#if defined(OMNIINFER_WITH_CUDA)
+  // The receiver opens the sender's handle from the target device, so both
+  // directions must be available. Cache only a complete positive answer.
+  auto accessible = [](int from, int to, std::string& reason) {
+    int can = 0;
+    const cudaError_t rc = cudaDeviceCanAccessPeer(&can, from, to);
+    if (rc != cudaSuccess) {
+      reason = cudaGetErrorString(rc);
+      (void)cudaGetLastError();
+      return false;
+    }
+    if (can == 0) {
+      reason = "peer access not supported";
+      return false;
+    }
+    return true;
+  };
+  std::string reason;
+  if (!accessible(source_gpu, target_gpu, reason)) {
+    warn_cuda_ipc_fallback(target, source_gpu, target_gpu, reason);
+    cuda_ipc_peer_cache_[target] = false;
+    return false;
+  }
+  if (!accessible(target_gpu, source_gpu, reason)) {
+    warn_cuda_ipc_fallback(target, source_gpu, target_gpu,
+                           "reverse direction unavailable: " + reason);
+    cuda_ipc_peer_cache_[target] = false;
+    return false;
+  }
+  cuda_ipc_peer_cache_[target] = true;
+  return true;
+#else
   warn_cuda_ipc_fallback(target, source_gpu, target_gpu,
-                         "peer query unavailable in this build");
+                         "peer query unavailable: built without CUDA");
   cuda_ipc_peer_cache_[target] = false;
   return false;
+#endif
 }
 
 void CommRouter::warn_cuda_ipc_fallback(const std::string& target, int source_gpu,
@@ -505,6 +576,8 @@ void CommRouter::warn_cuda_ipc_fallback(const std::string& target, int source_gp
   const std::string key = stage_name_ + "|" + target + "|" +
                           std::to_string(source_gpu) + "|" +
                           std::to_string(target_gpu) + "|" + reason;
+  // Several routers can race on the process-wide dedup set.
+  std::lock_guard<std::mutex> lock(warned_mu);
   if (!warned.insert(key).second) return;
   std::cerr << "CommRouter: using SHM for CUDA edge " << stage_name_
             << "(gpu=" << source_gpu << ") -> " << target << "(gpu=" << target_gpu
@@ -563,8 +636,10 @@ TransportKind CommRouter::inbound(const std::string& from_stage) {
     return note_transport("inbound", from_stage, TransportKind::Mooncake);
   }
   if (self_is_gpu() && gpu_stage_names_.count(from_stage)) {
+    // The sender picks the relay with the same peer check; a plain platform
+    // lookup here would build a relay kind the sender never used.
     return note_transport("inbound", from_stage,
-                          Platform::current().intra_node_transport);
+                          intra_node_transport(from_stage));
   }
   return note_transport("inbound", from_stage, TransportKind::Shm);
 }
@@ -598,11 +673,25 @@ Relay& CommRouter::relay(TransportKind kind) {
   if (kind == TransportKind::LocalObject) {
     throw ProtocolError("local_object has no relay");
   }
-  if (injected_relay_) return *injected_relay_;
   std::lock_guard<std::mutex> lock(relays_mu_);
+  if (closed_) throw ProtocolError("comm router is closed");
+  if (injected_relay_) return *injected_relay_;
   auto it = relays_.find(kind);
   if (it == relays_.end()) {
     it = relays_.emplace(kind, build_relay(kind)).first;
+  }
+  return *it->second;
+}
+
+Relay& CommRouter::relay_for_target(TransportKind kind,
+                                    const std::string& target) {
+  if (kind != TransportKind::CudaIpc) return relay(kind);
+  std::lock_guard<std::mutex> lock(relays_mu_);
+  if (closed_) throw ProtocolError("comm router is closed");
+  if (injected_relay_) return *injected_relay_;
+  auto it = target_relays_.find(target);
+  if (it == target_relays_.end()) {
+    it = target_relays_.emplace(target, build_relay(kind)).first;
   }
   return *it->second;
 }
@@ -613,7 +702,7 @@ std::pair<TransportKind, Relay*> CommRouter::relay_for(const std::string& target
     throw ProtocolError("same-process target " + target +
                         " has no relay transport; use local-object dispatch");
   }
-  return {kind, &relay(kind)};
+  return {kind, &relay_for_target(kind, target)};
 }
 
 std::pair<TransportKind, Relay*> CommRouter::relay_for_payload(
@@ -622,7 +711,41 @@ std::pair<TransportKind, Relay*> CommRouter::relay_for_payload(
   if (kind == TransportKind::LocalObject) {
     throw ProtocolError("local_object has no relay");
   }
-  return {kind, &relay(kind)};
+  return {kind, &relay_for_target(kind, target)};
+}
+
+std::pair<TransportKind, Relay*> CommRouter::relay_for_payload(
+    const std::string& target, const Value& payload, int64_t packed_bytes) {
+  TransportKind kind = outbound_payload(target, payload);
+  if (kind == TransportKind::LocalObject) {
+    throw ProtocolError("local_object has no relay");
+  }
+  // The CUDA relay rejects an oversized block before any device allocation.
+  // Pick SHM here instead so the transfer still completes.
+  if (kind == TransportKind::CudaIpc && packed_bytes > cuda_slot_bytes()) {
+    warn_cuda_ipc_fallback(target, placement_gpu_id_.value_or(-1),
+                           stage_gpu_ids_.count(target) &&
+                                   !stage_gpu_ids_.at(target).empty()
+                               ? stage_gpu_ids_.at(target)[0]
+                               : -1,
+                           "payload exceeds the CUDA slot limit; using SHM");
+    kind = TransportKind::Shm;
+  }
+  return {kind, &relay_for_target(kind, target)};
+}
+
+int CommRouter::slot_size_mb() const {
+  auto it = comm_config_.find("slot_size_mb");
+  const int64_t mb = it == comm_config_.end() ? 512 : it->second.as_int();
+  if (mb > std::numeric_limits<int>::max()) {
+    throw ProtocolError("slot_size_mb " + std::to_string(mb) +
+                        " is out of int range");
+  }
+  return mb > 0 ? static_cast<int>(mb) : 512;
+}
+
+int64_t CommRouter::cuda_slot_bytes() const {
+  return static_cast<int64_t>(slot_size_mb()) * 1024 * 1024;
 }
 
 std::pair<TransportKind, Relay*> CommRouter::relay_for_stream(
@@ -632,11 +755,23 @@ std::pair<TransportKind, Relay*> CommRouter::relay_for_stream(
     throw ProtocolError("same-process stream target " + target +
                         " has no relay transport; use local-object dispatch");
   }
-  return {kind, &relay(kind)};
+  return {kind, &relay_for_target(kind, target)};
 }
 
 Relay& CommRouter::inbound_relay(const std::string& from_stage) {
   return relay(inbound(from_stage));
+}
+
+Relay& CommRouter::inbound_relay(const std::string& from_stage,
+                                 TransportKind advertised_transport) {
+  (void)from_stage;
+  if (advertised_transport != TransportKind::Shm &&
+      advertised_transport != TransportKind::CudaIpc) {
+    throw ProtocolError("unsupported inbound relay transport");
+  }
+  // The sender already applied the P2P and fallback decision. Recomputing it on
+  // the receiver can select a different relay when placement maps differ.
+  return relay(advertised_transport);
 }
 
 void CommRouter::cleanup(const std::string& request_id) {
@@ -649,18 +784,25 @@ void CommRouter::cleanup(const std::string& request_id) {
 }
 
 void CommRouter::close() {
-  if (injected_relay_) {
-    injected_relay_->close();
-    return;
+  std::vector<Relay*> owned;
+  {
+    std::lock_guard<std::mutex> lock(relays_mu_);
+    if (closed_) return;
+    closed_ = true;
+    // Keep the allocations: callers may still hold raw relay pointers after
+    // close. The relays are closed here and destroyed with the router.
+    for (auto& [kind, relay_ptr] : relays_) owned.push_back(relay_ptr.get());
+    for (auto& [target, relay_ptr] : target_relays_) {
+      owned.push_back(relay_ptr.get());
+    }
   }
-  std::lock_guard<std::mutex> lock(relays_mu_);
-  for (auto& [kind, relay_ptr] : relays_) {
+  if (injected_relay_) injected_relay_->close();
+  for (Relay* relay_ptr : owned) {
     try {
       relay_ptr->close();
     } catch (...) {
     }
   }
-  relays_.clear();
 }
 
 std::vector<Relay*> CommRouter::active_relays() {
@@ -668,6 +810,7 @@ std::vector<Relay*> CommRouter::active_relays() {
   std::lock_guard<std::mutex> lock(relays_mu_);
   std::vector<Relay*> out;
   for (auto& [kind, relay_ptr] : relays_) out.push_back(relay_ptr.get());
+  for (auto& [target, relay_ptr] : target_relays_) out.push_back(relay_ptr.get());
   return out;
 }
 
@@ -683,7 +826,7 @@ std::unique_ptr<Relay> CommRouter::build_relay(TransportKind kind) {
                          ? static_cast<int>(found->second.as_int())
                          : fallback);
   };
-  number("slot_size_mb", 512);
+  cfg["slot_size_mb"] = Value(slot_size_mb());
   number("credits", 2);
   switch (kind) {
     case TransportKind::Shm:
@@ -693,6 +836,8 @@ std::unique_ptr<Relay> CommRouter::build_relay(TransportKind kind) {
         throw ProtocolError("cuda_ipc relay requested for non-GPU stage " +
                             stage_name_);
       }
+      // The relay allocates on the GPU this stage was placed on.
+      cfg["device"] = Value(*gpu_id_);
       return create_relay("cuda_ipc", cfg);
     case TransportKind::Mooncake:
       if (gpu_id_ && !Platform::current().is_cuda_alike()) {

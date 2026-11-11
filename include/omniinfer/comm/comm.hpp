@@ -178,7 +178,7 @@ class CommRouter {
              std::map<std::string, std::vector<int>> stage_gpu_ids,
              std::set<std::string> remote_stage_names,
              std::map<std::string, Value> comm_config = {},
-             std::unique_ptr<Relay> injected_relay = nullptr);
+             std::shared_ptr<Relay> injected_relay = nullptr);
 
   bool self_is_gpu() const { return gpu_id_.has_value(); }
   bool is_local_object(const std::string& target) const;
@@ -193,9 +193,18 @@ class CommRouter {
   std::pair<TransportKind, Relay*> relay_for(const std::string& target);
   std::pair<TransportKind, Relay*> relay_for_payload(const std::string& target,
                                                      const Value& payload);
+  // Same classification, plus the packed byte count. A payload above the CUDA
+  // slot limit selects SHM before any device allocation happens.
+  std::pair<TransportKind, Relay*> relay_for_payload(const std::string& target,
+                                                     const Value& payload,
+                                                     int64_t packed_bytes);
+  // Slot limit used for CUDA selection, from comm_config slot_size_mb.
+  int64_t cuda_slot_bytes() const;
   std::pair<TransportKind, Relay*> relay_for_stream(const std::string& target,
                                                     const Tensor& data);
   Relay& inbound_relay(const std::string& from_stage);
+  Relay& inbound_relay(const std::string& from_stage,
+                       TransportKind advertised_transport);
   void cleanup(const std::string& request_id);
   void close();
 
@@ -208,6 +217,13 @@ class CommRouter {
   TransportKind note_transport(const std::string& direction,
                                const std::string& target, TransportKind kind);
   std::unique_ptr<Relay> build_relay(TransportKind kind);
+  // One normalization of comm_config slot_size_mb: nonpositive keeps the
+  // 512 MiB default, a value above INT_MAX is a configuration error. Selection
+  // and relay construction share it so their limits cannot diverge.
+  int slot_size_mb() const;
+  // CUDA failure state is scoped to one edge, so each target gets its own CUDA
+  // relay. Other transports share the per-kind relay.
+  Relay& relay_for_target(TransportKind kind, const std::string& target);
   std::vector<Relay*> active_relays();
 
   std::string stage_name_;
@@ -219,9 +235,13 @@ class CommRouter {
   std::set<std::string> remote_stage_names_;
   std::set<std::string> direct_cuda_ipc_targets_;
   std::map<std::string, Value> comm_config_;
-  std::unique_ptr<Relay> injected_relay_;
+  std::shared_ptr<Relay> injected_relay_;
   std::mutex relays_mu_;
+  // close() sets closed_ and closes the relays but keeps the allocations alive:
+  // callers hold raw relay pointers that must stay valid. New work is rejected.
+  bool closed_ = false;
   std::map<TransportKind, std::unique_ptr<Relay>> relays_;
+  std::map<std::string, std::unique_ptr<Relay>> target_relays_;
   // Send and receive paths query the same peer cache on different threads.
   std::mutex cuda_mu_;
   std::map<std::string, bool> cuda_ipc_peer_cache_;

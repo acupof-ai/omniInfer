@@ -2,6 +2,7 @@
 #include "omniinfer/pipeline/pipeline.hpp"
 
 #include <chrono>
+#include <exception>
 #include <iostream>
 
 namespace omniinfer {
@@ -37,6 +38,62 @@ std::string object_id_for(const std::string& request_id, uint64_t n) {
   return request_id + ":" + std::to_string(n);
 }
 
+// Rejects a DataRef before the receiver allocates or touches a relay. The
+// length is untrusted: a peer supplies it in a control message.
+void validate_data_ref(const DataRef& ref, int64_t max_payload_bytes) {
+  // Only the two host-to-host movers exist here. Reject any other transport
+  // before the untrusted length can reach an allocation.
+  const bool supported_transport =
+      (ref.transport == TransportKind::Shm ||
+       ref.transport == TransportKind::CudaIpc) &&
+      (ref.buffer.transport == TransportKind::Shm ||
+       ref.buffer.transport == TransportKind::CudaIpc);
+  if (!supported_transport) {
+    throw ProtocolError("unsupported inbound relay transport");
+  }
+  const int64_t length = ref.buffer.length;
+  if (length < 0) {
+    throw ProtocolError("data_ref buffer length is negative");
+  }
+  if (max_payload_bytes > 0 && length > max_payload_bytes) {
+    throw ProtocolError("data_ref length " + std::to_string(length) +
+                        " exceeds the configured payload limit " +
+                        std::to_string(max_payload_bytes));
+  }
+  if (ref.transport != ref.buffer.transport) {
+    throw ProtocolError("data_ref transport differs from the buffer transport");
+  }
+  int64_t total = 0;
+  for (const auto& tensor : ref.tensors) {
+    if (tensor.size < 0 || tensor.offset < 0) {
+      throw ProtocolError("tensor metadata has a negative size or offset");
+    }
+    if (tensor.offset > length || tensor.size > length - tensor.offset) {
+      throw ProtocolError("tensor metadata exceeds the data_ref buffer length");
+    }
+    if (tensor.size > length - total) {
+      throw ProtocolError("tensor metadata sizes exceed the data_ref buffer length");
+    }
+    total += tensor.size;
+  }
+  if (ref.tensors.size() == 1 &&
+      ref.tensors[0].offset + ref.tensors[0].size != length) {
+    throw ProtocolError("tensor size does not match the data_ref buffer length");
+  }
+  // Both host and device movers copy transfer_info.size bytes. A mismatch can
+  // under-copy, add trailing zeros, or defer a negative size to a later failure.
+  if (ref.buffer.transport == TransportKind::Shm ||
+      ref.buffer.transport == TransportKind::CudaIpc) {
+    const Value& info = require_field(ref.buffer.info, "transfer_info");
+    const int64_t declared = require_non_negative_int(info, "size");
+    if (declared != length) {
+      throw ProtocolError("transfer size " + std::to_string(declared) +
+                          " does not match the data_ref length " +
+                          std::to_string(length));
+    }
+  }
+}
+
 }  // namespace
 
 // ---- stage ---------------------------------------------------------------
@@ -44,10 +101,17 @@ std::string object_id_for(const std::string& request_id, uint64_t n) {
 Stage::Stage(Config config, ComputeFn compute_fn)
     : config_(std::move(config)),
       scheduler_(std::make_unique<SimpleScheduler>(std::move(compute_fn))),
-      router_(config_.name, std::nullopt, std::nullopt, {},
-              config_.gpu_stage ? std::set<std::string>{config_.name}
-                                : std::set<std::string>{},
-              {}, {}) {}
+      router_(config_.name, config_.gpu_id, config_.gpu_id, {},
+              [&] {
+                std::set<std::string> names;
+                for (const auto& [name, devices] : config_.stage_gpu_ids) {
+                  (void)devices;
+                  names.insert(name);
+                }
+                return names;
+              }(),
+              config_.stage_gpu_ids, {}, config_.comm_config,
+              config_.injected_relay) {}
 
 Stage::~Stage() {
   stop();
@@ -176,7 +240,7 @@ void Stage::reap_pending(bool all, const std::string& request_id) {
                                        : "transfer ack timed out";
   for (auto& entry : expired) {
     try {
-      entry.second.op->mark_receiver_failed(reason);
+      entry.second.op->mark_receiver_abandoned(reason);
     } catch (...) {
       // An operation without an ack protocol has no credit to release.
     }
@@ -226,6 +290,13 @@ void Stage::on_data_ready(const DataReadyMessage& msg) {
     return;
   }
   std::string object_id;
+  // Best-effort id for the failure NACK: a malformed ref throws before the full
+  // decode assigns object_id. It only labels the NACK; the decode below still
+  // decides whether the payload is accepted.
+  if (const Value* id = msg.data_ref->find("object_id");
+      id != nullptr && id->is_str()) {
+    object_id = id->as_str();
+  }
   try {
     const DataRef ref = DataRef::from_value(*msg.data_ref);
     object_id = ref.object_id;
@@ -235,13 +306,14 @@ void Stage::on_data_ready(const DataReadyMessage& msg) {
       throw ProtocolError("data_ready for " + msg.to_stage + " arrived at " +
                           config_.name);
     }
+    validate_data_ref(ref, config_.max_payload_bytes);
     Tensor dest;
     dest.device = "cpu";
     dest.dtype = "uint8";
     dest.shape = {ref.buffer.length};
     dest.bytes.assign(static_cast<size_t>(ref.buffer.length), '\0');
 
-    Relay& relay = router_.inbound_relay(msg.from_stage);
+    Relay& relay = router_.inbound_relay(msg.from_stage, ref.buffer.transport);
     relay.get(ref.buffer.info, dest);
 
     StagePayload payload = StagePayload::from_value(unpack(dest.bytes));
@@ -337,7 +409,9 @@ void Stage::send_payload(const std::string& request_id, const std::string& targe
   tensor.shape = {static_cast<int64_t>(bytes.size())};
   tensor.bytes = bytes;
 
-  auto [transport, relay] = router_.relay_for_payload(target, payload_value);
+  auto [transport, relay] =
+      router_.relay_for_payload(target, payload_value,
+                                static_cast<int64_t>(bytes.size()));
   auto op = std::shared_ptr<RelayOperation>(relay->put(tensor, request_id).release());
   const std::string object_id = object_id_for(request_id, next_object_seq_++);
   {
@@ -351,28 +425,69 @@ void Stage::send_payload(const std::string& request_id, const std::string& targe
     pending_ops_[object_id] = PendingTransfer{op, request_id, deadline};
   }
 
-  // The abort thread may have reaped this request before the operation was
-  // inserted. Recheck after insertion so a disabled timeout cannot strand its
-  // credit; an abort after this check removes the entry through reap_pending.
-  if (scheduler_->consume_if_aborted(request_id)) {
-    reap_pending(false, request_id);
-    throw ProtocolError("request aborted");
+  // Build the message before the final synchronization point: metadata() may
+  // block, and the pending lock must not be held across that wait.
+  DataReadyMessage msg;
+  try {
+    msg.request_id = request_id;
+    msg.from_stage = config_.name;
+    msg.to_stage = target;
+    msg.data_ref = make_payload_ref(payload_value, transport, op->metadata(),
+                                    static_cast<int64_t>(bytes.size()), object_id)
+                       .to_value();
+  } catch (...) {
+    // ZMQ never saw a message, so no receiver can own this block.
+    discard_pending(object_id, "data_ready build failed");
+    throw;  // the original failure reaches the caller
   }
 
-  DataReadyMessage msg;
-  msg.request_id = request_id;
-  msg.from_stage = config_.name;
-  msg.to_stage = target;
-  msg.data_ref = make_payload_ref(payload_value, transport, op->metadata(),
-                                  static_cast<int64_t>(bytes.size()), object_id)
-                     .to_value();
-  try {
-    control_plane_->send_to_stage(target, config_.next_stages.at(target),
-                                  Message{msg});
-  } catch (...) {
+  // Hold pending_mu_ across the existence check, the abort check and the send
+  // so send and reap are linearizable: either DataReady queues before reap, or
+  // reap settles the operation first and this send is skipped. The socket send
+  // has a 5-second timeout, so the hold is bounded.
+  std::exception_ptr send_failure;
+  {
+    std::unique_lock<std::mutex> lock(pending_mu_);
+    if (pending_ops_.find(object_id) == pending_ops_.end()) {
+      // A reaper settled this transfer while metadata() was running.
+      lock.unlock();
+      throw ProtocolError("transfer was already settled");
+    }
+    if (scheduler_->consume_if_aborted(request_id)) {
+      lock.unlock();
+      // reap_pending takes pending_mu_ itself, so it must run unlocked.
+      reap_pending(false, request_id);
+      throw ProtocolError("request aborted");
+    }
+    try {
+      control_plane_->send_to_stage(target, config_.next_stages.at(target),
+                                    Message{msg});
+    } catch (...) {
+      send_failure = std::current_exception();
+    }
+  }
+  if (send_failure) {
+    // ZMQ did not queue DataReady, so no receiver can own this block.
+    discard_pending(object_id, "data_ready send failed");
+    std::rethrow_exception(send_failure);
+  }
+}
+
+void Stage::discard_pending(const std::string& object_id,
+                            const char* reason) noexcept {
+  std::shared_ptr<RelayOperation> op;
+  {
     std::lock_guard<std::mutex> lock(pending_mu_);
-    pending_ops_.erase(object_id);
-    throw;
+    auto it = pending_ops_.find(object_id);
+    if (it == pending_ops_.end()) return;
+    op = it->second.op;
+    pending_ops_.erase(it);
+  }
+  // A relay without an ack protocol throws here; that must not replace the
+  // original exception or skip the erase above.
+  try {
+    op->mark_receiver_failed(reason);
+  } catch (...) {
   }
 }
 

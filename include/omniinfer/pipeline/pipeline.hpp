@@ -44,10 +44,18 @@ class Stage {
     std::map<std::string, std::string> next_stages;  // name -> endpoint
     std::map<std::string, std::string> peer_endpoints;  // every stage, for acks
     std::vector<std::string> adjacent_stages;        // names only, same host
-    bool gpu_stage = false;
+    std::optional<int> gpu_id;                       // this stage's CUDA device
+    std::map<std::string, std::vector<int>> stage_gpu_ids;  // peer name -> devices
     // A transfer whose ack never arrives must not hold a relay credit forever.
     // A value <= 0 disables the timeout.
     int transfer_timeout_ms = 30000;
+    // Largest packed payload this stage accepts from a peer. A DataRef above
+    // this bound fails before any receiver-side allocation.
+    int64_t max_payload_bytes = int64_t{1} << 30;  // 1 GiB
+    // Relay options forwarded to CommRouter (slot_size_mb, credits, worker_id).
+    std::map<std::string, Value> comm_config;
+    // Replaces every relay the router builds. Test seam only.
+    std::shared_ptr<Relay> injected_relay;
   };
 
   Stage(Config config, ComputeFn compute_fn);
@@ -77,6 +85,8 @@ class Stage {
   void fail_request(const std::string& request_id, const std::string& error);
   void send_failure_ack(const DataReadyMessage& msg, const std::string& object_id,
                         const std::string& error);
+  // Drops one pending entry and settles its operation. Never throws.
+  void discard_pending(const std::string& object_id, const char* reason) noexcept;
   // Drops selected pending transfers and frees their credits. all=true drains
   // every entry; a request_id selects only that request. Draining unblocks a
   // sender waiting in CreditAllocator::acquire.
