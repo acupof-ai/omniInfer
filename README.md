@@ -314,7 +314,7 @@ share one quantization layout; on another layout it is skipped.
 
 The recorded result for the current stage against that baseline is a **61.93%
 warm speedup on median total latency**: 63.75 ms to 39.37 ms warm median
-`total_ms`, that is `(63.75 / 39.37 - 1) * 100`, or 38.25% fewer milliseconds.
+`total_ms`, that is `(63.75 / 39.37 - 1) * 100`, or 38.24% fewer milliseconds.
 Configuration: `http_sse`, `max_tokens=64`, 20 interleaved pairs, fresh process
 per sample, 2 warmups per process, `temperature=0`,
 Qwen2.5-0.5B-Instruct-4bit.

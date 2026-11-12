@@ -241,7 +241,7 @@ are in [validation section 7](validation.md#7-future-model-acceptance-gates).
 
 | Model | Status | Target and constraints |
 | --- | --- | --- |
-| `Qwen3.5-Omni` | **PLANNED** | Authorized official API only. Verified IDs are `qwen3.5-omni-plus` and `qwen3.5-omni-flash`; they accept text, image, audio, and video input and return text or streaming speech. Authorized access is unverified, so every execution case is `NOT_COVERED`. Do not claim image or video generation. |
+| `Qwen3.5-Omni` | **PLANNED** | Authorized official API only. The documented model IDs are `qwen3.5-omni-plus` and `qwen3.5-omni-flash`; their documented interface accepts text, image, audio, and video input and returns text or streaming speech. Authorized access is unverified, so every execution case is `NOT_COVERED`. Do not claim image or video generation. |
 | `MiniMaxAI/MiniMax-H3` | **IN_PROGRESS — integration planning** | Full-stack BF16 baseline on H20B. The open H3-Base path is limited to 768p; 2K needs hosted Context-IR/Regenerate-2K modules that are not fully open. |
 | `MiniMaxAI/MiniMax-H3-Image` | **IN_PROGRESS — integration planning** | Full-stack BF16 baseline on H20B. Text-to-image and editing with up to 16 reference images. |
 
