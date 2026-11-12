@@ -22,6 +22,13 @@ using namespace umminfer;
 
 namespace {
 
+struct IpcCleanup {
+  std::vector<std::string> paths;
+  ~IpcCleanup() {
+    for (const auto& path : paths) std::remove(path.c_str());
+  }
+};
+
 void check(bool condition, const char* message, int& failures) {
   if (!condition) {
     std::cerr << message << "\n";
@@ -282,6 +289,7 @@ void test_abort_before_stage_start(int& failures) {
   for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
   Coordinator coordinator(done, abort);
   coordinator.register_stage("entry", entry, true);
   coordinator.start();
@@ -362,6 +370,7 @@ void test_submit_request_id_mismatch(int& failures) {
   for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
   PullSocket completions(done, true);
   completions.start();
   PubSocket aborts(abort);
@@ -513,6 +522,7 @@ void test_coordinator_terminal_state(int& failures) {
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
   const std::string entry_ep = "ipc://" + base + "entry";
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
   PullSocket entry(entry_ep, true);
   entry.start();
 
@@ -623,6 +633,7 @@ void test_explicit_id_does_not_reissue(int& failures) {
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
   const std::string entry_ep = "ipc://" + base + "entry";
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
 
   // Start the stage first so it is subscribed to the abort edge. announce_ready
   // is off: this test releases the entry gate itself, after the abort.
@@ -704,6 +715,7 @@ void test_two_stage_pipeline(int& failures) {
   const std::string b_ep = "ipc://" + base + "b";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   Coordinator coordinator(done_ep, abort_ep);
   coordinator.register_stage("a", a_ep);
@@ -770,6 +782,7 @@ void test_transfer_ack_timeout(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "done", base + "abort"}};
 
   Coordinator coordinator(done_ep, abort_ep);
   coordinator.register_stage("a", a_ep);
@@ -818,6 +831,7 @@ void test_abort_releases_pending_transfer(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket downstream(b_ep, true);
   downstream.start();
@@ -892,6 +906,7 @@ void test_sse_content_and_timeout(int& failures) {
   for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
 
   Coordinator coordinator(done_ep, abort_ep);
   coordinator.register_stage("entry", entry_ep);
@@ -961,6 +976,7 @@ void test_abort_cleans_stage_request(int& failures) {
   for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
 
   PullSocket done(done_ep, true);
   done.start();
@@ -1047,6 +1063,7 @@ void test_data_ready_checks_target(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
   peer.start();
@@ -1162,6 +1179,7 @@ void test_data_ready_validation(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
   peer.start();
@@ -1391,6 +1409,7 @@ void test_send_payload_faults(int& failures) {
     for (const auto& path : {base + "a", base + "done", base + "abort"}) {
       std::remove(path.c_str());
     }
+    const IpcCleanup ipc_cleanup{{base + "a", base + "done", base + "abort"}};
 
     Coordinator coordinator(done_ep, abort_ep);
     coordinator.register_stage("a", a_ep);
@@ -1488,6 +1507,7 @@ void test_abort_before_data_ready(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket downstream(b_ep, true);
   downstream.start();
@@ -1563,6 +1583,7 @@ void test_malformed_data_ref_nack(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
   peer.start();
@@ -1674,6 +1695,7 @@ void test_unsupported_transport_rejected(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
   peer.start();
@@ -1864,6 +1886,7 @@ void test_nonstream_504_maps_to_timeout(int& failures) {
   for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "done", base + "abort"}};
 
   Coordinator coordinator(done_ep, abort_ep);
   coordinator.register_stage("entry", entry_ep, true);

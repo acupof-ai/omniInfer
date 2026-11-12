@@ -22,6 +22,13 @@ namespace {
 
 int failures = 0;
 
+struct IpcCleanup {
+  std::vector<std::string> paths;
+  ~IpcCleanup() {
+    for (const auto& path : paths) std::remove(path.c_str());
+  }
+};
+
 #define CHECK(cond)                                                          \
   do {                                                                       \
     if (!(cond)) {                                                           \
@@ -226,6 +233,7 @@ void test_pipeline_end_to_end() {
   for (const auto& path : {base + "entry", base + "completion", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "completion", base + "abort"}};
 
   Coordinator coordinator(completion_ep, abort_ep);
   coordinator.register_stage("entry", entry_ep);
