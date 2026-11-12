@@ -6,8 +6,10 @@ surface. Models run in separate worker processes behind ZeroMQ/MessagePack
 control messages.
 
 The engine foundation is implemented for text chat and for a deterministic
-audio test pipeline. The unified VLM+ASR capability is **not implemented**. The
-figure below marks which parts exist.
+audio test pipeline. The in-process unified ASR -> VLM orchestration contract
+is implemented (`umminfer::UnifiedEngine`) and covered by unit/contract tests;
+real-model end-to-end VLM+ASR is **not implemented**. The figure below marks
+which parts exist.
 
 See [roadmap](docs/roadmap.md) for phases and acceptance gates, and
 [validation](docs/validation.md) for the user journeys that exist today.
@@ -144,7 +146,7 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | Image generation and edit, video jobs | `image`, `video`, `/v1/images/*`, `/v1/videos*` | Fixed upstream proxy only |
 | Trained ASR worker | — | Not implemented |
 | Real VLM worker | — | Not implemented |
-| Cross-model orchestration (for example ASR to VLM) | — | Not implemented |
+| Cross-model orchestration (for example ASR to VLM) | `UnifiedEngine` | Contract implemented; unit/contract tested, no real-model E2E |
 | Shared session across modalities | — | Not implemented |
 | Unified multimodal end-to-end acceptance | — | Not run |
 | H20B verification | — | BLOCKED; jump host authentication fails |
