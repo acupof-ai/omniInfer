@@ -8,39 +8,100 @@
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "umminfer/pipeline/pipeline.hpp"
 #include "umminfer/serve/openai_api.hpp"
+#include "umminfer/serve/realtime_api.hpp"
+#include "client/cli.hpp"
 
 namespace {
 
 using namespace umminfer;
 
 std::atomic<bool> g_running{true};
+std::atomic<bool> g_cancelled{false};
 
-void on_signal(int) { g_running = false; }
+void on_signal(int) {
+  g_running = false;
+  g_cancelled = true;
+}
 
 using Flags = std::multimap<std::string, std::string>;
 
-Flags parse_flags(int argc, char** argv, int from) {
+struct FlagError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+struct ParsedFlags {
   Flags flags;
+  bool help = false;
+};
+
+struct CommandOptions {
+  std::set<std::string> values;
+  std::set<std::string> booleans;
+  std::set<std::string> repeated;
+};
+
+CommandOptions command_options(const std::string& command) {
+  if (command == "serve") {
+    return {{"port", "host", "model", "api-key", "entry", "entry-endpoint", "completion",
+             "abort", "realtime-port", "ipc-dir", "upstream-kind", "upstream-base-url",
+             "upstream-model", "upstream-api-key", "upstream-variant"},
+            {"demo"},
+            {}};
+  }
+  // --next, --peer and --peer-gpu carry one name=value pair each and repeat.
+  return {{"name", "recv", "coordinator", "abort", "next", "peer", "gpu-id", "peer-gpu"},
+          {},
+          {"next", "peer", "peer-gpu"}};
+}
+
+ParsedFlags parse_flags(const std::string& command, int argc, char** argv, int from) {
+  const CommandOptions allowed = command_options(command);
+  ParsedFlags parsed;
+  std::set<std::string> seen;
   for (int i = from; i < argc; ++i) {
-    std::string arg = argv[i];
-    if (arg.rfind("--", 0) != 0) continue;
+    const std::string arg = argv[i];
+    if (arg == "--help") {
+      parsed.help = true;
+      continue;
+    }
+    if (arg.rfind("--", 0) != 0) throw FlagError("unexpected argument: " + arg);
     std::string key = arg.substr(2);
-    std::string value = "true";
+    std::string value;
     if (const size_t eq = key.find('='); eq != std::string::npos) {
       value = key.substr(eq + 1);
-      key = key.substr(0, eq);
-    } else if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) {
+      key.resize(eq);
+      // A boolean is a bare switch. "--demo=false" must not silently enable it.
+      if (allowed.booleans.count(key)) {
+        throw FlagError("--" + key + " does not take a value");
+      }
+      if (!allowed.values.count(key)) {
+        throw FlagError("unknown option: --" + key);
+      }
+    } else if (allowed.booleans.count(key)) {
+      value = "true";
+    } else if (allowed.values.count(key)) {
+      if (i + 1 >= argc || std::string(argv[i + 1]).rfind("--", 0) == 0) {
+        throw FlagError("--" + key + " needs a value");
+      }
       value = argv[++i];
+    } else {
+      throw FlagError("unknown option: --" + key);
     }
-    flags.emplace(std::move(key), std::move(value));
+    if (!allowed.repeated.count(key) && !seen.insert(key).second) {
+      throw FlagError("duplicate option: --" + key);
+    }
+    parsed.flags.emplace(std::move(key), std::move(value));
   }
-  return flags;
+  return parsed;
 }
 
 std::string flag(const Flags& flags, const char* key,
@@ -49,17 +110,17 @@ std::string flag(const Flags& flags, const char* key,
   return it == flags.end() ? fallback : it->second;
 }
 
-int parse_port(const Flags& flags) {
-  const std::string text = flag(flags, "port", "30000");
+int parse_port(const Flags& flags, const char* key = "port") {
+  const std::string text = flag(flags, key, "30000");
   size_t used = 0;
   int port;
   try {
     port = std::stoi(text, &used);
   } catch (const std::exception&) {
-    throw ProtocolError("invalid --port: " + text);
+    throw ProtocolError("invalid --" + std::string(key) + ": " + text);
   }
   if (used != text.size() || port < 0 || port > 65535) {
-    throw ProtocolError("invalid --port: " + text);
+    throw ProtocolError("invalid --" + std::string(key) + ": " + text);
   }
   return port;
 }
@@ -110,20 +171,41 @@ Value echo_compute(const Value& payload) {
   }
   Value::Map out;
   out["text"] = Value("echo: " + text);
+  // The echo stage returns the whole message in one pass and never truncates it.
+  out["finish_reason"] = Value("stop");
   return Value(std::move(out));
 }
 
-int usage() {
-  std::cerr
+void print_usage(std::ostream& out) {
+  out
       << "usage:\n"
       << "  umm-infer serve --port 30000 [--host 0.0.0.0] [--model omni] "
          "[--api-key K]\n"
       << "      [--entry name --entry-endpoint ipc:///tmp/x/in] "
          "[--completion ipc:///tmp/x/done] [--abort ipc:///tmp/x/abort]\n"
+         "      [--realtime-port 30001]  enable the ASR WebSocket listener\n"
       << "      [--demo]  run one in-process echo stage (development only)\n"
       << "  umm-infer stage --name N --recv EP --coordinator EP --abort EP "
          "[--next name=EP ...] [--peer name=EP ...]\n"
-         "      [--gpu-id N --peer-gpu name=N ...]  staged CUDA IPC\n";
+         "      [--gpu-id N --peer-gpu name=N ...]  staged CUDA IPC\n"
+      << "  umm-infer chat --prompt TEXT [--url URL --model M --stream]\n"
+      << "      [--image-url URL ...] [--video-url URL ...] [--audio PATH]\n"
+      << "      [--audio-out PATH --voice NAME]  speech output, requires --stream\n"
+      << "  umm-infer transcribe --url URL --model M --file audio.wav\n"
+      << "  umm-infer realtime --url URL --model M --file audio.wav [--live-result]\n"
+      << "  umm-infer image generate --url URL --model M --prompt TEXT --out PATH\n"
+      << "  umm-infer image edit --url URL --model M --prompt TEXT --image PATH ... --out PATH\n"
+      << "  umm-infer video create|status|content|delete --url URL [--id ID --out PATH]\n"
+      << "      [--variant N]  zero-based output index for video content\n"
+      << "\n"
+      << "serve upstream options (one upstream per process, no routing):\n"
+      << "  --upstream-kind qwen|sglang --upstream-base-url URL --upstream-model M\n"
+      << "  --upstream-variant omni|image|video --upstream-api-key K\n"
+      << "  UMMINFER_UPSTREAM_API_KEY is used when --upstream-api-key is absent.\n";
+}
+
+int usage() {
+  print_usage(std::cerr);
   return 2;
 }
 
@@ -153,7 +235,7 @@ int run_demo(const Flags& flags) {
     std::cerr << "failed to bind " << api_config.host << ":" << api_config.port << "\n";
     return 1;
   }
-  coordinator.register_stage("entry", entry_ep);
+  coordinator.register_stage("entry", entry_ep, true);
   coordinator.start();
   std::thread coordinator_thread([&] { coordinator.run(); });
 
@@ -162,6 +244,7 @@ int run_demo(const Flags& flags) {
   stage_config.recv_endpoint = entry_ep;
   stage_config.coordinator_endpoint = completion_ep;
   stage_config.abort_endpoint = abort_ep;
+  stage_config.announce_ready = true;
   stage_config.peer_endpoints["entry"] = entry_ep;
   Stage stage(stage_config, echo_compute);
   stage.start();
@@ -190,32 +273,73 @@ int run_demo(const Flags& flags) {
 int run_serve(const Flags& flags) {
   if (flags.count("demo")) return run_demo(flags);
 
+  ApiConfig api_config;
+  api_config.host = flag(flags, "host", api_config.host);
+  api_config.port = parse_port(flags);
+  api_config.model = flag(flags, "model", api_config.model);
+  api_config.api_key = flag(flags, "api-key", "");
+  // Fixed upstream: one process serves one upstream, one model and one
+  // variant. The upstream key is read from the environment when the flag is
+  // absent, so it does not have to appear in the process arguments.
+  api_config.upstream_kind = flag(flags, "upstream-kind");
+  api_config.upstream_base_url = flag(flags, "upstream-base-url");
+  api_config.upstream_model = flag(flags, "upstream-model");
+  api_config.upstream_variant = flag(flags, "upstream-variant");
+  api_config.upstream_api_key = flag(flags, "upstream-api-key");
+  if (api_config.upstream_api_key.empty()) {
+    const char* key = std::getenv("UMMINFER_UPSTREAM_API_KEY");
+    if (key != nullptr) api_config.upstream_api_key = key;
+  }
+  const std::string upstream_error = validate_upstream_config(api_config);
+  if (!upstream_error.empty()) {
+    std::cerr << upstream_error << "\n";
+    return usage();
+  }
+  const bool fixed_upstream = !api_config.upstream_kind.empty();
+
   const std::string entry_name = flag(flags, "entry", "entry");
   const std::string entry_ep = flag(flags, "entry-endpoint");
-  if (entry_ep.empty()) {
+  // A fixed-upstream process serves only the upstream. Without an entry
+  // endpoint it runs no local stage, so nothing is registered and /ready can
+  // answer at once.
+  if (entry_ep.empty() && !fixed_upstream) {
     std::cerr << "--entry-endpoint is required (or pass --demo)\n";
+    return usage();
+  }
+  if (entry_ep.empty() && flags.count("realtime-port")) {
+    std::cerr << "--realtime-port requires --entry-endpoint: realtime needs a local stage\n";
     return usage();
   }
   const std::string completion_ep =
       flag(flags, "completion", "ipc:///tmp/omni/completion");
   const std::string abort_ep = flag(flags, "abort", "ipc:///tmp/omni/abort");
-  ensure_ipc_parent(entry_ep);
   ensure_ipc_parent(completion_ep);
   ensure_ipc_parent(abort_ep);
 
-  ApiConfig api_config;
-  api_config.host = flag(flags, "host", api_config.host);
-  api_config.port = parse_port(flags);
-  api_config.model = flag(flags, "model", api_config.model);
   api_config.entry_stage = entry_name;
-  api_config.api_key = flag(flags, "api-key", "");
+  // True only when this process waits for an entry stage in another process.
+  api_config.external_entry_stage = !entry_ep.empty();
   Coordinator coordinator(completion_ep, abort_ep);
   OpenAIApi api(coordinator, api_config);
   if (!api.bind()) {
     std::cerr << "failed to bind " << api_config.host << ":" << api_config.port << "\n";
     return 1;
   }
-  coordinator.register_stage(entry_name, entry_ep);
+  std::unique_ptr<RealtimeApi> realtime;
+  if (flags.count("realtime-port")) {
+    ApiConfig realtime_config = api_config;
+    realtime_config.port = parse_port(flags, "realtime-port");
+    realtime = std::make_unique<RealtimeApi>(coordinator, realtime_config);
+    if (!realtime->bind()) {
+      std::cerr << "failed to bind realtime " << realtime_config.host << ":"
+                << realtime_config.port << "\n";
+      return 1;
+    }
+  }
+  if (!entry_ep.empty()) {
+    ensure_ipc_parent(entry_ep);
+    coordinator.register_stage(entry_name, entry_ep, true);
+  }
   coordinator.start();
   std::thread coordinator_thread([&] { coordinator.run(); });
 
@@ -225,14 +349,29 @@ int run_serve(const Flags& flags) {
       server_failed = g_running.exchange(false);
     }
   });
+  std::thread realtime_thread;
+  if (realtime) {
+    realtime_thread = std::thread([&] {
+      if (!realtime->listen() && g_running.exchange(false)) {
+        std::cerr << "realtime listen failed\n";
+        server_failed = true;
+      }
+    });
+  }
 
   std::cout << "umm-infer serving on " << api_config.host << ":" << api.bound_port()
             << std::endl;
+  if (realtime) {
+    std::cout << "umm-infer realtime serving on " << api_config.host << ":"
+              << realtime->bound_port() << std::endl;
+  }
   while (g_running) std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
+  if (realtime) realtime->stop();
   api.stop();
   coordinator.stop();
   server_thread.join();
+  if (realtime_thread.joinable()) realtime_thread.join();
   coordinator_thread.join();
   return server_failed ? 1 : 0;
 }
@@ -243,6 +382,7 @@ int run_stage(const Flags& flags) {
   config.recv_endpoint = flag(flags, "recv");
   config.coordinator_endpoint = flag(flags, "coordinator");
   config.abort_endpoint = flag(flags, "abort");
+  config.announce_ready = true;
   if (flags.count("gpu-id")) {
     config.gpu_id = parse_gpu_id(flag(flags, "gpu-id"), "--gpu-id");
   }
@@ -312,10 +452,23 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, on_signal);
   if (argc < 2) return usage();
   const std::string command = argv[1];
-  const auto flags = parse_flags(argc, argv, 2);
   try {
-    if (command == "serve") return run_serve(flags);
-    if (command == "stage") return run_stage(flags);
+    if (command == "serve" || command == "stage") {
+      const ParsedFlags options = parse_flags(command, argc, argv, 2);
+      if (options.help) {
+        print_usage(std::cout);
+        return 0;
+      }
+      if (command == "serve") return run_serve(options.flags);
+      return run_stage(options.flags);
+    }
+    if (command == "chat" || command == "transcribe" || command == "realtime" ||
+        command == "image" || command == "video") {
+      return umminfer::client::run_cli(command, argc, argv, &g_cancelled);
+    }
+  } catch (const FlagError& exc) {
+    std::cerr << "error: " << exc.what() << "\n";
+    return usage();
   } catch (const std::exception& exc) {
     std::cerr << "error: " << exc.what() << "\n";
     return 1;

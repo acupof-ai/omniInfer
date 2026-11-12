@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
-#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,7 +27,6 @@ class RelayOperation {
  public:
   virtual ~RelayOperation() = default;
   virtual const Value& metadata() const = 0;
-  virtual void wait_for_completion(double timeout_s = 30.0) = 0;
   virtual void mark_receiver_done() { throw ProtocolError("no receiver ack"); }
   virtual void mark_receiver_failed(const std::string& error) {
     (void)error;

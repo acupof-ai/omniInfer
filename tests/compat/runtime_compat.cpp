@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -15,10 +16,18 @@
 #include "umminfer/relay/relay.hpp"
 #include "umminfer/scheduling/simple_scheduler.hpp"
 #include "umminfer/serve/openai_api.hpp"
+#include "umminfer/client/client.hpp"
 
 using namespace umminfer;
 
 namespace {
+
+struct IpcCleanup {
+  std::vector<std::string> paths;
+  ~IpcCleanup() {
+    for (const auto& path : paths) std::remove(path.c_str());
+  }
+};
 
 void check(bool condition, const char* message, int& failures) {
   if (!condition) {
@@ -68,6 +77,26 @@ void test_batch_cost_error_reaches_request(int& failures) {
   worker.join();
 }
 
+void test_batch_result_count_mismatch(int& failures) {
+  SimpleScheduler scheduler(
+      [](const Value&) { return Value("unused"); },
+      [](const std::vector<Value>&) { return std::vector<Value>{Value("short")}; },
+      2, 0, false);
+  std::thread worker([&scheduler] { scheduler.start(); });
+  scheduler.enqueue(IncomingMessage{"count-1", "new_request", Value("a")});
+  scheduler.enqueue(IncomingMessage{"count-2", "new_request", Value("b")});
+  for (int index = 0; index < 2; ++index) {
+    const auto message = scheduler.outbox().get(2.0);
+    check(message && message->type == "error",
+          "a batch result count mismatch did not fail its request", failures);
+  }
+  scheduler.enqueue(IncomingMessage{"count-3", "new_request", Value("c")});
+  check(scheduler.outbox().get(2.0).has_value(),
+        "a batch result count mismatch killed the scheduler", failures);
+  scheduler.stop();
+  worker.join();
+}
+
 void test_later_batch_cost_error(int& failures) {
   SimpleScheduler scheduler(
       [](const Value& input) { return input; },
@@ -107,6 +136,15 @@ void test_abort_retention_and_callback(int& failures) {
     scheduler.abort("b" + std::to_string(i));
   }
   check(scheduler.is_aborted("a"), "abort capacity cleanup forgot a request", failures);
+
+  SimpleScheduler expiring(
+      [](const Value& input) { return input; }, nullptr, 1, 0, true, nullptr,
+      std::nullopt, 1, nullptr, nullptr, nullptr, std::chrono::milliseconds(1));
+  expiring.abort("expired");
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  expiring.reap_aborted();
+  check(!expiring.is_aborted("expired"), "an unused abort tombstone never expired",
+        failures);
 }
 
 void test_batch_filters_aborted_inputs(int& failures) {
@@ -211,6 +249,164 @@ void test_scheduler_control_messages(int& failures) {
     worker.join();
     check(done && shutdowns == 1, "an inbox stop message was ignored", failures);
   }
+}
+
+void test_start_after_stop_returns(int& failures) {
+  for (int i = 0; i < 100; ++i) {
+    SimpleScheduler scheduler([](const Value& input) { return input; });
+    scheduler.stop();
+    std::atomic<bool> returned{false};
+    std::thread worker([&] {
+      scheduler.start();
+      returned = true;
+    });
+    worker.join();
+    check(returned, "scheduler restarted after stop", failures);
+  }
+
+  Stage::Config config;
+  config.name = "stopped";
+  config.recv_endpoint = "ipc:///tmp/omni-stopped-before-start";
+  config.coordinator_endpoint = "ipc:///tmp/omni-stopped-coordinator";
+  config.abort_endpoint = "ipc:///tmp/omni-stopped-abort";
+  Stage stage(config, [](const Value& input) { return input; });
+  stage.stop();
+  std::atomic<bool> returned{false};
+  std::thread worker([&] {
+    stage.run();
+    returned = true;
+  });
+  worker.join();
+  check(returned, "stage restarted after stop", failures);
+}
+
+void test_abort_before_stage_start(int& failures) {
+  const std::string base =
+      "/tmp/omni-runtime-abort-before-start-" + std::to_string(getpid()) + "-";
+  const std::string entry = "ipc://" + base + "entry";
+  const std::string done = "ipc://" + base + "done";
+  const std::string abort = "ipc://" + base + "abort";
+  for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
+    std::remove(path.c_str());
+  }
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
+  Coordinator coordinator(done, abort);
+  coordinator.register_stage("entry", entry, true);
+  coordinator.start();
+  bool dynamic_registration_rejected = false;
+  try {
+    coordinator.register_stage("entry", entry, false);
+  } catch (const ProtocolError&) {
+    dynamic_registration_rejected = true;
+  }
+  check(dynamic_registration_rejected,
+        "dynamic stage re-registration was not rejected", failures);
+  std::thread coordinator_thread([&] { coordinator.run(); });
+  StagePayload payload;
+  payload.request_id = "abort-before-start";
+  payload.data = Value("must not run");
+  const std::string id = coordinator.submit(payload, "entry");
+  const auto pending = coordinator.info(id);
+  check(pending && pending->state == "pending",
+        "submit before stage ready was not held locally", failures);
+  coordinator.abort(id);
+  const auto aborted = coordinator.info(id);
+  check(aborted && aborted->state == "aborted",
+        "abort before stage ready was not terminal", failures);
+  check(coordinator.release(id), "could not release the aborted request", failures);
+  StagePayload next;
+  next.request_id = "after-ready";
+  next.data = Value("must run");
+  const std::string next_id = coordinator.submit(next, "entry");
+
+  Stage::Config config;
+  config.name = "entry";
+  config.recv_endpoint = entry;
+  config.coordinator_endpoint = done;
+  config.abort_endpoint = abort;
+  config.announce_ready = true;
+  std::atomic<int> calls{0};
+  Stage stage(config, [&](const Value& input) {
+    ++calls;
+    return input;
+  });
+  void* malformed = zmq_socket(ControlPlaneContext::get(), ZMQ_PUSH);
+  check(malformed != nullptr, "could not create malformed-frame sender", failures);
+  if (malformed) {
+    int linger = 0;
+    int send_timeout = 1000;
+    zmq_setsockopt(malformed, ZMQ_LINGER, &linger, sizeof(linger));
+    zmq_setsockopt(malformed, ZMQ_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+    check(zmq_connect(malformed, entry.c_str()) == 0,
+          "could not connect malformed-frame sender", failures);
+    const unsigned char invalid_messagepack = 0xc1;
+    check(zmq_send(malformed, &invalid_messagepack, 1, 0) == 1,
+          "could not queue malformed control frame", failures);
+  }
+  stage.start();
+  std::thread stage_thread([&] { stage.run(); });
+
+  check(coordinator.wait(next_id, 5.0), "ready flush did not run a live submit", failures);
+  const auto completed = coordinator.info(next_id);
+  check(completed && completed->state == "completed" &&
+            completed->result.as_str() == "must run",
+        "ready flush did not complete only the live submit", failures);
+  check(calls == 1, "abort before stage ready was lost", failures);
+  check(stage.request_count() == 0, "a completed submit left a stage request", failures);
+
+  stage.stop();
+  if (malformed) zmq_close(malformed);
+  coordinator.stop();
+  stage_thread.join();
+  coordinator_thread.join();
+}
+
+void test_submit_request_id_mismatch(int& failures) {
+  const std::string base =
+      "/tmp/omni-runtime-request-id-" + std::to_string(getpid()) + "-";
+  const std::string entry = "ipc://" + base + "entry";
+  const std::string done = "ipc://" + base + "done";
+  const std::string abort = "ipc://" + base + "abort";
+  for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
+    std::remove(path.c_str());
+  }
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
+  PullSocket completions(done, true);
+  completions.start();
+  PubSocket aborts(abort);
+  aborts.bind();
+  Stage::Config config;
+  config.name = "entry";
+  config.recv_endpoint = entry;
+  config.coordinator_endpoint = done;
+  config.abort_endpoint = abort;
+  std::atomic<int> calls{0};
+  Stage stage(config, [&](const Value& input) {
+    ++calls;
+    return input;
+  });
+  stage.start();
+  std::thread stage_thread([&] { stage.run(); });
+  PushSocket submits(entry);
+  submits.connect();
+  StagePayload payload;
+  payload.request_id = "inner";
+  payload.data = Value("bad");
+  SubmitMessage submit;
+  submit.request_id = "outer";
+  submit.data = payload.to_value();
+  submits.send(Message{submit});
+  const auto result = completions.recv_timeout(1000);
+  check(result && std::holds_alternative<CompleteMessage>(*result) &&
+            std::get<CompleteMessage>(*result).request_id == "outer" &&
+            !std::get<CompleteMessage>(*result).success,
+        "mismatched submit request IDs were accepted", failures);
+  check(calls == 0, "mismatched submit request IDs executed compute", failures);
+  stage.stop();
+  stage_thread.join();
+  submits.close();
+  aborts.close();
+  completions.close();
 }
 
 void test_ack_releases_shm_credit(int& failures) {
@@ -326,6 +522,7 @@ void test_coordinator_terminal_state(int& failures) {
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
   const std::string entry_ep = "ipc://" + base + "entry";
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
   PullSocket entry(entry_ep, true);
   entry.start();
 
@@ -333,7 +530,9 @@ void test_coordinator_terminal_state(int& failures) {
   coordinator.register_stage("entry", entry_ep);
   coordinator.start();
   std::atomic<int> completions{0};
+  std::atomic<int> streams{0};
   coordinator.on_complete = [&](const RequestInfo&) { ++completions; };
+  coordinator.on_stream = [&](const StreamMessage&) { ++streams; };
   std::thread run_thread([&] { coordinator.run(); });
 
   StagePayload explicit_payload;
@@ -359,20 +558,153 @@ void test_coordinator_terminal_state(int& failures) {
   late.success = true;
   late.result = Value("late");
   completion.send(Message{late});
+  StreamMessage late_stream;
+  late_stream.request_id = "req-1";
+  late_stream.from_stage = "entry";
+  late_stream.chunk = Value("late");
+  completion.send(Message{late_stream});
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   const auto info = coordinator.info("req-1");
   check(info && info->state == "aborted", "a late completion overwrote an abort", failures);
   check(completions == 1, "terminal callbacks were not emitted exactly once", failures);
+  check(streams == 0, "a late stream chunk escaped an aborted request", failures);
 
   coordinator.release("req-1");
   coordinator.release(generated);
   check(!coordinator.info("req-1"), "release retained the request", failures);
   check(coordinator.in_flight() == 0, "released requests remained in flight", failures);
 
+  // An explicit id in the generated namespace moves the counter to its value.
+  StagePayload leading;
+  leading.request_id = "req-0042";
+  coordinator.submit(leading, "entry");
+  const std::string after_leading = coordinator.submit(StagePayload{}, "entry");
+  check(after_leading == "req-43",
+        "an explicit leading-zero id did not advance the counter", failures);
+
+  // A non-numeric or out-of-range id leaves the counter alone.
+  StagePayload word_id;
+  word_id.request_id = "req-abc";
+  coordinator.submit(word_id, "entry");
+  StagePayload overflow_id;
+  overflow_id.request_id = "req-99999999999999999999";
+  coordinator.submit(overflow_id, "entry");
+  const std::string after_word = coordinator.submit(StagePayload{}, "entry");
+  check(after_word == "req-44",
+        "a non-numeric or out-of-range explicit id moved the counter", failures);
+
+  // Exactly 2^64 does not fit either, so it must not move the counter.
+  StagePayload above_max;
+  above_max.request_id = "req-18446744073709551616";
+  coordinator.submit(above_max, "entry");
+  const std::string after_above_max = coordinator.submit(StagePayload{}, "entry");
+  check(after_above_max == "req-45",
+        "an explicit id above the 64-bit range moved the counter", failures);
+
+  // The largest id consumes the last number. Automatic allocation must fail,
+  // not wrap to req-0, and must leave no request behind.
+  const size_t in_flight_before = coordinator.in_flight();
+  StagePayload last_id;
+  last_id.request_id = "req-18446744073709551615";
+  coordinator.submit(last_id, "entry");
+  bool exhausted = false;
+  try {
+    coordinator.submit(StagePayload{}, "entry");
+  } catch (const ProtocolError&) {
+    exhausted = true;
+  }
+  check(exhausted, "automatic allocation wrapped the request id counter", failures);
+  check(coordinator.in_flight() == in_flight_before + 1,
+        "a rejected allocation left a pending request", failures);
+
   completion.close();
   coordinator.stop();
   run_thread.join();
   entry.close();
+}
+
+// An explicit "req-N" must move the generator past N. Otherwise a released id
+// is handed out again, and the stage's abort tombstone, which outlives the
+// release, drops the new request without a completion.
+void test_explicit_id_does_not_reissue(int& failures) {
+  const std::string base =
+      "/tmp/omni-runtime-idreuse-" + std::to_string(getpid()) + "-";
+  remove_ipc("idreuse");
+  const std::string done_ep = "ipc://" + base + "done";
+  const std::string abort_ep = "ipc://" + base + "abort";
+  const std::string entry_ep = "ipc://" + base + "entry";
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
+
+  // Start the stage first so it is subscribed to the abort edge. announce_ready
+  // is off: this test releases the entry gate itself, after the abort.
+  Stage::Config config;
+  config.name = "entry";
+  config.recv_endpoint = entry_ep;
+  config.coordinator_endpoint = done_ep;
+  config.abort_endpoint = abort_ep;
+  Stage stage(config, [](const Value& value) { return value; });
+  stage.start();
+  std::thread stage_thread([&] { stage.run(); });
+
+  Coordinator coordinator(done_ep, abort_ep);
+  coordinator.register_stage("entry", entry_ep, /*require_ready=*/true);
+  coordinator.start();
+  std::thread coordinator_thread([&] { coordinator.run(); });
+  // No submit has reached the stage yet, so the only abort path to it is the
+  // PUB socket. Let the stage's SUB handshake finish before using it: a PUB
+  // message sent before the subscription is established is dropped.
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  // The first request holds the entry stage; req-2 waits behind it.
+  StagePayload occupant_payload;
+  occupant_payload.data = Value("occupy");
+  const std::string occupant = coordinator.submit(occupant_payload, "entry");
+  StagePayload explicit_payload;
+  explicit_payload.request_id = "req-2";
+  explicit_payload.data = Value("aborted");
+  coordinator.submit(explicit_payload, "entry");
+
+  // Abort while the submit is still queued in the coordinator. The stage never
+  // sees a submit for req-2, so its tombstone for that id stays live.
+  coordinator.abort("req-2");
+  coordinator.release("req-2");
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  PushSocket ready(done_ep);
+  ready.connect();
+  ready.send(Message{StageReadyMessage{"entry"}});
+  check(coordinator.wait(occupant, 5.0), "the occupying request timed out", failures);
+  coordinator.release(occupant);
+
+  // The live tombstone still drops a submit that reuses req-2.
+  StagePayload reused_payload;
+  reused_payload.request_id = "req-2";
+  reused_payload.data = Value("reused");
+  coordinator.submit(reused_payload, "entry");
+  check(!coordinator.wait("req-2", 0.5),
+        "the stage did not retain the abort tombstone across release", failures);
+  coordinator.abort("req-2");
+  coordinator.release("req-2");
+
+  // Automatic allocation must skip req-2 and settle normally.
+  StagePayload after_payload;
+  after_payload.data = Value("after");
+  const std::string after = coordinator.submit(after_payload, "entry");
+  check(after != "req-2",
+        "an automatic request id reused a released explicit id", failures);
+  check(coordinator.wait(after, 5.0),
+        "a request after an aborted explicit id was swallowed by its tombstone",
+        failures);
+  const auto after_info = coordinator.info(after);
+  check(after_info && after_info->state == "completed",
+        "a request after an aborted explicit id did not complete", failures);
+  coordinator.release(after);
+
+  ready.close();
+  coordinator.stop();
+  coordinator_thread.join();
+  stage.stop();
+  stage_thread.join();
 }
 
 void test_two_stage_pipeline(int& failures) {
@@ -383,6 +715,7 @@ void test_two_stage_pipeline(int& failures) {
   const std::string b_ep = "ipc://" + base + "b";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   Coordinator coordinator(done_ep, abort_ep);
   coordinator.register_stage("a", a_ep);
@@ -449,6 +782,7 @@ void test_transfer_ack_timeout(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "done", base + "abort"}};
 
   Coordinator coordinator(done_ep, abort_ep);
   coordinator.register_stage("a", a_ep);
@@ -497,6 +831,7 @@ void test_abort_releases_pending_transfer(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket downstream(b_ep, true);
   downstream.start();
@@ -571,6 +906,7 @@ void test_sse_content_and_timeout(int& failures) {
   for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
 
   Coordinator coordinator(done_ep, abort_ep);
   coordinator.register_stage("entry", entry_ep);
@@ -640,6 +976,7 @@ void test_abort_cleans_stage_request(int& failures) {
   for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
 
   PullSocket done(done_ep, true);
   done.start();
@@ -726,6 +1063,7 @@ void test_data_ready_checks_target(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
   peer.start();
@@ -841,6 +1179,7 @@ void test_data_ready_validation(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
   peer.start();
@@ -970,6 +1309,39 @@ void test_data_ready_validation(int& failures) {
     check(calls == 1, "the valid request did not run compute", failures);
   }
 
+  {
+    StagePayload payload;
+    payload.request_id = "inner-data-ready";
+    payload.data = Value("bad");
+    const std::string bytes = pack(payload.to_value());
+    ShmRelay relay("mismatched_data_ready_source", 1, 1);
+    Tensor source;
+    source.device = "cpu";
+    source.dtype = "uint8";
+    source.shape = {static_cast<int64_t>(bytes.size())};
+    source.bytes = bytes;
+    auto operation = relay.put(source, "outer-data-ready");
+    DataRef ref = make_ref("mismatched-data-ready", static_cast<int64_t>(bytes.size()),
+                           TransportKind::Shm,
+                           static_cast<int64_t>(bytes.size()), operation->metadata());
+    DataReadyMessage ready;
+    ready.request_id = "outer-data-ready";
+    ready.from_stage = "a";
+    ready.to_stage = "b";
+    ready.data_ref = ref.to_value();
+    sender.send(Message{ready});
+    const auto ack = peer.recv_timeout(1000);
+    check(ack && std::holds_alternative<DataAckMessage>(*ack) &&
+              !std::get<DataAckMessage>(*ack).success,
+          "mismatched data_ready request IDs were not rejected", failures);
+    const auto result = done.recv_timeout(1000);
+    check(result && std::holds_alternative<CompleteMessage>(*result) &&
+              std::get<CompleteMessage>(*result).request_id == "outer-data-ready" &&
+              !std::get<CompleteMessage>(*result).success,
+          "mismatched data_ready completed under the inner ID", failures);
+    check(calls == 1, "mismatched data_ready request IDs executed compute", failures);
+  }
+
   stage.stop();
   stage_thread.join();
   sender.close();
@@ -983,7 +1355,6 @@ void test_data_ready_validation(int& failures) {
 class NoAckOperation : public RelayOperation {
  public:
   const Value& metadata() const override { return metadata_; }
-  void wait_for_completion(double) override {}
 
  private:
   Value metadata_ = Value::map({});
@@ -1038,6 +1409,7 @@ void test_send_payload_faults(int& failures) {
     for (const auto& path : {base + "a", base + "done", base + "abort"}) {
       std::remove(path.c_str());
     }
+    const IpcCleanup ipc_cleanup{{base + "a", base + "done", base + "abort"}};
 
     Coordinator coordinator(done_ep, abort_ep);
     coordinator.register_stage("a", a_ep);
@@ -1100,7 +1472,6 @@ class LatchOperation : public RelayOperation {
     }
     return metadata_;
   }
-  void wait_for_completion(double) override {}
   void mark_receiver_done() override { ++state_->settled; }
   void mark_receiver_failed(const std::string&) override { ++state_->settled; }
   void mark_receiver_abandoned(const std::string&) override { ++state_->settled; }
@@ -1136,6 +1507,7 @@ void test_abort_before_data_ready(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket downstream(b_ep, true);
   downstream.start();
@@ -1211,6 +1583,7 @@ void test_malformed_data_ref_nack(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
   peer.start();
@@ -1322,6 +1695,7 @@ void test_unsupported_transport_rejected(int& failures) {
   for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
     std::remove(path.c_str());
   }
+  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
   peer.start();
@@ -1499,25 +1873,116 @@ void test_slot_size_range(int& failures) {
         failures);
 }
 
+// A real non-streaming chat request waits for the pending entry request until
+// the configured server timeout and then answers 504. The entry stage is
+// registered with require_ready but no stage is started, so the request stays
+// pending on the supported pre-readiness path. No fake stage or model is used.
+void test_nonstream_504_maps_to_timeout(int& failures) {
+  const std::string base =
+      "/tmp/omni-runtime-504-" + std::to_string(getpid()) + "-";
+  const std::string entry_ep = "ipc://" + base + "entry";
+  const std::string done_ep = "ipc://" + base + "done";
+  const std::string abort_ep = "ipc://" + base + "abort";
+  for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
+    std::remove(path.c_str());
+  }
+  const IpcCleanup ipc_cleanup{{base + "done", base + "abort"}};
+
+  Coordinator coordinator(done_ep, abort_ep);
+  coordinator.register_stage("entry", entry_ep, true);
+  coordinator.start();
+  std::thread coordinator_thread([&] { coordinator.run(); });
+
+  ApiConfig api_config;
+  api_config.host = "127.0.0.1";
+  api_config.port = 0;
+  api_config.model = "omni";
+  api_config.request_timeout_s = 0.2;
+  OpenAIApi api(coordinator, api_config);
+  if (!api.bind()) {
+    check(false, "504 test server did not bind", failures);
+    coordinator.stop();
+    coordinator_thread.join();
+    return;
+  }
+  std::thread server_thread([&] { (void)api.listen(); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  client::OpenAIConfig client_config;
+  client_config.base_url =
+      "http://127.0.0.1:" + std::to_string(api.bound_port()) + "/v1";
+  client_config.model = "omni";
+  client_config.max_attempts = 1;
+  client_config.timeout = client::Milliseconds{2000};
+  client::ChatRequest request;
+  request.messages.push_back(client::Message{"user", "hi"});
+
+  bool mapped = false;
+  bool retryable = false;
+  int status = 0;
+  std::string detail;
+  const auto started = std::chrono::steady_clock::now();
+  try {
+    (void)client::OpenAIClient(client_config).chat(request);
+  } catch (const client::Error& error) {
+    mapped = error.code() == client::ErrorCode::kTimeout;
+    status = error.status();
+    retryable = error.retryable();
+    detail = error.what();
+  } catch (const std::exception& error) {
+    detail = error.what();
+  }
+  const double elapsed = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+  check(mapped, "non-streaming 504 did not map to kTimeout", failures);
+  check(status == 504, "non-streaming 504 lost its HTTP status", failures);
+  check(retryable, "non-streaming 504 was not retryable", failures);
+  check(detail.find("HTTP 504: request timed out") != std::string::npos,
+        "non-streaming 504 error text was incomplete", failures);
+  check(elapsed >= 0.15 && elapsed < 3.0,
+        "non-streaming 504 did not use the configured server wait", failures);
+
+  // The handler releases the request before it writes the 504, so the
+  // coordinator must already be empty while it is still running. Checking
+  // after stop() would be vacuous because stop() aborts every request.
+  check(coordinator.in_flight() == 0,
+        "non-streaming 504 left a request in flight", failures);
+  api.stop();
+  server_thread.join();
+  coordinator.stop();
+  coordinator_thread.join();
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   alarm(20);
   int failures = 0;
+  if (argc == 2 && std::string_view(argv[1]) == "--abort-before-start") {
+    test_abort_before_stage_start(failures);
+    return failures == 0 ? 0 : 1;
+  }
   test_batch_strings_are_results(failures);
   test_batch_cost_error_reaches_request(failures);
+  test_batch_result_count_mismatch(failures);
   test_later_batch_cost_error(failures);
   test_abort_retention_and_callback(failures);
   test_batch_filters_aborted_inputs(failures);
   test_batch_cost_overflow(failures);
   test_scheduler_control_messages(failures);
+  test_start_after_stop_returns(failures);
+  test_abort_before_stage_start(failures);
+  test_submit_request_id_mismatch(failures);
   test_ack_releases_shm_credit(failures);
   test_wire_boundaries(failures);
   test_coordinator_terminal_state(failures);
+  test_explicit_id_does_not_reissue(failures);
   test_two_stage_pipeline(failures);
   test_transfer_ack_timeout(failures);
   test_abort_releases_pending_transfer(failures);
   test_sse_content_and_timeout(failures);
+  test_nonstream_504_maps_to_timeout(failures);
   test_abort_cleans_stage_request(failures);
   test_data_ready_checks_target(failures);
   test_data_ready_validation(failures);

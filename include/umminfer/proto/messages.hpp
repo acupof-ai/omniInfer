@@ -106,11 +106,6 @@ struct StagePayload {
   static StagePayload from_value(const Value& v);
 };
 
-struct RoutedPayloads {
-  std::map<std::string, StagePayload> payloads;
-  bool keep_request_state = false;
-};
-
 // ---- admin.py ------------------------------------------------------------
 
 inline constexpr const char* kAdminModelInfo = "model_info";
@@ -248,6 +243,12 @@ struct AbortMessage {
   static AbortMessage from_value(const Value& v);
 };
 
+struct StageReadyMessage {
+  std::string from_stage;
+  Value to_value() const;
+  static StageReadyMessage from_value(const Value& v);
+};
+
 struct CompleteMessage {
   std::string request_id;
   std::string from_stage;
@@ -323,7 +324,7 @@ struct AdminResultMessage {
 // Every control-plane message the stage and coordinator exchange.
 using Message = std::variant<DataReadyMessage, StreamChunkBatchMessage, DataAckMessage,
                              KVTransferPrepareMessage, KVTransferReadyMessage,
-                             AbortMessage, CompleteMessage, StreamMessage,
+                             AbortMessage, StageReadyMessage, CompleteMessage, StreamMessage,
                              SubmitMessage, ShutdownMessage, FreezeGCMessage,
                              ProfilerStartMessage, ProfilerStopMessage, AdminMessage,
                              AdminResultMessage>;

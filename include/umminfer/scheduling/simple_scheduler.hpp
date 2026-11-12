@@ -22,8 +22,6 @@
 
 namespace umminfer {
 
-using IncomingMessageType = std::string;  // new_request, abort, stop, wakeup, ...
-
 struct IncomingMessage {
   std::string request_id;
   std::string type;
@@ -32,10 +30,8 @@ struct IncomingMessage {
 
 struct OutgoingMessage {
   std::string request_id;
-  std::string type;  // result, stream, error
+  std::string type;  // result, error
   Value data;
-  std::optional<std::string> target;
-  std::optional<Value> metadata;
 };
 
 // Bounded-free thread-safe queue; the C++ stand-in for queue.Queue.
@@ -94,7 +90,8 @@ class SimpleScheduler {
                   int max_concurrency = 1,
                   std::function<void(const std::string&)> abort_callback = nullptr,
                   std::function<void()> shutdown_callback = nullptr,
-                  RequestArrivalHook request_arrival_hook = nullptr);
+                  RequestArrivalHook request_arrival_hook = nullptr,
+                  std::chrono::milliseconds abort_retention = std::chrono::minutes(10));
 
   MessageQueue<IncomingMessage>& inbox() { return inbox_; }
   MessageQueue<OutgoingMessage>& outbox() { return outbox_; }
@@ -106,12 +103,13 @@ class SimpleScheduler {
 
   bool is_aborted(const std::string& request_id);
   bool consume_if_aborted(const std::string& request_id);
+  void reap_aborted();
 
  private:
   void run_serial();
   void run_concurrent();
   void run_single(const IncomingMessage& msg);
-  void run_batch(const std::vector<IncomingMessage>& batch);
+  void run_batch(std::vector<IncomingMessage> batch);
   void collect_batch(std::vector<IncomingMessage>& batch);
   int64_t message_cost(const IncomingMessage& msg) const;
   void emit_result(const std::string& request_id, Value result);
@@ -135,9 +133,12 @@ class SimpleScheduler {
   std::mutex pending_mu_;
 
   std::mutex abort_mu_;
-  std::set<std::string> aborted_;
+  std::chrono::milliseconds abort_retention_;
+  std::map<std::string, std::chrono::steady_clock::time_point> aborted_;
 
   std::atomic<bool> running_{false};
+  std::atomic<bool> stopped_{false};
+  std::mutex lifecycle_mu_;
 };
 
 }  // namespace umminfer

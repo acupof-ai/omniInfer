@@ -102,12 +102,13 @@ class StageControlPlane {
   std::optional<Message> recv_nowait();
   void send_to_stage(const std::string& next_stage, const std::string& endpoint,
                      const Message& msg);
+  void send_ready(const StageReadyMessage& msg);
   void send_complete(const CompleteMessage& msg);
   void send_stream(const StreamMessage& msg);
   void send_admin_result(const AdminResultMessage& msg);
   AbortMessage recv_abort();
-  // Non-blocking check so the abort loop can observe shutdown.
-  bool recv_abort_ready(int timeout_ms);
+  // Waits up to timeout_ms for an abort; false on timeout.
+  bool poll_abort(int timeout_ms);
   void close();
 
  private:

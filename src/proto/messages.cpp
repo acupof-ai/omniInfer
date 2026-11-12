@@ -733,6 +733,17 @@ AbortMessage AbortMessage::from_value(const Value& v) {
   return AbortMessage{require_str(v, "request_id")};
 }
 
+Value StageReadyMessage::to_value() const {
+  Value::Map m;
+  m["type"] = Value("stage_ready");
+  m["from_stage"] = Value(from_stage);
+  return Value(std::move(m));
+}
+
+StageReadyMessage StageReadyMessage::from_value(const Value& v) {
+  return StageReadyMessage{require_str(v, "from_stage")};
+}
+
 Value CompleteMessage::to_value() const {
   Value::Map m;
   m["type"] = Value("complete");
@@ -886,6 +897,7 @@ Message parse_message(const Value& v) {
   if (type == "kv_transfer_prepare") return KVTransferPrepareMessage::from_value(v);
   if (type == "kv_transfer_ready") return KVTransferReadyMessage::from_value(v);
   if (type == "abort") return AbortMessage::from_value(v);
+  if (type == "stage_ready") return StageReadyMessage::from_value(v);
   if (type == "complete") return CompleteMessage::from_value(v);
   if (type == "stream") return StreamMessage::from_value(v);
   if (type == "submit") return SubmitMessage::from_value(v);
@@ -911,6 +923,7 @@ const char* message_type_name(const Message& msg) {
         else if constexpr (std::is_same_v<T, KVTransferReadyMessage>)
           return "kv_transfer_ready";
         else if constexpr (std::is_same_v<T, AbortMessage>) return "abort";
+        else if constexpr (std::is_same_v<T, StageReadyMessage>) return "stage_ready";
         else if constexpr (std::is_same_v<T, CompleteMessage>) return "complete";
         else if constexpr (std::is_same_v<T, StreamMessage>) return "stream";
         else if constexpr (std::is_same_v<T, SubmitMessage>) return "submit";

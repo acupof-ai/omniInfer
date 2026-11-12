@@ -15,6 +15,7 @@ import tempfile
 import time
 
 API_KEY = "test-key"
+SHUTDOWN_TIMEOUT_S = float(os.environ.get("UMMINFER_SHUTDOWN_TIMEOUT_S", "2"))
 
 
 def free_port():
@@ -179,16 +180,19 @@ def check_disconnect_and_shutdown(binary, root, log):
         wait_ready(process, port)
         body = json.dumps(
             {"messages": [{"role": "user", "content": "rst"}], "stream": True})
-        for _ in range(3):
-            with socket.create_connection(("127.0.0.1", port), timeout=1) as sock:
-                sock.sendall(
-                    (f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-                     f"Authorization: Bearer {API_KEY}\r\nContent-Type: application/json\r\n"
-                     f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}")
-                    .encode())
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                                struct.pack("ii", 1, 0))
-        wait_in_flight(port, 0)
+        for stream in (False, True):
+            body = json.dumps(
+                {"messages": [{"role": "user", "content": "rst"}], "stream": stream})
+            for _ in range(3):
+                with socket.create_connection(("127.0.0.1", port), timeout=1) as sock:
+                    sock.sendall(
+                        (f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                         f"Authorization: Bearer {API_KEY}\r\nContent-Type: application/json\r\n"
+                         f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}")
+                        .encode())
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                    struct.pack("ii", 1, 0))
+            wait_in_flight(port, 0)
 
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
         conn.request("POST", "/v1/chat/completions", body=body,
@@ -205,7 +209,7 @@ def check_disconnect_and_shutdown(binary, root, log):
             pending = pool.submit(chat, port, "stalled")
             wait_in_flight(port, 1)
             process.send_signal(signal.SIGTERM)
-            assert process.wait(timeout=2) == 0
+            assert process.wait(timeout=SHUTDOWN_TIMEOUT_S) == 0
             try:
                 pending.result(timeout=3)
             except (OSError, http.client.HTTPException):
@@ -232,7 +236,7 @@ def check_startup_shutdown(binary, root):
             line = process.stdout.readline()
             assert "serving on" in line, line
             process.send_signal(signal.SIGTERM)
-            code = process.wait(timeout=2)
+            code = process.wait(timeout=SHUTDOWN_TIMEOUT_S)
             assert code == 0, (iteration, code)
         finally:
             if process.poll() is None:

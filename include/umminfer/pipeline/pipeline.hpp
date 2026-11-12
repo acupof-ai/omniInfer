@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,7 +44,6 @@ class Stage {
     std::string abort_endpoint;        // stage subscribes here
     std::map<std::string, std::string> next_stages;  // name -> endpoint
     std::map<std::string, std::string> peer_endpoints;  // every stage, for acks
-    std::vector<std::string> adjacent_stages;        // names only, same host
     std::optional<int> gpu_id;                       // this stage's CUDA device
     std::map<std::string, std::vector<int>> stage_gpu_ids;  // peer name -> devices
     // A transfer whose ack never arrives must not hold a relay credit forever.
@@ -52,6 +52,9 @@ class Stage {
     // Largest packed payload this stage accepts from a peer. A DataRef above
     // this bound fails before any receiver-side allocation.
     int64_t max_payload_bytes = int64_t{1} << 30;  // 1 GiB
+    // Announces stage_ready after the control plane and abort subscription start.
+    // Embedded users that do not gate Submit can leave this disabled.
+    bool announce_ready = false;
     // Relay options forwarded to CommRouter (slot_size_mb, credits, worker_id).
     std::map<std::string, Value> comm_config;
     // Replaces every relay the router builds. Test seam only.
@@ -67,16 +70,13 @@ class Stage {
 
   const std::string& name() const { return config_.name; }
   size_t request_count();
-  CommRouter& router() { return router_; }
-  SimpleScheduler& scheduler() { return *scheduler_; }
-
-  // Sends one payload across an edge. Public so tests and sibling stages can
-  // exercise the data plane without a full pipeline.
-  void send_payload(const std::string& request_id, const std::string& target,
-                    const StagePayload& payload);
 
  private:
+  // Sends one payload across an edge.
+  void send_payload(const std::string& request_id, const std::string& target,
+                    const StagePayload& payload);
   void execute(StagePayload payload);
+  void handle_message(Message msg);
   void route_result(const std::string& request_id, Value result);
   void on_submit(const SubmitMessage& msg);
   void on_data_ready(const DataReadyMessage& msg);
@@ -111,6 +111,8 @@ class Stage {
 
   std::atomic<uint64_t> next_object_seq_{0};
   std::atomic<bool> running_{false};
+  std::atomic<bool> stopped_{false};
+  std::mutex lifecycle_mu_;
   std::thread scheduler_thread_;
   std::thread abort_thread_;
   std::thread outbox_thread_;
@@ -124,12 +126,24 @@ class Coordinator {
   Coordinator(std::string completion_endpoint, std::string abort_endpoint);
   ~Coordinator();
 
-  void register_stage(const std::string& name, const std::string& endpoint);
+  // Register every stage before start; dynamic re-registration is rejected.
+  // require_ready holds Submit locally until that stage sends stage_ready.
+  // The default preserves compatibility for embedded legacy external stages.
+  void register_stage(const std::string& name, const std::string& endpoint,
+                      bool require_ready = false);
+  // True after that stage sent stage_ready. False before, and false for a
+  // stage that was not registered with require_ready.
+  bool stage_ready(const std::string& name) const;
   void start();
   void run();  // blocks; pumps completions and stream chunks
   void stop();
 
   // Returns the request id. The coordinator generates one from a counter.
+  // A caller-supplied id must stay unique for this coordinator's lifetime,
+  // including after release: delayed abort frames can outlive the result record.
+  // An explicit id of the form req-<decimal> advances the generator past it, so
+  // a released explicit id is never reissued automatically. Automatic
+  // allocation throws ProtocolError once the counter reaches its maximum.
   std::string submit(StagePayload payload, const std::string& entry_stage);
   bool wait(const std::string& request_id, double timeout_s);
   std::optional<RequestInfo> info(const std::string& request_id);
@@ -151,6 +165,9 @@ class Coordinator {
   std::string abort_endpoint_;
   std::unique_ptr<CoordinatorControlPlane> control_plane_;
   std::map<std::string, std::string> endpoints_;
+  std::set<std::string> stages_requiring_ready_;
+  std::set<std::string> ready_stages_;
+  std::map<std::string, std::deque<SubmitMessage>> pending_submits_;
 
   mutable std::mutex mu_;
   std::condition_variable cv_;

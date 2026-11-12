@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -85,9 +84,7 @@ class ShmPutOperation : public ShmOperation {
       : ShmOperation(std::move(metadata)),
         shm_name_(std::move(shm_name)),
         credit_(credit),
-        credits_(std::move(credits)),
-        promise_(std::make_shared<std::promise<void>>()),
-        future_(promise_->get_future().share()) {}
+        credits_(std::move(credits)) {}
 
   ~ShmPutOperation() override {
     // The block must not outlive its sender, whether or not the receiver ever
@@ -96,33 +93,15 @@ class ShmPutOperation : public ShmOperation {
     release_credit();
   }
 
-  void wait_for_completion(double timeout_s = 30.0) override {
-    if (completed_) return;
-    if (future_.wait_for(std::chrono::duration<double>(timeout_s)) !=
-        std::future_status::ready) {
-      completed_ = true;
-      release_credit();
-      throw ProtocolError("SHM block " + shm_name_ + " was not consumed in time");
-    }
-    try {
-      future_.get();
-    } catch (...) {
-      completed_ = true;
-      throw;
-    }
-    completed_ = true;
-  }
-
   // A completion is reported once and frees the credit once, no matter whether
-  // it arrived through an ack, a timeout, or this operation's destruction.
+  // it arrived through an ack or this operation's destruction.
   void mark_receiver_done() override {
     if (acked_.exchange(true)) return;
-    promise_->set_value();
     release_credit();
   }
   void mark_receiver_failed(const std::string& error) override {
+    (void)error;
     if (acked_.exchange(true)) return;
-    promise_->set_exception(std::make_exception_ptr(ProtocolError(error)));
     release_credit();
   }
 
@@ -136,9 +115,6 @@ class ShmPutOperation : public ShmOperation {
   int64_t credit_;
   // Held by shared_ptr: the operation may outlive ShmRelay.
   std::shared_ptr<CreditAllocator> credits_;
-  std::shared_ptr<std::promise<void>> promise_;
-  std::shared_future<void> future_;
-  std::atomic<bool> completed_{false};
   std::atomic<bool> acked_{false};
   std::atomic<bool> released_{false};
 };
@@ -253,9 +229,7 @@ class CudaIpcPutOperation : public RelayOperation {
                       int64_t credit)
       : metadata_(std::move(metadata)),
         shared_(std::move(shared)),
-        credit_(credit),
-        promise_(std::make_shared<std::promise<void>>()),
-        future_(promise_->get_future().share()) {}
+        credit_(credit) {}
 
   ~CudaIpcPutOperation() override {
     // An ack means the receiver finished with the block, so the slot stays in
@@ -267,34 +241,14 @@ class CudaIpcPutOperation : public RelayOperation {
 
   const Value& metadata() const override { return metadata_; }
 
-  void wait_for_completion(double timeout_s = 30.0) override {
-    if (completed_) return;
-    if (future_.wait_for(std::chrono::duration<double>(timeout_s)) !=
-        std::future_status::ready) {
-      completed_ = true;
-      // A late receiver may still read the block, so this is an abandonment,
-      // not a plain failure: retire the buffer and poison the relay.
-      mark_receiver_abandoned("CUDA IPC block was not consumed in time");
-      throw ProtocolError("CUDA IPC block was not consumed in time");
-    }
-    try {
-      future_.get();
-    } catch (...) {
-      completed_ = true;
-      throw;
-    }
-    completed_ = true;
-  }
-
   void mark_receiver_done() override {
     if (acked_.exchange(true)) return;
-    promise_->set_value();
     release_credit();
   }
 
   void mark_receiver_failed(const std::string& error) override {
+    (void)error;
     if (acked_.exchange(true)) return;
-    promise_->set_exception(std::make_exception_ptr(ProtocolError(error)));
     release_credit();
   }
 
@@ -314,7 +268,6 @@ class CudaIpcPutOperation : public RelayOperation {
     // The receiver may still map this block, so it must leave the pool before
     // the credit is released and a later put could reuse it.
     retire_slot(shared_, credit_);
-    promise_->set_exception(std::make_exception_ptr(ProtocolError(reason)));
     release_credit();
   }
 
@@ -327,9 +280,6 @@ class CudaIpcPutOperation : public RelayOperation {
   Value metadata_;
   std::shared_ptr<CudaIpcShared> shared_;
   int64_t credit_;
-  std::shared_ptr<std::promise<void>> promise_;
-  std::shared_future<void> future_;
-  std::atomic<bool> completed_{false};
   std::atomic<bool> acked_{false};
   std::atomic<bool> abandoned_{false};
   std::atomic<bool> released_{false};
@@ -534,14 +484,24 @@ ShmRelay::ShmRelay(std::string engine_id, int slot_size_mb, int credits)
 std::unique_ptr<RelayOperation> ShmRelay::put(const Tensor& tensor,
                                               const std::string& request_id) {
   const int64_t credit = credits_->acquire();
+  struct CreditGuard {
+    std::shared_ptr<CreditAllocator> credits;
+    int64_t credit;
+    bool active = true;
+    ~CreditGuard() {
+      if (active) credits->release(credit);
+    }
+  } guard{credits_, credit};
   const std::string name = fresh_shm_name(engine_id_);
-  ShmBlock block;
-  try {
-    block = ShmBlock::create(name, tensor.bytes.data(), tensor.bytes.size());
-  } catch (...) {
-    credits_->release(credit);
-    throw;
-  }
+  ShmBlock block = ShmBlock::create(name, tensor.bytes.data(), tensor.bytes.size());
+
+  struct ShmGuard {
+    std::string name;
+    bool active = true;
+    ~ShmGuard() {
+      if (active) unlink_quiet(name);
+    }
+  } shm_guard{name};
 
   Value::Map transfer_info;
   transfer_info["shm_name"] = Value(block.name);
@@ -553,8 +513,11 @@ std::unique_ptr<RelayOperation> ShmRelay::put(const Tensor& tensor,
   metadata["transfer_info"] = Value(std::move(transfer_info));
   // The credit stays held until the receiver acks, so a sender cannot reuse a
   // block that a receiver has not read yet.
-  return std::make_unique<ShmPutOperation>(Value(std::move(metadata)), block.name,
-                                           credit, credits_);
+  auto operation = std::make_unique<ShmPutOperation>(Value(std::move(metadata)), block.name,
+                                                     credit, credits_);
+  guard.active = false;
+  shm_guard.active = false;
+  return operation;
 }
 
 void ShmRelay::get(const Value& metadata, Tensor& dest) {
