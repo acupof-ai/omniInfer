@@ -27,6 +27,20 @@ bool chunk_is_final(const Value& chunk) {
   return flag != nullptr && flag->is_bool() && flag->as_bool();
 }
 
+// Extracts ASR result text under the same contract as
+// serve_detail::asr_result_text (src/serve/asr_common.hpp): a plain string or a
+// map with a string "text". Kept local so the pipeline layer does not include a
+// serve-private header. Nullopt means the stage returned no usable text; the
+// caller must fail the request, not start the VLM leg with an empty prompt.
+std::optional<std::string> asr_result_text(const Value& result) {
+  if (result.is_str()) return result.as_str();
+  if (result.is_map()) {
+    const Value* text = result.find("text");
+    if (text != nullptr && text->is_str()) return text->as_str();
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 const char* to_string(UnifiedModality modality) {
@@ -141,17 +155,20 @@ std::string UnifiedEngine::submit(StagePayload payload) {
 }
 
 bool UnifiedEngine::cancel(const std::string& request_id) {
-  std::string vlm_id;
+  std::string active_id;
   {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = records_.find(request_id);
     if (it == records_.end() || it->second.phase == Phase::kDone) return false;
-    vlm_id = it->second.vlm_id;
+    // Record the intent under mu_ first. The ASR completion and the VLM start
+    // are decided under the same lock in handle_complete, so either this flag
+    // is visible there and the request settles as kCancelled, or the VLM leg
+    // already exists and its child id is what we abort.
+    it->second.cancel_requested = true;
+    active_id = it->second.vlm_id.empty() ? request_id : it->second.vlm_id;
   }
-  // Abort the active leg. The Coordinator publishes on its PUB abort socket,
-  // so every stage process receives the frame; a completed ASR leg ignores it
-  // and needs no second abort.
-  const std::string active_id = vlm_id.empty() ? request_id : vlm_id;
+  // No engine lock held: Coordinator::abort can synchronously invoke
+  // on_complete, which needs mu_.
   coordinator_.abort(active_id);
   return true;
 }
@@ -360,35 +377,46 @@ void UnifiedEngine::handle_complete(const RequestInfo& info) {
         terminal_event = finish_locked(
             unified_id, record, UnifiedEvent::Kind::kError,
             info.error.empty() ? "stage failure" : info.error, {});
+      } else if (record.cancel_requested) {
+        // A successful completion beat the abort frame through the
+        // Coordinator. The intent was recorded under mu_ first, so this path is
+        // deterministic: settle as kCancelled and never run (or trust) the VLM
+        // leg. A record that already failed is kDone and cannot reach here.
+        terminal_event = finish_locked(unified_id, record,
+                                       UnifiedEvent::Kind::kCancelled, {}, {});
       } else if (record.vlm_id.empty()) {
         // ASR leg succeeded. A non-streaming stage sends no final chunk, so
         // synthesize the ASR final from the result text.
         if (!record.asr_final_seen) {
-          std::string text;
-          if (info.result.is_map()) {
-            if (const Value* value = info.result.find("text");
-                value != nullptr && value->is_str()) {
-              text = value->as_str();
-            }
+          const auto text = asr_result_text(info.result);
+          if (!text) {
+            // No usable text means a malformed stage result: fail here and
+            // never start the VLM leg with an empty or invented prompt.
+            terminal_event = finish_locked(
+                unified_id, record, UnifiedEvent::Kind::kError,
+                "ASR stage returned no text", {});
+          } else {
+            record.asr_final_seen = true;
+            record.transcript = *text;
+            UnifiedEvent event;
+            event.request_id = unified_id;
+            event.session_id = record.session_id;
+            event.stage_id = kAsrStageId;
+            event.kind = UnifiedEvent::Kind::kAsrFinal;
+            event.seq = record.next_seq++;
+            event.is_final = true;
+            event.text = *text;
+            due.push_back(std::move(event));
           }
-          record.asr_final_seen = true;
-          record.transcript = text;
-          UnifiedEvent event;
-          event.request_id = unified_id;
-          event.session_id = record.session_id;
-          event.stage_id = kAsrStageId;
-          event.kind = UnifiedEvent::Kind::kAsrFinal;
-          event.seq = record.next_seq++;
-          event.is_final = true;
-          event.text = text;
-          due.push_back(std::move(event));
         }
-        try {
-          start_vlm_locked(unified_id, record);
-        } catch (const std::exception& error) {
-          terminal_event = finish_locked(unified_id, record,
-                                         UnifiedEvent::Kind::kError,
-                                         error.what(), {});
+        if (!terminal_event) {
+          try {
+            start_vlm_locked(unified_id, record);
+          } catch (const std::exception& error) {
+            terminal_event = finish_locked(unified_id, record,
+                                           UnifiedEvent::Kind::kError,
+                                           error.what(), {});
+          }
         }
       } else {
         if (record.vlm_text.empty() && info.result.is_map()) {

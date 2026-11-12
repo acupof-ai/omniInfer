@@ -127,6 +127,10 @@ class UnifiedEngine {
     Phase phase = Phase::kAsr;
     int64_t next_seq = 0;
     bool asr_final_seen = false;
+    // Set by cancel() under mu_ before any coordinator call. A completion that
+    // wins the race against abort is still required to settle as kCancelled
+    // and must not start the VLM leg.
+    bool cancel_requested = false;
     std::string transcript;  // partials concatenated; final replaces them
     std::string vlm_text;
     std::string vlm_id;
