@@ -1,93 +1,166 @@
 # ummInfer
 
-ummInfer is an inference runtime for **Unified Multimodal Models (UMM)**.
+ummInfer is an inference runtime for **Unified Multimodal Models (UMM)**. The
+engine is a C++20 control plane with an OpenAI-compatible HTTP/SSE/WebSocket
+surface. Models run in separate worker processes behind ZeroMQ/MessagePack
+control messages.
 
-The target is one engine that serves vision-language (VLM) and speech (ASR)
-workloads together: shared sessions, one orchestration path, streaming events,
-cancellation, backpressure, error propagation, and output coordination. Models
-run in separate worker processes behind that one control plane.
+The engine foundation is implemented for text chat and for a deterministic
+audio test pipeline. The unified VLM+ASR capability is **not implemented**. The
+figure below marks which parts exist.
 
-The engine foundation is implemented and tested for text chat and for a
-deterministic audio test pipeline. The unified VLM+ASR capability is **not
-implemented**. This README separates the two.
+See [roadmap](docs/roadmap.md) for phases and acceptance gates, and
+[validation](docs/validation.md) for the user journeys that exist today.
+
+## Target architecture
+
+Green nodes exist in this revision. Amber nodes are planned. Gray nodes are the
+future RL boundary. A dashed edge is an optional or alternative path. The figure
+shows the target; the [status table](#status) gives the per-layer state.
+
+```mermaid
+flowchart TB
+  subgraph clients["Clients"]
+    CLI["<b>umm-infer CLI</b><br/>chat · transcribe · realtime<br/>image · video"]
+    CPP["<b>C++ API</b><br/>OpenAIClient · ASRClient"]
+    SWIFT["<b>ummmlx</b><br/>macOS SwiftUI"]
+  end
+
+  subgraph edge["Edge adapters (C++)"]
+    HTTP["<b>HTTP + SSE</b><br/>/v1/chat/completions · /v1/audio/transcriptions<br/>/health · /ready · /v1/models · /abort"]
+    WS["<b>WebSocket</b><br/>/v1/realtime (private protocol)"]
+  end
+
+  subgraph control["Control plane (C++)"]
+    SESSION["<b>Unified session + orchestration plan</b><br/>ordered steps · one event stream<br/>cancel · backpressure · error propagation"]
+    COORD["<b>Coordinator</b><br/>request ids · in_flight · abort<br/>ready gating"]
+  end
+
+  subgraph workers["Model workers (separate processes)"]
+    MLXW["<b>MLX-LM text stage</b><br/>text in, text out"]
+    TCTCW["<b>TinyCTC audio stage</b><br/>test model, not trained ASR"]
+    ASRW["<b>Trained ASR worker</b>"]
+    VLMW["<b>VLM worker</b><br/>text + image in<br/>text or streamed text out"]
+    IMGW["<b>Image worker</b><br/>optional"]
+    VIDW["<b>Video worker</b><br/>optional"]
+  end
+
+  subgraph data["Data plane"]
+    ZMQ["<b>ZeroMQ + MessagePack</b><br/>control messages"]
+    SHM["<b>POSIX shared memory</b><br/>payload relay, bounded credits"]
+    CUDA["<b>CUDA IPC</b><br/>optional build path"]
+  end
+
+  subgraph upstream["Fixed upstream proxy (alternative path)"]
+    UP["one configured upstream<br/>qwen omni · sglang image · sglang video"]
+  end
+
+  subgraph rl["RL boundary (future)"]
+    EXPORT["rollout trajectory export"]
+    REWARD["reward"]
+    TRAIN["independent training worker"]
+  end
+
+  CLI --> HTTP
+  CLI --> WS
+  CPP --> HTTP
+  CPP --> WS
+  SWIFT --> HTTP
+
+  HTTP --> COORD
+  WS --> COORD
+  HTTP -.-> SESSION
+  WS -.-> SESSION
+  SESSION -.-> COORD
+  COORD --> ZMQ
+
+  ZMQ --> MLXW
+  ZMQ --> TCTCW
+  MLXW --> ZMQ
+  TCTCW --> ZMQ
+
+  ZMQ -.-> ASRW
+  ZMQ -.-> VLMW
+  ZMQ -.-> IMGW
+  ZMQ -.-> VIDW
+  ASRW -.-> ZMQ
+  VLMW -.-> ZMQ
+  IMGW -.-> ZMQ
+  VIDW -.-> ZMQ
+
+  ZMQ --> SHM
+  SHM -.-> CUDA
+
+  HTTP -.-> UP
+  SESSION -.-> EXPORT
+  EXPORT -.-> REWARD
+  REWARD -.-> TRAIN
+
+  classDef done fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+  classDef plan fill:#fff8e1,stroke:#f9a825,color:#5d4037
+  classDef future fill:#eceff1,stroke:#78909c,color:#37474f
+
+  class CLI,CPP,SWIFT,HTTP,WS,COORD,ZMQ,SHM,CUDA,UP,MLXW,TCTCW done
+  class SESSION,ASRW,VLMW,IMGW,VIDW plan
+  class EXPORT,REWARD,TRAIN future
+```
+
+Image and video are optional modalities: no local image or video worker exists,
+and their only routes are the proxy.
+
+### Current call paths
+
+```text
+Local text or audio:
+CLI/public API/Swift -> HTTP or WS -> Coordinator -> ZeroMQ
+  -> external Python stage (MLX-LM or TinyCTC) -> model -> ZeroMQ -> client
+
+Fixed upstream (no Coordinator use):
+CLI/public API -> HTTP -> one configured upstream -> client
+
+C++ stage host (demo):
+Coordinator -> ZeroMQ -> C++ Stage -> SimpleScheduler -> echo compute
+  -> next C++ Stage through SHM, or CUDA IPC where its requirements hold
+
+The external Python path does not use C++ Stage, SimpleScheduler, or the
+shared-memory relay; it carries inline data in ZeroMQ messages.
+```
 
 ## Status
 
-| Layer | State |
-| --- | --- |
-| C++20 control plane: Coordinator, request abort, ready gating | Implemented; default tests pass |
-| ZeroMQ transport with MessagePack control messages | Implemented; default tests pass |
-| POSIX shared-memory payload relay with bounded credits | Implemented; default tests pass |
-| Optional CUDA IPC relay path | Build path present; unbuilt and unexecuted here (no CUDA toolkit) |
-| External persistent Python stage protocol | Implemented; used by the two stages below |
-| MLX-LM text chat, JSON and SSE | Implemented; checked against a real local model |
-| ASR pipeline | Implemented against the deterministic TinyCTC test model only |
-| HTTP, SSE, WebSocket server; CLI; C++ clients | Implemented |
-| Native macOS client `clients/ummmlx` | Implemented; text chat only |
-| Trained ASR model | Not implemented |
-| Real VLM worker | Not implemented |
-| Cross-model orchestration (for example ASR to VLM) | Not implemented |
-| Shared session across modalities | Not implemented |
-| Unified multimodal end-to-end acceptance | Not run |
-| H20B verification | BLOCKED; jump host authentication fails |
-
-TinyCTC is test infrastructure. It has deterministic initialized weights, and
-it does not recognize speech. The MLX-LM chat path is text-only inference. It is
-not a VLM.
-
-Image and video are optional modalities. They attach as separate workers when a
-use case needs them, and they do not block the VLM+ASR main path. Today no local
-image or video worker exists; the only image and video routes are the
-fixed-upstream proxy described below.
-
-See [roadmap](docs/roadmap.md) for the phase plan and acceptance gates, and
-[validation](docs/validation.md) for the user journeys that exist today.
-
-Verification has two profiles. The Apple Silicon Mac runs low-consumption
-control-plane, stage, and small real-model checks. NVIDIA H20B is for
-high-precision acceptance. H20B access currently fails at the jump host
-authentication step, so every H20B result is `BLOCKED` / `NOT_RUN`; none is
-verified. The split and its gates are in
-[roadmap](docs/roadmap.md#verification-split).
-
-## What you can do
-
-| Task | Interface | Backend |
+| Capability | Interface | State |
 | --- | --- | --- |
-| Generate text once | `chat`, `/v1/chat/completions` JSON | External MLX-LM stage |
-| Stream generated text | `chat --stream`, chat SSE | External MLX-LM stage |
-| Transcribe a WAV or PCM file | `transcribe`, multipart HTTP | TinyCTC test stage |
-| Send audio over WebSocket | `realtime`, `/v1/realtime` | TinyCTC test stage |
-| Use a bearer key | Environment variables in the client | Optional server authentication |
-| Generate or edit an image, create a video | `image`, `video`, `/v1/images/*`, `/v1/videos*` | Fixed upstream only |
+| C++20 control plane: Coordinator, request abort, ready gating | `serve` | Implemented |
+| ZeroMQ transport with MessagePack control messages | internal | Implemented |
+| POSIX shared-memory payload relay with bounded credits | `stage --next/--peer` | Implemented |
+| Optional CUDA IPC relay path | `stage --gpu-id/--peer-gpu` | Build path present; unbuilt and unexecuted here (no CUDA toolkit) |
+| External persistent Python stage protocol | `serve --entry-endpoint` | Implemented |
+| Text chat, JSON and SSE | `chat`, `/v1/chat/completions` | Implemented on MLX-LM; checked against a real local model |
+| File and realtime transcription | `transcribe`, `realtime`, `/v1/audio/transcriptions`, `/v1/realtime` | Implemented against the deterministic TinyCTC test model only |
+| Native macOS client | `clients/ummmlx` | Implemented; text chat only |
+| Bearer authentication | `serve --api-key` | Implemented |
+| Image generation and edit, video jobs | `image`, `video`, `/v1/images/*`, `/v1/videos*` | Fixed upstream proxy only |
+| Trained ASR worker | — | Not implemented |
+| Real VLM worker | — | Not implemented |
+| Cross-model orchestration (for example ASR to VLM) | — | Not implemented |
+| Shared session across modalities | — | Not implemented |
+| Unified multimodal end-to-end acceptance | — | Not run |
+| H20B verification | — | BLOCKED; jump host authentication fails |
+
+TinyCTC has deterministic initialized weights; it is not a speech recognizer.
+The MLX-LM chat path is text-only inference, not a VLM. The Mac and H20B
+verification profiles and their limits are in
+[verification split](docs/roadmap.md#verification-split).
 
 The server exposes `/health`, `/ready`, `/v1/models`, and `/abort`.
-`/v1/audio/speech` returns HTTP 501.
-
-A second, opt-in server mode forwards one model family to one configured
-upstream instead of running a local stack. It adds image, video, and
-omni-modality routes. It is a proxy: it does not implement a VLM or a video
-model inside ummInfer. See [fixed upstream mode](#fixed-upstream-proxy-mode).
-## What is not implemented
-
-- A VLM worker. Local chat accepts text content only and rejects content part
-  arrays with HTTP 400.
-- A trained ASR model. Only the deterministic TinyCTC stage exists.
-- Cross-model orchestration. Chat, transcription, and realtime are separate
-  request paths. No request runs two model families in one plan.
-- A shared session object across modalities. The realtime WebSocket session is
-  private to one audio utterance.
-- A unified cancellation, backpressure, and error-propagation contract spanning
-  several workers. Abort exists per request. Shared-memory relay credits bound
-  one C++ payload edge. Neither is a multi-worker contract.
-- Unified multimodal end-to-end acceptance across participants' changes.
-  Component results recorded during development do not replace it.
+`/v1/audio/speech` returns HTTP 501. The opt-in
+[fixed upstream mode](#fixed-upstream-proxy-mode) forwards one model family to
+one configured upstream; it is a proxy and implements no local VLM or video
+model.
 
 ## Requirements and limits
 
 - Text models must be MLX-LM models with a compatible text chat template.
-- The provided ASR model is TinyCTC with deterministic initialized weights.
-  TinyCTC tests inference and transport. It is not a trained speech recognizer.
 - TinyCTC accepts headerless little-endian PCM16, mono, 16 kHz. WAV input must
   contain exactly that format. It accepts 400 samples to 30 seconds of audio.
 - Do not pass stereo, compressed audio, another sample rate, or a WAV with
@@ -114,7 +187,7 @@ model inside ummInfer. See [fixed upstream mode](#fixed-upstream-proxy-mode).
   MLX abort takes effect at token boundaries.
 - One external MLX stage processes one request at a time. Other requests queue.
 - The C++ stage host contains reference echo compute only. It does not load a
-  model. CUDA support is build-time functionality and has not been tested here.
+  model.
 - On the local path, chat message content must be text. Multimodal content
   arrays, tools, `top_p`, `seed`, non-empty `stop`, usage in `stream_options`,
   and JSON response format are rejected by this server.
@@ -234,47 +307,40 @@ options are absent. With no `--prompt`, it reads the prompt from standard input.
 ### Measured stage result
 
 The frozen comparison baseline already caches the tokenizer vocabulary map. The
-current stage adds two changes on top of it: a reusable prompt KV snapshot with
-a reused detokenizer, and one fused quantized QKV projection per layer instead
-of three projections. The fusion applies to quantized Qwen2-architecture models
-whose Q, K, and V projections share one quantization layout; on another layout
-it is skipped.
+current stage adds a reusable prompt KV snapshot with a reused detokenizer, and
+one fused quantized QKV projection per layer instead of three. The fusion
+applies to quantized Qwen2-architecture models whose Q, K, and V projections
+share one quantization layout; on another layout it is skipped.
 
-Under the project's fixed comparison convention, the recorded result for the
-current stage against that baseline is a **61.93% warm speedup on median total
-latency**:
+The recorded result for the current stage against that baseline is a **61.93%
+warm speedup on median total latency**: 63.75 ms to 39.37 ms warm median
+`total_ms`, that is `(63.75 / 39.37 - 1) * 100`, or 38.25% fewer milliseconds.
+Configuration: `http_sse`, `max_tokens=64`, 20 interleaved pairs, fresh process
+per sample, 2 warmups per process, `temperature=0`,
+Qwen2.5-0.5B-Instruct-4bit.
 
-| Item | Value |
-| --- | --- |
-| Metric | warm median `total_ms`, 63.75 ms to 39.37 ms |
-| Formula | `(63.75 / 39.37 - 1) * 100`, a ratio of medians |
-| Same change as latency reduction | 38.25% fewer milliseconds |
-| Configuration | `http_sse`, `max_tokens=64`, 20 interleaved pairs, fresh process per sample, 2 warmups per process, `temperature=0`, Qwen2.5-0.5B-Instruct-4bit |
-| Output identity | One output SHA256 across both arms; finish reason `stop` on all 20 pairs |
-| Recompute | A second script recomputed the stored medians and matched |
+The fused QKV step alone is smaller: 3.92% in the direct in-process harness
+(391.05 to 406.39 output tokens per second) on the arm that already had the
+vocabulary cache and prompt KV. Do not attribute the 61.93% to the fusion.
 
-The fused QKV step alone is smaller. In the direct in-process harness, the arm
-that already has the vocabulary cache and prompt KV measured 3.92% from adding
-the fusion (391.05 to 406.39 output tokens per second). Do not attribute the
-61.93% to the fusion.
-
-Read the number with its conditions:
+Conditions that limit the claim:
 
 - It is a ratio of medians, not a median of per-pair ratios. The median
   per-pair speedup is 51.11%, and 2 of the 20 pairs were slower with the
   candidate arm.
 - Every recorded `cv` is above the 0.10 quiet-window limit: warm `total_ms`
   0.167 baseline and 0.287 candidate; warm `ttft_ms` 0.328 and 2.735. The run
-  itself printed four `cv` warnings. By the project rule this is one recorded
-  run that asks for a repeat, not a validated result.
+  printed four `cv` warnings. By the project rule this is one recorded run that
+  asks for a repeat, not a validated result.
+- Output hashes matched across arms on all 20 pairs, and a second script
+  recomputed the stored medians and matched.
 - The token counters are absent, not estimated. The frozen binary's chat reply
   carries no `usage`, `generation_tokens`, or `prompt_tokens`, and peak memory
   is unobservable without `--perf-log`. The report records those gaps.
 - The report did not pass the `tests/mlx_perf_compare.py` gate set; it has a
   recompute check only.
-- Both the HTTP A/B harness and its report are local artifacts. Neither is
-  committed here, so the number cannot be re-derived from a clean checkout
-  alone.
+- Both the HTTP A/B harness and its report are local artifacts outside this
+  repository, so the number cannot be re-derived from a clean checkout alone.
 - The in-repository harnesses for the same stage are
   `tests/mlx_prompt_cache_perf.py` (direct MLX-LM A/B) and `tests/mlx_perf.py`
   (general comparison). Their gates are in [MLX backend](docs/mlx.md).
@@ -378,7 +444,7 @@ device, and give the sender the device of the stage it sends to:
 
 None of these commands has been executed on this machine, which has no CUDA
 toolkit: `zig build -Dcuda` stops here when `cuda_runtime_api.h` is not found.
-The relay code has default-test coverage only; CUDA execution is unverified.
+The relay code has default-test coverage only.
 
 ## Fixed upstream proxy mode
 
@@ -463,24 +529,6 @@ Requests accept cancellation flags.
 `umminfer/audio/audio.hpp` provides `wav_from_pcm16` and `pcm16_from_wav`.
 The client namespace retains thin wrappers that convert invalid audio errors to
 `ErrorCode::kBadRequest`.
-
-## Runtime components
-
-```text
-External model path:
-CLI/public API -> HTTP or WebSocket -> Coordinator -> ZeroMQ
-  -> external Python MLX/TinyASR stage -> model
-
-C++ stage-host path:
-C++ Stage -> SimpleScheduler -> compute function
-
-Fixed upstream path:
-CLI/public API -> HTTP -> one configured upstream (no Coordinator use)
-
-C++ stage-to-stage payload transfer uses POSIX shared memory, or optional CUDA
-IPC where its requirements hold. The external Python path does not use C++
-Stage, SimpleScheduler, or the C++ shared-memory relay.
-```
 
 ## Desktop client
 
