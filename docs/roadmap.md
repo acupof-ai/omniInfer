@@ -63,7 +63,7 @@ Existing chat and ASR paths keep working through it.
 
 | Check | Rule |
 | --- | --- |
-| Existing behavior | Chat JSON, chat SSE, transcription, and realtime still pass `zig build test` and the real-model client checks. |
+| Existing behavior | Chat JSON, chat SSE, and transcription still pass the default `zig build test` (which needs `-Ddeps-prefix` and `-Dcurl-prefix`). Realtime has no C++ unit test; it must still pass its two Python E2E scripts, run by hand with a real TinyCTC model. |
 | Plan execution | A two-step plan with test workers returns ordered stream events and one terminal event. |
 | Cancel | Cancelling a running two-step plan reaches both workers and leaves `in_flight` at zero. |
 | Backpressure | A slow consumer bounds worker output without unbounded buffer growth; the test measures high-water bytes. |

@@ -14,9 +14,11 @@ See [roadmap](docs/roadmap.md) for phases and acceptance gates, and
 
 ## Target architecture
 
-Green nodes exist in this revision. Amber nodes are planned. Gray nodes are the
-future RL boundary. A dashed edge is an optional or alternative path. The figure
-shows the target; the [status table](#status) gives the per-layer state.
+Green means the code for that node is present in this revision; it does not mean
+a run was recorded. Amber nodes are planned. Gray nodes are the future RL
+boundary. A dashed edge is an optional or alternative path. The figure shows the
+target; the [status table](#status) gives the per-layer state, including the
+CUDA path, whose code is present but which is unbuilt and unexecuted here.
 
 ```mermaid
 flowchart TB
@@ -135,7 +137,7 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | POSIX shared-memory payload relay with bounded credits | `stage --next/--peer` | Implemented |
 | Optional CUDA IPC relay path | `stage --gpu-id/--peer-gpu` | Build path present; unbuilt and unexecuted here (no CUDA toolkit) |
 | External persistent Python stage protocol | `serve --entry-endpoint` | Implemented |
-| Text chat, JSON and SSE | `chat`, `/v1/chat/completions` | Implemented on MLX-LM; checked against a real local model |
+| Text chat, JSON and SSE | `chat`, `/v1/chat/completions` | Implemented on MLX-LM; checked against a real local model with no run artifact committed |
 | File and realtime transcription | `transcribe`, `realtime`, `/v1/audio/transcriptions`, `/v1/realtime` | Implemented against the deterministic TinyCTC test model only |
 | Native macOS client | `clients/ummmlx` | Implemented; text chat only |
 | Bearer authentication | `serve --api-key` | Implemented |
@@ -229,13 +231,19 @@ The binary is `zig-out/bin/umm-infer`. Apple's system libcurl 8.7.1 lacks the
 WebSocket support required by the realtime client. Use `-Ddeps-prefix` when
 dependencies are outside the system include and library paths.
 
-`test` runs wire, relay, scheduler, coordinator, client, fixed-upstream proxy,
-and two-stage pipeline tests. It builds and runs no model. On this machine it
-exits 0: `all checks passed`, `all transport checks passed`, `all serve proxy
-checks passed`, `all 82 client checks passed`.
+`test` runs six C++ executables: wire, relay, scheduler, coordinator, client, and
+fixed-upstream proxy, plus the two-stage pipeline cases. It builds and runs no
+model, no Python, and no Swift. It needs the dependency flags shown above; a bare
+`zig build test` fails to find `msgpack.h` and `zmq.h`. On this machine, with the
+flags, it exits 0: `all checks passed`, `all transport checks passed`, `all serve
+proxy checks passed`, `all 82 client checks passed`.
 
 `smoke` checks HTTP validation, authentication, JSON, SSE, 24 concurrent JSON
 requests, 12 concurrent SSE requests, external stages, and SIGTERM shutdown.
+
+The Python E2E and performance scripts under `tests/` are not wired into any
+`zig build` step. Run them by hand as the sections below show. The Swift client
+has its own suite, `swift test` in `clients/ummmlx`.
 
 The finite request-lifecycle model has a TLA check. It does not prove that the
 C++ implementation conforms to the model:
