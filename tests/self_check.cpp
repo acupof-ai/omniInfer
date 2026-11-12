@@ -3,11 +3,22 @@
 // and one end-to-end pipeline request.
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iostream>
+#include <limits.h>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include "umminfer/client/client.hpp"
 #include "umminfer/comm/comm.hpp"
@@ -22,11 +33,123 @@ namespace {
 
 int failures = 0;
 
-struct IpcCleanup {
-  std::vector<std::string> paths;
-  ~IpcCleanup() {
-    for (const auto& path : paths) std::remove(path.c_str());
+constexpr int kMaxIpcPaths = 128;
+char ipc_root[PATH_MAX];
+char ipc_paths[kMaxIpcPaths][PATH_MAX];
+volatile sig_atomic_t ipc_path_active[kMaxIpcPaths];
+volatile sig_atomic_t ipc_path_count = 0;
+int ipc_foreign_paths = 0;
+
+void cleanup_ipc_path(int index, int& failure_count) {
+  if (!ipc_path_active[index]) return;
+  if (::unlink(ipc_paths[index]) != 0 && errno != ENOENT) {
+    std::cerr << "FAIL IPC cleanup unlink " << ipc_paths[index] << ": "
+              << std::strerror(errno) << "\n";
+    ++failure_count;
   }
+  ipc_path_active[index] = 0;
+}
+
+void cleanup_ipc_paths(int& failure_count, bool include_root) {
+  for (int i = 0; i < ipc_path_count; ++i) {
+    cleanup_ipc_path(i, failure_count);
+  }
+  if (!include_root || ipc_root[0] == '\0') return;
+  if (::rmdir(ipc_root) != 0) {
+    // A foreign entry keeps the private root non-empty on purpose. Retaining it
+    // is the required behaviour, not a cleanup failure.
+    if (errno == ENOTEMPTY && ipc_foreign_paths > 0) {
+      std::cerr << "IPC root retained: foreign entries in " << ipc_root << "\n";
+    } else if (errno != ENOENT) {
+      std::cerr << "FAIL IPC cleanup rmdir " << ipc_root << ": "
+                << std::strerror(errno) << "\n";
+      ++failure_count;
+    }
+  }
+}
+
+void ipc_signal_handler(int signal) {
+  bool failed = false;
+  for (int i = 0; i < ipc_path_count; ++i) {
+    if (ipc_path_active[i] && ::unlink(ipc_paths[i]) != 0 && errno != ENOENT) {
+      failed = true;
+    }
+    ipc_path_active[i] = 0;
+  }
+  if (ipc_root[0] != '\0' && ::rmdir(ipc_root) != 0 && errno != ENOENT &&
+      !(errno == ENOTEMPTY && ipc_foreign_paths > 0)) {
+    failed = true;
+  }
+  if (failed) {
+    static const char message[] = "FAIL IPC signal cleanup\n";
+    (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
+  }
+  _exit(128 + signal);
+}
+
+void init_ipc_root() {
+  char path[PATH_MAX];
+  const int length = std::snprintf(path, sizeof(path),
+                                   "/tmp/omni-self-check-XXXXXX");
+  if (length < 0 || static_cast<size_t>(length) >= sizeof(path)) {
+    throw std::runtime_error("IPC root path is too long");
+  }
+  if (::mkdtemp(path) == nullptr) {
+    throw std::runtime_error(std::string("mkdtemp failed: ") +
+                             std::strerror(errno));
+  }
+  if (::chmod(path, 0700) != 0) {
+    const int error = errno;
+    (void)::rmdir(path);
+    throw std::runtime_error(std::string("chmod IPC root failed: ") +
+                             std::strerror(error));
+  }
+  std::memcpy(ipc_root, path, static_cast<size_t>(length) + 1);
+  std::cerr << "IPC_ROOT " << ipc_root << std::endl;
+}
+
+void install_ipc_signal_handlers() {
+  struct sigaction action = {};
+  action.sa_handler = ipc_signal_handler;
+  sigemptyset(&action.sa_mask);
+  for (const int signal : {SIGALRM, SIGINT, SIGTERM}) {
+    if (::sigaction(signal, &action, nullptr) != 0) {
+      throw std::runtime_error(std::string("sigaction failed: ") +
+                               std::strerror(errno));
+    }
+  }
+}
+
+std::string ipc_root_path() { return std::string(ipc_root) + "/"; }
+
+int register_ipc_path(const std::string& path) {
+  if (path.size() >= PATH_MAX || ipc_path_count >= kMaxIpcPaths) {
+    throw std::runtime_error("too many or too long IPC paths");
+  }
+  struct stat metadata {};
+  errno = 0;
+  const int stat_result = ::lstat(path.c_str(), &metadata);
+  if (stat_result != 0 && errno != ENOENT) {
+    throw std::runtime_error(std::string("lstat failed: ") + std::strerror(errno));
+  }
+  const int index = ipc_path_count;
+  std::memcpy(ipc_paths[index], path.c_str(), path.size() + 1);
+  ipc_path_active[index] = stat_result != 0;
+  if (stat_result == 0) ++ipc_foreign_paths;
+  ipc_path_count = static_cast<sig_atomic_t>(index + 1);
+  return index;
+}
+
+struct IpcCleanup {
+  IpcCleanup(int& failure_count, std::vector<std::string> owned_paths)
+      : failures(&failure_count) {
+    for (const auto& path : owned_paths) indices.push_back(register_ipc_path(path));
+  }
+  ~IpcCleanup() {
+    for (const int index : indices) cleanup_ipc_path(index, *failures);
+  }
+  std::vector<int> indices;
+  int* failures;
 };
 
 #define CHECK(cond)                                                          \
@@ -37,6 +160,56 @@ struct IpcCleanup {
       ++failures;                                                            \
     }                                                                        \
   } while (0)
+
+// Test-only process control. No environment variable means no behavior change.
+void ipc_test_hook(const char* phase, const std::string& delete_path = "") {
+  const char* selected = std::getenv("OMNI_IPC_TEST_PHASE");
+  if (selected == nullptr || std::string_view(selected) != phase) return;
+  const char* fault = std::getenv("OMNI_IPC_TEST_FAULT");
+  if (fault == nullptr) return;
+
+  const char* gate = std::getenv("OMNI_IPC_TEST_GATE");
+  if (gate != nullptr) {
+    const std::string prefix = std::string(gate) + "." + phase;
+    std::ofstream ready(prefix + ".ready", std::ios::trunc);
+    ready << getpid() << " " << ipc_root << " " << phase << "\n";
+    ready.close();
+    if (!ready) throw std::runtime_error("could not write IPC test ready file");
+    bool released = false;
+    for (int i = 0; i < 500; ++i) {
+      if (::access((prefix + ".go").c_str(), F_OK) == 0) {
+        released = true;
+        break;
+      }
+      ::usleep(20000);
+    }
+    if (!released) throw std::runtime_error("IPC test gate timed out");
+  }
+
+  if (std::string_view(fault) == "wait") {
+    if (gate == nullptr) throw std::runtime_error("wait needs an IPC test gate");
+    return;
+  }
+  if (std::string_view(fault) == "check") {
+    CHECK(false);
+    return;
+  }
+  if (std::string_view(fault) == "exception") {
+    throw std::runtime_error("injected IPC test exception");
+  }
+  if (std::string_view(fault) == "delete-failure") {
+    if (delete_path.empty()) throw std::runtime_error("missing delete test path");
+    if (::unlink(delete_path.c_str()) != 0 && errno != ENOENT) {
+      throw std::runtime_error("could not prepare delete failure");
+    }
+    if (::mkdir(delete_path.c_str(), 0700) != 0) {
+      throw std::runtime_error("could not inject delete failure");
+    }
+    std::cerr << "injected IPC delete failure at " << delete_path << "\n";
+    return;
+  }
+  throw std::runtime_error("unknown IPC test fault");
+}
 
 std::string hex_encode(const std::string& raw) {
   static const char* digits = "0123456789abcdef";
@@ -225,19 +398,17 @@ void test_scheduler_serial_and_batch() {
 
 void test_pipeline_end_to_end() {
   const std::string base =
-      "/tmp/omni-self-check-" + std::to_string(getpid()) + "-";
+      ipc_root_path() + "omni-self-check-" + std::to_string(getpid()) + "-";
   const std::string entry_ep = "ipc://" + base + "entry";
   const std::string completion_ep = "ipc://" + base + "completion";
   const std::string abort_ep = "ipc://" + base + "abort";
-  // A run killed mid-test leaves its ipc sockets behind and the next bind fails.
-  for (const auto& path : {base + "entry", base + "completion", base + "abort"}) {
-    std::remove(path.c_str());
-  }
-  const IpcCleanup ipc_cleanup{{base + "entry", base + "completion", base + "abort"}};
+  const IpcCleanup ipc_cleanup{
+      failures, {base + "entry", base + "completion", base + "abort"}};
 
   Coordinator coordinator(completion_ep, abort_ep);
   coordinator.register_stage("entry", entry_ep);
   coordinator.start();
+  ipc_test_hook("partial");
   std::thread coordinator_thread([&] { coordinator.run(); });
 
   Stage::Config config;
@@ -272,6 +443,7 @@ void test_pipeline_end_to_end() {
   coordinator.stop();
   stage_thread.join();
   coordinator_thread.join();
+  ipc_test_hook("full", base + "entry");
 }
 
 void test_chat_rejects_reserved_extra_stream() {
@@ -305,23 +477,36 @@ void test_chat_rejects_reserved_extra_stream() {
 }  // namespace
 
 int main() {
-  alarm(20);
-  std::cerr << "[1] value roundtrip\n";
-  test_value_roundtrip();
-  std::cerr << "[2] python bytes\n";
-  test_decode_python_bytes();
-  std::cerr << "[3] message roundtrip\n";
-  test_message_roundtrip();
-  std::cerr << "[4] shm relay\n";
-  test_shm_relay();
-  std::cerr << "[5] router\n";
-  test_router_classification();
-  std::cerr << "[6] scheduler\n";
-  test_scheduler_serial_and_batch();
-  std::cerr << "[7] pipeline\n";
-  test_pipeline_end_to_end();
-  std::cerr << "[8] chat reserved stream\n";
-  test_chat_rejects_reserved_extra_stream();
+  try {
+    init_ipc_root();
+    install_ipc_signal_handlers();
+    alarm(20);
+    ipc_test_hook("start");
+    std::cerr << "[1] value roundtrip\n";
+    test_value_roundtrip();
+    std::cerr << "[2] python bytes\n";
+    test_decode_python_bytes();
+    std::cerr << "[3] message roundtrip\n";
+    test_message_roundtrip();
+    std::cerr << "[4] shm relay\n";
+    test_shm_relay();
+    std::cerr << "[5] router\n";
+    test_router_classification();
+    std::cerr << "[6] scheduler\n";
+    test_scheduler_serial_and_batch();
+    std::cerr << "[7] pipeline\n";
+    test_pipeline_end_to_end();
+    std::cerr << "[8] chat reserved stream\n";
+    test_chat_rejects_reserved_extra_stream();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL exception: " << error.what() << "\n";
+    ++failures;
+  } catch (...) {
+    std::cerr << "FAIL unknown exception\n";
+    ++failures;
+  }
+  cleanup_ipc_paths(failures, true);
+  alarm(0);
   std::cerr << "[done]\n";
 
   if (failures != 0) {

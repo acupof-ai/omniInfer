@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
 #include <httplib.h>
 #include <iostream>
 #include <limits>
+#include <limits.h>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -22,10 +31,148 @@ using namespace umminfer;
 
 namespace {
 
+constexpr int kMaxIpcPaths = 128;
+char ipc_root[PATH_MAX];
+char ipc_paths[kMaxIpcPaths][PATH_MAX];
+volatile sig_atomic_t ipc_path_active[kMaxIpcPaths];
+volatile sig_atomic_t ipc_path_count = 0;
+volatile sig_atomic_t ipc_foreign_paths = 0;
+int ipc_cleanup_failures = 0;
+
+void ipc_signal_handler(int signal) {
+  bool failed = false;
+  for (int i = 0; i < ipc_path_count; ++i) {
+    if (ipc_path_active[i] && unlink(ipc_paths[i]) != 0 && errno != ENOENT) {
+      failed = true;
+    }
+    ipc_path_active[i] = 0;
+  }
+  if (ipc_root[0] && rmdir(ipc_root) != 0 && errno != ENOENT &&
+      !(errno == ENOTEMPTY && ipc_foreign_paths > 0)) {
+    failed = true;
+  }
+  if (failed) {
+    const char message[] = "IPC cleanup failed during signal handling\n";
+    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+  }
+  _exit(128 + signal);
+}
+
+void install_ipc_cleanup(const char* prefix) {
+  std::snprintf(ipc_root, sizeof(ipc_root), "/tmp/%s-%ld-XXXXXX", prefix,
+                static_cast<long>(getpid()));
+  if (!mkdtemp(ipc_root)) {
+    throw std::runtime_error(std::string("mkdtemp failed: ") + std::strerror(errno));
+  }
+  if (chmod(ipc_root, 0700) != 0) {
+    const int error = errno;
+    (void)rmdir(ipc_root);
+    throw std::runtime_error(std::string("chmod IPC root failed: ") +
+                             std::strerror(error));
+  }
+  struct sigaction action {};
+  action.sa_handler = ipc_signal_handler;
+  sigemptyset(&action.sa_mask);
+  for (int signal : {SIGALRM, SIGINT, SIGTERM}) {
+    if (sigaction(signal, &action, nullptr) != 0) {
+      throw std::runtime_error(std::string("sigaction failed: ") + std::strerror(errno));
+    }
+  }
+  std::cerr << "IPC_ROOT " << ipc_root << std::endl;
+}
+
+std::string runtime_ipc_base(const std::string& suffix) {
+  return std::string(ipc_root) + "/omni-runtime-" + suffix + "-" +
+         std::to_string(getpid()) + "-";
+}
+
+std::string runtime_ipc_path(const std::string& basename) {
+  return std::string(ipc_root) + "/" + basename;
+}
+
+void wait_for_ipc_gate(const char* environment_name) {
+  const char* gate = std::getenv(environment_name);
+  if (!gate) return;
+  {
+    // The harness creates sentinels and the release file after reading this.
+    const std::string ready = std::string(gate) + ".ready";
+    const int fd = open(ready.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (fd < 0) throw std::runtime_error("could not write IPC gate ready file");
+    char payload[PATH_MAX + 32];
+    const int size = std::snprintf(payload, sizeof(payload), "%ld %s\n",
+                                   static_cast<long>(getpid()), ipc_root);
+    if (size > 0 && write(fd, payload, static_cast<size_t>(size)) < 0) {
+      close(fd);
+      throw std::runtime_error("could not write IPC gate ready payload");
+    }
+    if (close(fd) != 0) throw std::runtime_error("could not close IPC gate ready file");
+  }
+  for (int attempt = 0; attempt < 1800 && access(gate, F_OK) != 0; ++attempt) {
+    usleep(10000);
+  }
+  if (access(gate, F_OK) != 0) throw std::runtime_error("IPC test gate timed out");
+}
+
+int register_ipc_path(const std::string& path) {
+  if (ipc_path_count == kMaxIpcPaths || path.size() >= PATH_MAX) {
+    throw std::runtime_error("too many or too-long IPC paths");
+  }
+  struct stat metadata {};
+  errno = 0;
+  const int stat_result = lstat(path.c_str(), &metadata);
+  if (stat_result != 0 && errno != ENOENT) {
+    throw std::runtime_error(std::string("lstat failed: ") + std::strerror(errno));
+  }
+  const bool missing = stat_result != 0;
+  const int index = ipc_path_count;
+  std::memcpy(ipc_paths[index], path.c_str(), path.size() + 1);
+  // A pre-existing entry is foreign. A bind may fail on it, but cleanup must not
+  // unlink it. Entries absent now are prospective children of this private root.
+  ipc_path_active[index] = missing;
+  if (!missing) ipc_foreign_paths = static_cast<sig_atomic_t>(ipc_foreign_paths + 1);
+  ipc_path_count = static_cast<sig_atomic_t>(index + 1);
+  return index;
+}
+
+void cleanup_ipc_path(int index) {
+  if (!ipc_path_active[index]) return;
+  const int result = unlink(ipc_paths[index]);
+  ipc_path_active[index] = 0;
+  if (result != 0 && errno != ENOENT) {
+    std::cerr << "IPC cleanup failed: " << ipc_paths[index] << ": "
+              << std::strerror(errno) << "\n";
+    ++ipc_cleanup_failures;
+  }
+}
+
+int cleanup_ipc_root() {
+  for (int i = 0; i < ipc_path_count; ++i) cleanup_ipc_path(i);
+  if (ipc_root[0] == '\0') return ipc_cleanup_failures;
+  if (rmdir(ipc_root) != 0) {
+    // A foreign sentinel keeps the private root non-empty. Retaining it is the
+    // required behaviour, not a cleanup failure.
+    if (errno == ENOTEMPTY && ipc_foreign_paths > 0) {
+      std::cerr << "IPC root retained: foreign entries in " << ipc_root << "\n";
+    } else if (errno != ENOENT) {
+      std::cerr << "IPC root cleanup failed: " << ipc_root << ": "
+                << std::strerror(errno) << "\n";
+      ++ipc_cleanup_failures;
+    }
+  }
+  return ipc_cleanup_failures;
+}
+
 struct IpcCleanup {
-  std::vector<std::string> paths;
+  std::vector<int> indices;
+  IpcCleanup(std::initializer_list<std::string> paths) {
+    for (const auto& path : paths) indices.push_back(register_ipc_path(path));
+  }
+  template <typename Iterator>
+  IpcCleanup(Iterator first, Iterator last) {
+    for (; first != last; ++first) indices.push_back(register_ipc_path(*first));
+  }
   ~IpcCleanup() {
-    for (const auto& path : paths) std::remove(path.c_str());
+    for (const int index : indices) cleanup_ipc_path(index);
   }
 };
 
@@ -157,10 +304,13 @@ void test_batch_filters_aborted_inputs(int& failures) {
       },
       3, 0, false);
   scheduler.abort("b");
-  std::thread worker([&] { scheduler.start(); });
+  // Enqueue before the worker starts. With max_batch_wait_ms = 0 a worker that
+  // is already running can pop "a" alone, so no batch forms and the assertion
+  // below becomes timing-dependent.
   for (const char* id : {"a", "b", "c"}) {
     scheduler.enqueue(IncomingMessage{id, "new_request", Value(id)});
   }
+  std::thread worker([&] { scheduler.start(); });
   int results = 0;
   for (int i = 0; i < 2; ++i) {
     if (scheduler.outbox().get(1.0)) ++results;
@@ -266,9 +416,13 @@ void test_start_after_stop_returns(int& failures) {
 
   Stage::Config config;
   config.name = "stopped";
-  config.recv_endpoint = "ipc:///tmp/omni-stopped-before-start";
-  config.coordinator_endpoint = "ipc:///tmp/omni-stopped-coordinator";
-  config.abort_endpoint = "ipc:///tmp/omni-stopped-abort";
+  const std::string stopped = runtime_ipc_path("omni-stopped-before-start");
+  const std::string coordinator_path = runtime_ipc_path("omni-stopped-coordinator");
+  const std::string abort_path = runtime_ipc_path("omni-stopped-abort");
+  config.recv_endpoint = "ipc://" + stopped;
+  config.coordinator_endpoint = "ipc://" + coordinator_path;
+  config.abort_endpoint = "ipc://" + abort_path;
+  const IpcCleanup ipc_cleanup{{stopped, coordinator_path, abort_path}};
   Stage stage(config, [](const Value& input) { return input; });
   stage.stop();
   std::atomic<bool> returned{false};
@@ -281,14 +435,10 @@ void test_start_after_stop_returns(int& failures) {
 }
 
 void test_abort_before_stage_start(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-abort-before-start-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("abort-before-start");
   const std::string entry = "ipc://" + base + "entry";
   const std::string done = "ipc://" + base + "done";
   const std::string abort = "ipc://" + base + "abort";
-  for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
   const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
   Coordinator coordinator(done, abort);
   coordinator.register_stage("entry", entry, true);
@@ -362,14 +512,10 @@ void test_abort_before_stage_start(int& failures) {
 }
 
 void test_submit_request_id_mismatch(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-request-id-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("request-id");
   const std::string entry = "ipc://" + base + "entry";
   const std::string done = "ipc://" + base + "done";
   const std::string abort = "ipc://" + base + "abort";
-  for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
   const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
   PullSocket completions(done, true);
   completions.start();
@@ -507,22 +653,13 @@ void test_wire_boundaries(int& failures) {
   }
 }
 
-void remove_ipc(const std::string& suffix) {
-  for (const char* name : {"a", "b", "done", "abort", "entry"}) {
-    std::remove(("/tmp/omni-runtime-" + suffix + "-" +
-                 std::to_string(getpid()) + "-" + name)
-                    .c_str());
-  }
-}
-
 void test_coordinator_terminal_state(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-state-" + std::to_string(getpid()) + "-";
-  remove_ipc("state");
+  const std::string base = runtime_ipc_base("state");
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
   const std::string entry_ep = "ipc://" + base + "entry";
-  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
+  const IpcCleanup ipc_cleanup{
+      {base + "a", base + "b", base + "entry", base + "done", base + "abort"}};
   PullSocket entry(entry_ep, true);
   entry.start();
 
@@ -627,13 +764,12 @@ void test_coordinator_terminal_state(int& failures) {
 // is handed out again, and the stage's abort tombstone, which outlives the
 // release, drops the new request without a completion.
 void test_explicit_id_does_not_reissue(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-idreuse-" + std::to_string(getpid()) + "-";
-  remove_ipc("idreuse");
+  const std::string base = runtime_ipc_base("idreuse");
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
   const std::string entry_ep = "ipc://" + base + "entry";
-  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
+  const IpcCleanup ipc_cleanup{
+      {base + "a", base + "b", base + "entry", base + "done", base + "abort"}};
 
   // Start the stage first so it is subscribed to the abort edge. announce_ready
   // is off: this test releases the entry gate itself, after the abort.
@@ -708,14 +844,13 @@ void test_explicit_id_does_not_reissue(int& failures) {
 }
 
 void test_two_stage_pipeline(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-two-" + std::to_string(getpid()) + "-";
-  remove_ipc("two");
+  const std::string base = runtime_ipc_base("two");
   const std::string a_ep = "ipc://" + base + "a";
   const std::string b_ep = "ipc://" + base + "b";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
+  const IpcCleanup ipc_cleanup{
+      {base + "a", base + "b", base + "done", base + "abort", base + "entry"}};
 
   Coordinator coordinator(done_ep, abort_ep);
   coordinator.register_stage("a", a_ep);
@@ -774,15 +909,12 @@ void test_two_stage_pipeline(int& failures) {
 }
 
 void test_transfer_ack_timeout(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-timeout-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("timeout");
   const std::string a_ep = "ipc://" + base + "a";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
-  const IpcCleanup ipc_cleanup{{base + "a", base + "done", base + "abort"}};
+  const IpcCleanup ipc_cleanup{
+      {base + "a", base + "b", base + "done", base + "abort"}};
 
   Coordinator coordinator(done_ep, abort_ep);
   coordinator.register_stage("a", a_ep);
@@ -822,15 +954,11 @@ void test_transfer_ack_timeout(int& failures) {
 }
 
 void test_abort_releases_pending_transfer(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-abort-credit-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("abort-credit");
   const std::string a_ep = "ipc://" + base + "a";
   const std::string b_ep = "ipc://" + base + "b";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
   const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket downstream(b_ep, true);
@@ -898,14 +1026,10 @@ void test_abort_releases_pending_transfer(int& failures) {
 }
 
 void test_sse_content_and_timeout(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-http-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("http");
   const std::string entry_ep = "ipc://" + base + "entry";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
   const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
 
   Coordinator coordinator(done_ep, abort_ep);
@@ -968,14 +1092,10 @@ void test_sse_content_and_timeout(int& failures) {
 }
 
 void test_abort_cleans_stage_request(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-abort-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("abort");
   const std::string entry_ep = "ipc://" + base + "entry";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
   const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
 
   PullSocket done(done_ep, true);
@@ -1054,15 +1174,11 @@ void test_abort_cleans_stage_request(int& failures) {
 }
 
 void test_data_ready_checks_target(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-target-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("target");
   const std::string b_ep = "ipc://" + base + "b";
   const std::string peer_ep = "ipc://" + base + "a";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
   const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
@@ -1170,15 +1286,11 @@ DataRef make_ref(const std::string& object_id, int64_t length,
 }
 
 void test_data_ready_validation(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-validate-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("validate");
   const std::string b_ep = "ipc://" + base + "b";
   const std::string peer_ep = "ipc://" + base + "a";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
   const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
@@ -1400,15 +1512,11 @@ void test_send_payload_faults(int& failures) {
   };
 
   for (const Case& item : cases) {
-    const std::string base = "/tmp/omni-runtime-fault-" +
-                             std::to_string(getpid()) + "-" +
-                             std::to_string(&item - cases) + "-";
+    const std::string base =
+        runtime_ipc_base("fault") + std::to_string(&item - cases) + "-";
     const std::string a_ep = "ipc://" + base + "a";
     const std::string done_ep = "ipc://" + base + "done";
     const std::string abort_ep = "ipc://" + base + "abort";
-    for (const auto& path : {base + "a", base + "done", base + "abort"}) {
-      std::remove(path.c_str());
-    }
     const IpcCleanup ipc_cleanup{{base + "a", base + "done", base + "abort"}};
 
     Coordinator coordinator(done_ep, abort_ep);
@@ -1498,15 +1606,11 @@ class LatchRelay : public Relay {
 // returns: no DataReady may reach the next stage, and the operation settles
 // exactly once.
 void test_abort_before_data_ready(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-latch-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("latch");
   const std::string a_ep = "ipc://" + base + "a";
   const std::string b_ep = "ipc://" + base + "b";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
   const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket downstream(b_ep, true);
@@ -1574,15 +1678,11 @@ void test_abort_before_data_ready(int& failures) {
 // ---- round 2: F10 malformed DataRef still NACKs ---------------------------
 
 void test_malformed_data_ref_nack(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-nack-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("nack");
   const std::string b_ep = "ipc://" + base + "b";
   const std::string peer_ep = "ipc://" + base + "a";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
   const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
@@ -1686,15 +1786,11 @@ void test_malformed_data_ref_nack(int& failures) {
 // ---- round 2: F11 unsupported transport rejected before allocation --------
 
 void test_unsupported_transport_rejected(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-transport-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("transport");
   const std::string b_ep = "ipc://" + base + "b";
   const std::string peer_ep = "ipc://" + base + "a";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  for (const auto& path : {base + "a", base + "b", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
   const IpcCleanup ipc_cleanup{{base + "a", base + "b", base + "done", base + "abort"}};
 
   PullSocket peer(peer_ep, true);
@@ -1878,15 +1974,11 @@ void test_slot_size_range(int& failures) {
 // registered with require_ready but no stage is started, so the request stays
 // pending on the supported pre-readiness path. No fake stage or model is used.
 void test_nonstream_504_maps_to_timeout(int& failures) {
-  const std::string base =
-      "/tmp/omni-runtime-504-" + std::to_string(getpid()) + "-";
+  const std::string base = runtime_ipc_base("504");
   const std::string entry_ep = "ipc://" + base + "entry";
   const std::string done_ep = "ipc://" + base + "done";
   const std::string abort_ep = "ipc://" + base + "abort";
-  for (const auto& path : {base + "entry", base + "done", base + "abort"}) {
-    std::remove(path.c_str());
-  }
-  const IpcCleanup ipc_cleanup{{base + "done", base + "abort"}};
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
 
   Coordinator coordinator(done_ep, abort_ep);
   coordinator.register_stage("entry", entry_ep, true);
@@ -1954,43 +2046,288 @@ void test_nonstream_504_maps_to_timeout(int& failures) {
   coordinator_thread.join();
 }
 
+void test_injected_exception() {
+  const std::string base = runtime_ipc_base("exception");
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "done", base + "abort"}};
+  PullSocket entry("ipc://" + base + "entry", true);
+  entry.start();
+  PubSocket abort("ipc://" + base + "abort");
+  abort.bind();
+  throw std::runtime_error("injected exception after IPC bind");
+}
+
+// Binds one endpoint, then a second one that the harness made unavailable with
+// a foreign directory. The blocked path is derivable from the private root.
+// Only the owned endpoint may be cleaned up afterwards.
+void test_injected_partial_bind() {
+  const std::string base = runtime_ipc_base("partial");
+  const std::string blocked = base + "blocked";
+  const IpcCleanup ipc_cleanup{{base + "entry", blocked}};
+  PullSocket entry("ipc://" + base + "entry", true);
+  entry.start();
+  bool rejected = false;
+  try {
+    PullSocket second("ipc://" + blocked, true);
+    second.start();
+  } catch (const ProtocolError&) {
+    rejected = true;
+  }
+  if (!rejected) throw std::runtime_error("partial bind unexpectedly succeeded");
+  std::cerr << "PARTIAL_BIND_REJECTED" << std::endl;
+}
+
+// A regular file at a bind path cannot be protected: libzmq unlinks it inside
+// zmq_bind before this test can register it. Assert that documented behaviour
+// so the limitation is visible, then let cleanup remove the socket libzmq made.
+void test_foreign_bind_file() {
+  const std::string path = runtime_ipc_base("foreign") + "entry";
+  struct stat before {};
+  if (lstat(path.c_str(), &before) != 0 || !S_ISREG(before.st_mode)) {
+    throw std::runtime_error("bind-file sentinel is not a regular file: " + path);
+  }
+  const IpcCleanup ipc_cleanup{{path}};
+  PullSocket entry("ipc://" + path, true);
+  entry.start();
+  struct stat after {};
+  if (lstat(path.c_str(), &after) != 0 || !S_ISSOCK(after.st_mode)) {
+    throw std::runtime_error("libzmq did not replace the bind-file sentinel");
+  }
+  if (after.st_dev == before.st_dev && after.st_ino == before.st_ino) {
+    throw std::runtime_error("bind-file sentinel inode was unexpectedly preserved");
+  }
+  std::cerr << "LIMITATION foreign regular file at bind path was unlinked by "
+               "libzmq: "
+            << path << std::endl;
+}
+
+// Every path below already holds a foreign regular file, placed by the harness
+// before the gate is released. These paths are registered for cleanup by the
+// tests below, so cleanup must leave each one byte-identical. Verification runs
+// again after the whole suite, at the exit path.
+std::vector<std::string> foreign_sentinel_paths() {
+  return {
+      runtime_ipc_base("state") + "a",   runtime_ipc_base("state") + "b",
+      runtime_ipc_base("idreuse") + "a", runtime_ipc_base("idreuse") + "b",
+      runtime_ipc_base("two") + "entry", runtime_ipc_base("timeout") + "b",
+      runtime_ipc_base("504") + "entry",
+  };
+}
+
+struct SentinelSnapshot {
+  dev_t device;
+  ino_t inode;
+  std::string content;
+};
+
+void capture_sentinel(const std::string& path, SentinelSnapshot& out,
+                      const char* when) {
+  struct stat metadata {};
+  if (lstat(path.c_str(), &metadata) != 0) {
+    throw std::runtime_error(std::string("sentinel missing ") + when + ": " + path);
+  }
+  if (!S_ISREG(metadata.st_mode)) {
+    throw std::runtime_error(std::string("sentinel is not a regular file ") + when +
+                             ": " + path);
+  }
+  std::ifstream input(path);
+  const std::string content((std::istreambuf_iterator<char>(input)),
+                            std::istreambuf_iterator<char>());
+  input.close();
+  out.device = metadata.st_dev;
+  out.inode = metadata.st_ino;
+  out.content = content;
+}
+
+std::vector<SentinelSnapshot> sentinel_before;
+
+void test_foreign_sentinels() {
+  // The ordinary tests register every one of these paths in their own
+  // IpcCleanup, so this only records the before-state.
+  const std::vector<std::string> paths = foreign_sentinel_paths();
+  sentinel_before.resize(paths.size());
+  for (size_t i = 0; i < paths.size(); ++i) {
+    capture_sentinel(paths[i], sentinel_before[i], "before");
+  }
+  std::cerr << "SENTINELS_REGISTERED " << paths.size() << std::endl;
+}
+
+int verify_foreign_sentinels() {
+  const std::vector<std::string> paths = foreign_sentinel_paths();
+  if (sentinel_before.size() != paths.size()) return 0;
+  int failures_found = 0;
+  for (size_t i = 0; i < paths.size(); ++i) {
+    SentinelSnapshot after{};
+    try {
+      capture_sentinel(paths[i], after, "after cleanup");
+    } catch (const std::exception& error) {
+      std::cerr << "FAIL sentinel " << error.what() << "\n";
+      ++failures_found;
+      continue;
+    }
+    if (after.device != sentinel_before[i].device ||
+        after.inode != sentinel_before[i].inode) {
+      std::cerr << "FAIL cleanup replaced a foreign sentinel: " << paths[i] << "\n";
+      ++failures_found;
+    } else if (after.content != sentinel_before[i].content) {
+      std::cerr << "FAIL cleanup modified a foreign sentinel: " << paths[i] << "\n";
+      ++failures_found;
+    }
+  }
+  if (failures_found == 0) {
+    std::cerr << "SENTINELS_INTACT " << paths.size() << std::endl;
+  }
+  return failures_found;
+}
+
+// A directory sentinel at a real bind endpoint. zmq_bind fails with
+// EADDRINUSE, and the directory must survive cleanup. The path is derived from
+// the private root so the harness can place the sentinel before the gate opens.
+void test_foreign_bind_directory() {
+  const std::string path = runtime_ipc_base("foreigndir") + "entry";
+  struct stat before {};
+  if (lstat(path.c_str(), &before) != 0 || !S_ISDIR(before.st_mode)) {
+    throw std::runtime_error("foreign bind sentinel is not a directory: " + path);
+  }
+  const IpcCleanup ipc_cleanup{{path}};
+  bool rejected = false;
+  try {
+    PullSocket socket("ipc://" + path, true);
+    socket.start();
+  } catch (const ProtocolError&) {
+    rejected = true;
+  }
+  if (!rejected) throw std::runtime_error("bind over a foreign directory succeeded");
+  struct stat after {};
+  if (lstat(path.c_str(), &after) != 0 || !S_ISDIR(after.st_mode)) {
+    throw std::runtime_error("foreign bind directory disappeared");
+  }
+  if (after.st_dev != before.st_dev || after.st_ino != before.st_ino) {
+    throw std::runtime_error("foreign bind directory was replaced");
+  }
+  std::cerr << "FOREIGN_BIND_INTACT" << std::endl;
+}
+
+// Holds live IPC paths until the harness signals, so cleanup runs from the
+// signal handler with real socket files on disk.
+void test_bind_and_wait() {
+  const std::string base = runtime_ipc_base("signal");
+  const IpcCleanup ipc_cleanup{{base + "entry", base + "abort"}};
+  PullSocket entry("ipc://" + base + "entry", true);
+  entry.start();
+  PubSocket abort("ipc://" + base + "abort");
+  abort.bind();
+  alarm(0);  // the harness chooses when the signal arrives
+  std::cerr << "SIGNAL_READY" << std::endl;
+  const char* gate = std::getenv("UMMINFER_TEST_SIGNAL_GATE");
+  if (!gate) throw std::runtime_error("signal test needs a gate");
+  for (int attempt = 0; attempt < 1800 && access(gate, F_OK) != 0; ++attempt) {
+    usleep(10000);
+  }
+  if (access(gate, F_OK) != 0) throw std::runtime_error("IPC signal gate timed out");
+  for (;;) pause();
+}
+
+void test_injected_unlink_failure() {
+  // A non-empty directory cannot be unlinked, so cleanup must report a real
+  // failure and the process must exit non-zero. No env-var fault injection.
+  const std::string path = runtime_ipc_base("unlink") + "entry";
+  const IpcCleanup ipc_cleanup{{path}};
+  if (mkdir(path.c_str(), 0700) != 0) {
+    throw std::runtime_error("could not create unlink injection directory");
+  }
+  const std::string inner = path + "/sentinel";
+  const int fd = open(inner.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+  if (fd < 0) throw std::runtime_error("could not create unlink injection file");
+  if (write(fd, "owned", 5) != 5 || close(fd) != 0) {
+    throw std::runtime_error("could not write unlink injection file");
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  alarm(20);
   int failures = 0;
-  if (argc == 2 && std::string_view(argv[1]) == "--abort-before-start") {
-    test_abort_before_stage_start(failures);
-    return failures == 0 ? 0 : 1;
+  bool injected = false;
+  try {
+    install_ipc_cleanup("omni-runtime");
+    alarm(20);
+    wait_for_ipc_gate("UMMINFER_TEST_IPC_GATE");
+    if (std::getenv("UMMINFER_TEST_EXCEPTION")) {
+      injected = true;
+      test_injected_exception();
+    }
+    if (std::getenv("UMMINFER_TEST_PARTIAL_BIND")) {
+      injected = true;
+      test_injected_partial_bind();
+    }
+    if (const char* path = std::getenv("UMMINFER_TEST_FOREIGN_BIND_FILE")) {
+      (void)path;
+      injected = true;
+      test_foreign_bind_file();
+    }
+    if (std::getenv("UMMINFER_TEST_SENTINELS")) {
+      // Record before-states only; the ordinary suite below registers the same
+      // paths and must leave them untouched.
+      test_foreign_sentinels();
+    }
+    if (std::getenv("UMMINFER_TEST_FOREIGN_BIND")) {
+      injected = true;
+      test_foreign_bind_directory();
+    }
+    if (std::getenv("UMMINFER_TEST_SIGNAL")) {
+      injected = true;
+      test_bind_and_wait();
+    }
+    if (std::getenv("UMMINFER_TEST_UNLINK_CASE")) {
+      injected = true;
+      test_injected_unlink_failure();
+    }
+    if (injected) {
+      // The injected scenario already ran. Only cleanup remains.
+    } else if (argc == 2 && std::string_view(argv[1]) == "--abort-before-start") {
+      test_abort_before_stage_start(failures);
+    } else {
+      if (std::getenv("UMMINFER_TEST_FORCE_CHECK_FAILURE")) {
+        check(false, "injected cumulative assertion failure", failures);
+      }
+      test_batch_strings_are_results(failures);
+      test_batch_cost_error_reaches_request(failures);
+      test_batch_result_count_mismatch(failures);
+      test_later_batch_cost_error(failures);
+      test_abort_retention_and_callback(failures);
+      test_batch_filters_aborted_inputs(failures);
+      test_batch_cost_overflow(failures);
+      test_scheduler_control_messages(failures);
+      test_start_after_stop_returns(failures);
+      test_abort_before_stage_start(failures);
+      test_submit_request_id_mismatch(failures);
+      test_ack_releases_shm_credit(failures);
+      test_wire_boundaries(failures);
+      test_coordinator_terminal_state(failures);
+      test_explicit_id_does_not_reissue(failures);
+      test_two_stage_pipeline(failures);
+      test_transfer_ack_timeout(failures);
+      test_abort_releases_pending_transfer(failures);
+      test_sse_content_and_timeout(failures);
+      test_nonstream_504_maps_to_timeout(failures);
+      test_abort_cleans_stage_request(failures);
+      test_data_ready_checks_target(failures);
+      test_data_ready_validation(failures);
+      test_send_payload_faults(failures);
+      test_abort_before_data_ready(failures);
+      test_malformed_data_ref_nack(failures);
+      test_unsupported_transport_rejected(failures);
+      test_router_close_keeps_relays(failures);
+      test_slot_size_range(failures);
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "runtime_compat exception: " << error.what() << "\n";
+    ++failures;
+  } catch (...) {
+    std::cerr << "runtime_compat unknown exception\n";
+    ++failures;
   }
-  test_batch_strings_are_results(failures);
-  test_batch_cost_error_reaches_request(failures);
-  test_batch_result_count_mismatch(failures);
-  test_later_batch_cost_error(failures);
-  test_abort_retention_and_callback(failures);
-  test_batch_filters_aborted_inputs(failures);
-  test_batch_cost_overflow(failures);
-  test_scheduler_control_messages(failures);
-  test_start_after_stop_returns(failures);
-  test_abort_before_stage_start(failures);
-  test_submit_request_id_mismatch(failures);
-  test_ack_releases_shm_credit(failures);
-  test_wire_boundaries(failures);
-  test_coordinator_terminal_state(failures);
-  test_explicit_id_does_not_reissue(failures);
-  test_two_stage_pipeline(failures);
-  test_transfer_ack_timeout(failures);
-  test_abort_releases_pending_transfer(failures);
-  test_sse_content_and_timeout(failures);
-  test_nonstream_504_maps_to_timeout(failures);
-  test_abort_cleans_stage_request(failures);
-  test_data_ready_checks_target(failures);
-  test_data_ready_validation(failures);
-  test_send_payload_faults(failures);
-  test_abort_before_data_ready(failures);
-  test_malformed_data_ref_nack(failures);
-  test_unsupported_transport_rejected(failures);
-  test_router_close_keeps_relays(failures);
-  test_slot_size_range(failures);
-  return failures == 0 ? 0 : 1;
+  const int cleanup_failures = cleanup_ipc_root();
+  const int sentinel_failures = verify_foreign_sentinels();
+  return failures == 0 && cleanup_failures == 0 && sentinel_failures == 0 ? 0 : 1;
 }
