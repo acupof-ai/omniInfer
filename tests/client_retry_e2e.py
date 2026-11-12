@@ -122,6 +122,16 @@ class ByteTapProxy:
                 continue
             except OSError:
                 return
+            head = self._peek_request_head(client)
+            if head is None or not head.startswith(b"POST "):
+                # A localhost port scanner, a health probe or any other
+                # non-API client must not consume a plan slot. It gets no
+                # bytes and is not recorded.
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                continue
             with self._lock:
                 index = len(self.records)
                 mode = self.plans[index] if index < len(self.plans) else "pass"
@@ -129,10 +139,32 @@ class ByteTapProxy:
                           "response_bytes": 0, "delta_seen": False,
                           "result": "pending"}
                 self.records.append(record)
-            threading.Thread(target=self._handle, args=(client, record),
+            threading.Thread(target=self._handle, args=(client, record, head),
                              daemon=True).start()
 
-    def _handle(self, client, record):
+    @staticmethod
+    def _peek_request_head(client):
+        """Read the request head and keep it for the forwarding pump.
+
+        The bytes are returned to the caller, not consumed: `_handle` replays
+        them upstream. A client that sends nothing within the peek timeout is
+        treated as not a plan.
+        """
+        client.settimeout(5.0)
+        head = b""
+        try:
+            while b"\r\n\r\n" not in head and len(head) < 16384:
+                chunk = client.recv(4096)
+                if not chunk:
+                    return None
+                head += chunk
+        except OSError:
+            return None
+        finally:
+            client.settimeout(None)
+        return head
+
+    def _handle(self, client, record, head=b""):
         try:
             upstream = socket.create_connection(("127.0.0.1", self.upstream_port),
                                                 timeout=10)
@@ -147,20 +179,30 @@ class ByteTapProxy:
         client_closed = threading.Event()
 
         def pump_request():
-            buffer = bytearray()
+            buffer = bytearray(head)
             try:
                 while True:
+                    if buffer:
+                        # A reset_after_request case must never let the real
+                        # response reach the client. Clear response forwarding
+                        # before the request that triggers the reset is sent, so
+                        # the reset is deterministic even when the local server
+                        # answers faster than this thread can be scheduled.
+                        resets_now = (mode == "reset_after_request"
+                                      and request_complete(buffer))
+                        if resets_now:
+                            state["forward"] = False
+                        record["request_bytes"] += len(buffer)
+                        if state["forward"] or resets_now:
+                            upstream.sendall(bytes(buffer))
+                        buffer.clear()
+                        if resets_now and not trigger.is_set():
+                            trigger.set()
+                            return
                     chunk = client.recv(65536)
                     if not chunk:
                         break
                     buffer.extend(chunk)
-                    record["request_bytes"] += len(chunk)
-                    if state["forward"]:
-                        upstream.sendall(chunk)
-                    if mode == "reset_after_request" and not trigger.is_set() \
-                            and request_complete(buffer):
-                        trigger.set()
-                        return
             except OSError:
                 pass
             finally:

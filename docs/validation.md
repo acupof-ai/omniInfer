@@ -113,6 +113,16 @@ The test inserts a TCP byte relay between the real client and real server. The
 relay only forwards, delays, holds, truncates, resets, or observes actual bytes.
 It never writes HTTP, SSE, WebSocket, or control-frame payloads of its own.
 
+Both relays ignore connections that are not part of the protocol under test. A
+localhost port scanner or health probe sends `GET /` and must not consume a
+relay plan slot or bind the WebSocket session. `tests/proxy_isolation_test.py`
+pins that invariant without a model, and also proves the pre-fix behaviour still
+fails:
+
+```sh
+python3 -I tests/proxy_isolation_test.py "$UMMINFER_BINARY"
+```
+
 Expected result: retries occur only where the client contract allows them.
 Emitted stream content is not silently restarted. Stall and total timeouts
 produce client errors. Subsequent requests and process cleanup pass.

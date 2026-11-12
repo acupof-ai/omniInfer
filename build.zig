@@ -168,4 +168,14 @@ pub fn build(b: *std.Build) void {
     mlx_test.addFileArg(b.path("tests/mlx_stage_test.py"));
     const mlx_test_step = b.step("mlx-test", "Run MLX stage unit tests");
     mlx_test_step.dependOn(&mlx_test.step);
+
+    // Harness regression: an ambient non-API probe must not shift a proxy
+    // plan or bind a WebSocket session. Needs only the CLI binary, no model.
+    const proxy_isolation = b.addSystemCommand(&.{ "python3", "-I" });
+    proxy_isolation.addFileArg(b.path("tests/proxy_isolation_test.py"));
+    proxy_isolation.addArtifactArg(exe);
+    const proxy_isolation_step = b.step(
+        "proxy-isolation-test",
+        "Check harness proxies ignore non-API probe connections");
+    proxy_isolation_step.dependOn(&proxy_isolation.step);
 }

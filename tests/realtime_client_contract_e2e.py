@@ -332,7 +332,7 @@ class WireProxy:
         self.listener = socket.socket()
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("127.0.0.1", 0))
-        self.listener.listen(1)
+        self.listener.listen(16)
         self.listener.settimeout(0.1)
         self.port = self.listener.getsockname()[1]
         self.events = []
@@ -383,9 +383,19 @@ class WireProxy:
                     return
                 try:
                     client, _ = self.listener.accept()
-                    break
                 except socket.timeout:
                     continue
+                head = self._peek_upgrade_head(client)
+                if head is None:
+                    # A localhost port scanner or any other non-WebSocket
+                    # client must not bind the real session. Drop it and keep
+                    # waiting for the real handshake.
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+                    continue
+                break
             else:
                 self.errors.append("proxy accept timeout")
                 return
@@ -398,8 +408,12 @@ class WireProxy:
                                  else FrameParser(self, "server"))
             for source, destination, direction in (
                     (client, upstream, "client"), (upstream, client, "server")):
+                # The client handshake head was read during the upgrade
+                # check. Replay it so the real server sees the same bytes.
+                replay = head if direction == "client" else b""
                 thread = threading.Thread(target=self.forward,
-                                          args=(source, destination, direction, parsers[direction]),
+                                          args=(source, destination, direction,
+                                                parsers[direction], replay),
                                           name=f"ws-wire-{direction}", daemon=True)
                 self.forwarders.append(thread)
                 thread.start()
@@ -407,8 +421,44 @@ class WireProxy:
             if not self.stopping.is_set():
                 self.errors.append(f"proxy accept: {exc}")
 
-    def forward(self, source, destination, direction, parser):
+    @staticmethod
+    def _peek_upgrade_head(client):
+        """Return the request head when it is a real WebSocket upgrade.
+
+        The bytes are returned, not consumed, so the forwarder replays them.
+        A non-WebSocket client (port scanner, health probe) returns None and is
+        dropped without binding the session.
+        """
+        client.settimeout(5.0)
+        head = b""
         try:
+            while b"\r\n\r\n" not in head and len(head) < 16384:
+                chunk = client.recv(4096)
+                if not chunk:
+                    return None
+                head += chunk
+        except OSError:
+            return None
+        finally:
+            client.settimeout(None)
+        lines = head.split(b"\r\n")
+        if not lines[0].upper().startswith(b"GET "):
+            return None
+        fields = {}
+        for line in lines[1:]:
+            name, _, value = line.partition(b":")
+            fields[name.strip().lower()] = value.strip().lower()
+        if fields.get(b"upgrade") != b"websocket":
+            return None
+        if b"upgrade" not in fields.get(b"connection", b""):
+            return None
+        return head
+
+    def forward(self, source, destination, direction, parser, head=b""):
+        try:
+            if head:
+                parser.feed(head)
+                destination.sendall(head)
             for _ in range(100000):
                 data = source.recv(65536)
                 if not data:
