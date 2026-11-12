@@ -9,13 +9,16 @@ from pathlib import Path
 import sys
 import time
 
+import mlx.core as mx
 from mlx_lm import load
 
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE = ROOT / "python" / "umminfer_mlx_stage.py"
 BASELINE_STAGE = Path("/tmp/umminfer-stage-iteration2-baseline.py")
-PREVIOUS_STAGE = Path("/tmp/umminfer-stage-iteration2-wired.py")
+BASELINE_STAGE_SHA256 = "be0e6b89cc9d636cf630a544f24cc87f854936bba60671a63761e9935df1ab89"
+PREVIOUS_STAGE = Path("/tmp/umminfer-stage-0003.py")
+PREVIOUS_STAGE_SHA256 = "0003b29085c5630e7d16a53b370691872d7016318b2eb74d922bc7b8c48b0c2a"
 SPEC = importlib.util.spec_from_file_location(
     "umminfer_mlx_perf", ROOT / "tests" / "mlx_perf.py")
 perf = importlib.util.module_from_spec(SPEC)
@@ -85,6 +88,10 @@ def main():
     needles = perf.patrol_needles("/tmp/umminfer-direct-no-binary", STAGE)
     perf.check_exclusive(needles)
     other_inference = perf.foreign_processes(["umm-infer"])
+    perf.require(perf.digest(BASELINE_STAGE) == BASELINE_STAGE_SHA256,
+                 "the original baseline stage changed")
+    perf.require(perf.digest(PREVIOUS_STAGE) == PREVIOUS_STAGE_SHA256,
+                 "the incremental previous stage is not frozen 0003")
     stage = perf.load_stage_module(STAGE)
     baseline_stage = perf.load_stage_module(BASELINE_STAGE)
     previous_stage = perf.load_stage_module(PREVIOUS_STAGE)
@@ -92,6 +99,13 @@ def main():
     model, tokenizer = load(str(perf.MODEL_PATH))
     stage._cache_vocabulary(tokenizer)
     load_seconds = time.perf_counter() - started
+    candidate_started = time.perf_counter()
+    candidate_model, candidate_tokenizer = load(
+        str(perf.MODEL_PATH), lazy=True)
+    stage._fuse_qwen2_qkv(candidate_model)
+    mx.eval(candidate_model.parameters())
+    stage._cache_vocabulary(candidate_tokenizer)
+    candidate_load_seconds = time.perf_counter() - candidate_started
     prompt = tokenizer.apply_chat_template(
         [{"role": "user", "content": perf.PROMPT}], tokenize=False,
         add_generation_prompt=True)
@@ -101,7 +115,7 @@ def main():
         model, tokenizer, skip_final_lookahead=True,
         reuse_prompt_cache=True, reuse_detokenizer=True)
     candidate = stage._make_greedy_generate(
-        model, tokenizer, skip_final_lookahead=True,
+        candidate_model, candidate_tokenizer, skip_final_lookahead=True,
         reuse_prompt_cache=True, reuse_detokenizer=True)
     arms = (("baseline", baseline), ("prompt_cache", prompt_cache),
             ("candidate", candidate))
@@ -127,8 +141,13 @@ def main():
                 perf.require(actual == expected,
                              f"{name} changed output at iteration {iteration}: "
                              f"expected={expected!r} actual={actual!r}")
-            perf.require(rows["baseline"][-1]["generation_tokens"] > 0,
-                         "the fixed request reported no generated tokens")
+            for name in rows:
+                row = rows[name][-1]
+                observed = (row["generation_tokens"], row["prompt_tokens"],
+                            row["finish_reason"])
+                perf.require(observed == (13, 35, "stop"),
+                             f"fixed request changed for {name} at iteration "
+                             f"{iteration}: {observed!r}")
 
         measurement_stats = {
             name: {"prompt_cache": dict(getattr(
@@ -182,10 +201,10 @@ def main():
                 "prompt": perf.PROMPT, "temperature": perf.TEMPERATURE,
                 "max_tokens": args.max_tokens,
                 "samples": args.samples, "warmup": args.warmup,
-                "interleaved": True, "loaded_model_shared": True,
-                "baseline": "frozen iteration-1 greedy argmax, fresh KV and detokenizer",
-                "prompt_cache": "previous candidate with request-private shallow KV cache objects",
-                "candidate": "previous candidate with process-lifetime wired limit",
+                "interleaved": True, "loaded_model_shared": False,
+                "baseline": "original frozen baseline: fresh KV and detokenizer",
+                "prompt_cache": "frozen 0003 previous: prompt KV, vocabulary and post-item async",
+                "candidate": "current stage: load-time fused quantized QKV projection",
                 "mlx_exclusive": True,
                 "other_inference_processes_at_start": other_inference,
             },
@@ -197,6 +216,7 @@ def main():
                 "harness": perf.digest(Path(perf.__file__).resolve()),
             },
             "model_load_seconds": load_seconds,
+            "candidate_model_load_seconds": candidate_load_seconds,
             "correctness": {
                 "per_sample_fields": ["token_ids_sha256", "output_sha256",
                                       "generation_tokens", "finish_reason",

@@ -218,11 +218,75 @@ def _make_greedy_generate(model, tokenizer, skip_final_lookahead=True,
     return generate
 
 
+def _fuse_qwen2_qkv(model):
+    """Evaluate one quantized QKV projection instead of three per layer."""
+    import copy
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models import qwen2
+
+    if not isinstance(model, qwen2.Model):
+        return
+    attentions = [layer.self_attn for layer in model.model.layers]
+    projections = [(attention.q_proj, attention.k_proj, attention.v_proj)
+                   for attention in attentions]
+    if not all(isinstance(projection, nn.QuantizedLinear)
+               for group in projections for projection in group):
+        return
+    layouts = [(q.group_size, q.bits, q.mode, q.weight.shape[1:])
+               for q, _, _ in projections]
+    if any((k.group_size, k.bits, k.mode, k.weight.shape[1:]) != layout or
+           (v.group_size, v.bits, v.mode, v.weight.shape[1:]) != layout or
+           k.weight.shape[0] != v.weight.shape[0]
+           for layout, (_, k, v) in zip(layouts, projections)):
+        return
+
+    class FusedAttention(qwen2.Attention):
+        def __call__(self, x, mask=None, cache=None):
+            B, L, D = x.shape
+            qkv = self.qkv_proj(x)
+            queries = qkv[..., :self.q_size]
+            keys = qkv[..., self.q_size:self.q_size + self.kv_size]
+            values = qkv[..., self.q_size + self.kv_size:]
+            queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+            keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+            values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+            if cache is not None:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
+                keys, values = cache.update_and_fetch(keys, values)
+            else:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
+            output = qwen2.scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask)
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self.o_proj(output)
+
+    for attention, (q, k, v) in zip(attentions, projections):
+        fused = copy.copy(q)
+        for name in ("weight", "scales", "biases", "bias"):
+            setattr(fused, name, mx.concatenate(
+                [getattr(projection, name) for projection in (q, k, v)], axis=0))
+        attention.q_size = q.weight.shape[0]
+        attention.kv_size = k.weight.shape[0]
+        attention.qkv_proj = fused
+        del attention.q_proj, attention.k_proj, attention.v_proj
+        attention.__class__ = FusedAttention
+
+
 def load_mlx_backend(path):
+    import inspect
+    import mlx.core as mx
     from mlx_lm import load, stream_generate
     from mlx_lm.sample_utils import make_sampler
 
-    model, tokenizer = load(path)
+    if "lazy" in inspect.signature(load).parameters:
+        model, tokenizer = load(path, lazy=True)
+        _fuse_qwen2_qkv(model)
+        mx.eval(model.parameters())
+    else:
+        model, tokenizer = load(path)
     _cache_vocabulary(tokenizer)
     try:
         greedy_generate = _make_greedy_generate(model, tokenizer)
