@@ -1,16 +1,54 @@
 # ummInfer
 
 ummInfer is an inference runtime for **Unified Multimodal Models (UMM)**.
-It provides a C++20 pipeline with MessagePack control messages, ZeroMQ
-transport, POSIX shared-memory payload relay, and an OpenAI-compatible HTTP API.
 
-Text generation runs through the C++ HTTP server and an external Python MLX-LM
-stage on Apple Silicon. A deterministic TinyCTC audio stage exercises the
-transcription pipeline. The C++ stage host also contains reference echo compute
-for the in-process demo and multi-stage shared-memory paths.
+The target is one engine that serves vision-language (VLM) and speech (ASR)
+workloads together: shared sessions, one orchestration path, streaming events,
+cancellation, backpressure, error propagation, and output coordination. Models
+run in separate worker processes behind that one control plane.
 
-The `umm-infer` executable includes a C++ client CLI. The public C++ API provides
-chat, file transcription, and realtime audio sessions.
+The engine foundation is implemented and tested for text chat and for a
+deterministic audio test pipeline. The unified VLM+ASR capability is **not
+implemented**. This README separates the two.
+
+## Status
+
+| Layer | State |
+| --- | --- |
+| C++20 control plane: Coordinator, request abort, ready gating | Implemented; default tests pass |
+| ZeroMQ transport with MessagePack control messages | Implemented; default tests pass |
+| POSIX shared-memory payload relay with bounded credits | Implemented; default tests pass |
+| Optional CUDA IPC relay path | Build path present; unbuilt and unexecuted here (no CUDA toolkit) |
+| External persistent Python stage protocol | Implemented; used by the two stages below |
+| MLX-LM text chat, JSON and SSE | Implemented; checked against a real local model |
+| ASR pipeline | Implemented against the deterministic TinyCTC test model only |
+| HTTP, SSE, WebSocket server; CLI; C++ clients | Implemented |
+| Native macOS client `clients/ummmlx` | Implemented; text chat only |
+| Trained ASR model | Not implemented |
+| Real VLM worker | Not implemented |
+| Cross-model orchestration (for example ASR to VLM) | Not implemented |
+| Shared session across modalities | Not implemented |
+| Unified multimodal end-to-end acceptance | Not run |
+| H20B verification | BLOCKED; jump host authentication fails |
+
+TinyCTC is test infrastructure. It has deterministic initialized weights, and
+it does not recognize speech. The MLX-LM chat path is text-only inference. It is
+not a VLM.
+
+Image and video are optional modalities. They attach as separate workers when a
+use case needs them, and they do not block the VLM+ASR main path. Today no local
+image or video worker exists; the only image and video routes are the
+fixed-upstream proxy described below.
+
+See [roadmap](docs/roadmap.md) for the phase plan and acceptance gates, and
+[validation](docs/validation.md) for the user journeys that exist today.
+
+Verification has two profiles. The Apple Silicon Mac runs low-consumption
+control-plane, stage, and small real-model checks. NVIDIA H20B is for
+high-precision acceptance. H20B access currently fails at the jump host
+authentication step, so every H20B result is `BLOCKED` / `NOT_RUN`; none is
+verified. The split and its gates are in
+[roadmap](docs/roadmap.md#verification-split).
 
 ## What you can do
 
@@ -21,9 +59,29 @@ chat, file transcription, and realtime audio sessions.
 | Transcribe a WAV or PCM file | `transcribe`, multipart HTTP | TinyCTC test stage |
 | Send audio over WebSocket | `realtime`, `/v1/realtime` | TinyCTC test stage |
 | Use a bearer key | Environment variables in the client | Optional server authentication |
+| Generate or edit an image, create a video | `image`, `video`, `/v1/images/*`, `/v1/videos*` | Fixed upstream only |
 
 The server exposes `/health`, `/ready`, `/v1/models`, and `/abort`.
 `/v1/audio/speech` returns HTTP 501.
+
+A second, opt-in server mode forwards one model family to one configured
+upstream instead of running a local stack. It adds image, video, and
+omni-modality routes. It is a proxy: it does not implement a VLM or a video
+model inside ummInfer. See [fixed upstream mode](#fixed-upstream-proxy-mode).
+## What is not implemented
+
+- A VLM worker. Local chat accepts text content only and rejects content part
+  arrays with HTTP 400.
+- A trained ASR model. Only the deterministic TinyCTC stage exists.
+- Cross-model orchestration. Chat, transcription, and realtime are separate
+  request paths. No request runs two model families in one plan.
+- A shared session object across modalities. The realtime WebSocket session is
+  private to one audio utterance.
+- A unified cancellation, backpressure, and error-propagation contract spanning
+  several workers. Abort exists per request. Shared-memory relay credits bound
+  one C++ payload edge. Neither is a multi-worker contract.
+- Unified multimodal end-to-end acceptance across participants' changes.
+  Component results recorded during development do not replace it.
 
 ## Requirements and limits
 
@@ -57,9 +115,9 @@ The server exposes `/health`, `/ready`, `/v1/models`, and `/abort`.
 - One external MLX stage processes one request at a time. Other requests queue.
 - The C++ stage host contains reference echo compute only. It does not load a
   model. CUDA support is build-time functionality and has not been tested here.
-- Chat message content must be text. Multimodal content, tools, `top_p`, `seed`,
-  non-empty `stop`, usage in `stream_options`, and JSON response format are
-  rejected by this server.
+- On the local path, chat message content must be text. Multimodal content
+  arrays, tools, `top_p`, `seed`, non-empty `stop`, usage in `stream_options`,
+  and JSON response format are rejected by this server.
 - Transcription accepts `model`, `stream`, `max_new_tokens`,
   `include_generation_metadata`, `response_format=json`, and `temperature=0`.
   Other response formats and nonzero temperatures return HTTP 400. `language`,
@@ -79,8 +137,7 @@ The server exposes `/health`, `/ready`, `/v1/models`, and `/abort`.
   seconds by default (`transfer_timeout_ms`); a timed-out transfer abandons
   its CUDA edge and other targets keep working.
 
-See [architecture](docs/external_stage.md), [delivery status](docs/roadmap.md),
-and [user validation](docs/validation.md).
+See [architecture](docs/external_stage.md) and [user validation](docs/validation.md).
 
 ## Install and build
 
@@ -99,7 +156,11 @@ The binary is `zig-out/bin/umm-infer`. Apple's system libcurl 8.7.1 lacks the
 WebSocket support required by the realtime client. Use `-Ddeps-prefix` when
 dependencies are outside the system include and library paths.
 
-`test` runs wire, relay, scheduler, coordinator, and two-stage pipeline tests.
+`test` runs wire, relay, scheduler, coordinator, client, fixed-upstream proxy,
+and two-stage pipeline tests. It builds and runs no model. On this machine it
+exits 0: `all checks passed`, `all transport checks passed`, `all serve proxy
+checks passed`, `all 82 client checks passed`.
+
 `smoke` checks HTTP validation, authentication, JSON, SSE, 24 concurrent JSON
 requests, 12 concurrent SSE requests, external stages, and SIGTERM shutdown.
 
@@ -169,6 +230,54 @@ The server queues requests until the stage announces readiness.
 
 The client reads `OPENAI_BASE_URL` and `OPENAI_MODEL` when the corresponding
 options are absent. With no `--prompt`, it reads the prompt from standard input.
+
+### Measured stage result
+
+The frozen comparison baseline already caches the tokenizer vocabulary map. The
+current stage adds two changes on top of it: a reusable prompt KV snapshot with
+a reused detokenizer, and one fused quantized QKV projection per layer instead
+of three projections. The fusion applies to quantized Qwen2-architecture models
+whose Q, K, and V projections share one quantization layout; on another layout
+it is skipped.
+
+Under the project's fixed comparison convention, the recorded result for the
+current stage against that baseline is a **61.93% warm speedup on median total
+latency**:
+
+| Item | Value |
+| --- | --- |
+| Metric | warm median `total_ms`, 63.75 ms to 39.37 ms |
+| Formula | `(63.75 / 39.37 - 1) * 100`, a ratio of medians |
+| Same change as latency reduction | 38.25% fewer milliseconds |
+| Configuration | `http_sse`, `max_tokens=64`, 20 interleaved pairs, fresh process per sample, 2 warmups per process, `temperature=0`, Qwen2.5-0.5B-Instruct-4bit |
+| Output identity | One output SHA256 across both arms; finish reason `stop` on all 20 pairs |
+| Recompute | A second script recomputed the stored medians and matched |
+
+The fused QKV step alone is smaller. In the direct in-process harness, the arm
+that already has the vocabulary cache and prompt KV measured 3.92% from adding
+the fusion (391.05 to 406.39 output tokens per second). Do not attribute the
+61.93% to the fusion.
+
+Read the number with its conditions:
+
+- It is a ratio of medians, not a median of per-pair ratios. The median
+  per-pair speedup is 51.11%, and 2 of the 20 pairs were slower with the
+  candidate arm.
+- Every recorded `cv` is above the 0.10 quiet-window limit: warm `total_ms`
+  0.167 baseline and 0.287 candidate; warm `ttft_ms` 0.328 and 2.735. The run
+  itself printed four `cv` warnings. By the project rule this is one recorded
+  run that asks for a repeat, not a validated result.
+- The token counters are absent, not estimated. The frozen binary's chat reply
+  carries no `usage`, `generation_tokens`, or `prompt_tokens`, and peak memory
+  is unobservable without `--perf-log`. The report records those gaps.
+- The report did not pass the `tests/mlx_perf_compare.py` gate set; it has a
+  recompute check only.
+- Both the HTTP A/B harness and its report are local artifacts. Neither is
+  committed here, so the number cannot be re-derived from a clean checkout
+  alone.
+- The in-repository harnesses for the same stage are
+  `tests/mlx_prompt_cache_perf.py` (direct MLX-LM A/B) and `tests/mlx_perf.py`
+  (general comparison). Their gates are in [MLX backend](docs/mlx.md).
 
 ## Run the audio test pipeline
 
@@ -267,6 +376,63 @@ device, and give the sender the device of the stage it sends to:
   `UMMINFER_DISABLE_CUDA_IPC=1` is set, the edge uses POSIX shared memory.
   The fallback is logged once per edge.
 
+None of these commands has been executed on this machine, which has no CUDA
+toolkit: `zig build -Dcuda` stops here when `cuda_runtime_api.h` is not found.
+The relay code has default-test coverage only; CUDA execution is unverified.
+
+## Fixed upstream proxy mode
+
+`serve` can forward requests to one external model server instead of running a
+local stage. This mode is separate from the engine foundation. It adds no local
+model, no local orchestration, and no local session.
+
+```sh
+# Official compatible API, omni variant.
+./zig-out/bin/umm-infer serve --port 30000 --model MY-MODEL \
+  --upstream-kind qwen --upstream-base-url https://example.invalid/v1 \
+  --upstream-model MODEL-ID --upstream-variant omni
+
+# SGLang server, image or video variant.
+./zig-out/bin/umm-infer serve --port 30000 --model MY-MODEL \
+  --upstream-kind sglang --upstream-base-url http://127.0.0.1:30010 \
+  --upstream-model MODEL-ID --upstream-variant image
+```
+
+Rules of this mode:
+
+- One process serves one upstream, one model, and one variant. There is no
+  routing or fallback between upstreams.
+- The route set follows the variant. `qwen` serves only
+  `POST /v1/chat/completions`. `sglang` with `image` serves
+  `POST /v1/images/generations` and `POST /v1/images/edits`. `sglang` with
+  `video` serves `POST /v1/videos`, `GET /v1/videos/{id}`,
+  `GET /v1/videos/{id}/content`, and `DELETE /v1/videos/{id}`.
+- Every other media route answers HTTP 501. A server with no upstream flags also
+  answers 501 on all image and video routes.
+- The upstream credential comes from `--upstream-api-key` or
+  `UMMINFER_UPSTREAM_API_KEY`. It is sent only to the upstream. It must differ
+  from `--api-key`.
+- The request body's `model` field is replaced with `--upstream-model` before
+  forwarding.
+- `/abort` answers HTTP 501. A fixed upstream is not a coordinator job.
+- Remote plain HTTP is rejected. A plain-HTTP upstream must be loopback.
+- Requests bypass the Coordinator submission path, C++ `Stage`, and the relay.
+  The process still constructs a Coordinator, but no proxy request uses it.
+- `/ready` answers 200 immediately when no entry stage is configured.
+
+The CLI multimodal flags need this mode. `chat --image-url`, `--video-url`,
+`--audio`, and `--audio-out` send content parts that the local MLX path rejects;
+they work only against an `omni` upstream. `image generate`, `image edit`, and
+the `video` subcommands need an `image` or `video` upstream.
+
+The default test suite checks configuration validation, route gating, error
+mapping, and credential scrubbing against a real local server with an
+unreachable upstream. It does not prove an upstream success. Live scripts
+`tests/qwen_omni_live.py`, `tests/h3_live.py`, and `tests/h3_image_live.py`
+require `UMMINFER_LIVE_OPT_IN=1` and provider credentials. Without them they
+print `BLOCKED`/`NOT_COVERED` and make no network request. No live upstream run
+is recorded for this revision.
+
 ## Authentication
 
 The server enables authentication with `serve --api-key KEY`. It protects HTTP,
@@ -308,10 +474,20 @@ CLI/public API -> HTTP or WebSocket -> Coordinator -> ZeroMQ
 C++ stage-host path:
 C++ Stage -> SimpleScheduler -> compute function
 
+Fixed upstream path:
+CLI/public API -> HTTP -> one configured upstream (no Coordinator use)
+
 C++ stage-to-stage payload transfer uses POSIX shared memory, or optional CUDA
 IPC where its requirements hold. The external Python path does not use C++
 Stage, SimpleScheduler, or the C++ shared-memory relay.
 ```
+
+## Desktop client
+
+`clients/ummmlx` is a native macOS SwiftUI client for a local MLX server. It
+supports incremental SSE chat, Stop, New chat, and light/dark appearance. It
+covers text chat only; voice, ASR, image, and video are `NOT_COVERED` there. See
+[clients/ummmlx/README.md](clients/ummmlx/README.md).
 
 ## Layout
 
@@ -330,6 +506,7 @@ tests/{cuda_stress.py,cuda_sanitize.py,http_smoke.py,tla_test.py}
 tests/{client_smoke.py,client_retry_e2e.py,client_boundary_e2e.py}
 tests/{realtime_contract_e2e.py,realtime_client_contract_e2e.py}
 tests/{mlx_smoke.py,mlx_stage_test.py,mlx_*_perf.py,client_benchmark.py}
+tests/{qwen_omni_live.py,h3_live.py,h3_image_live.py,live_common.py}
 tests/tla/{RequestLifecycle.tla,RequestLifecycle.cfg}
 docs/{cuda-ipc.md,external_stage.md,mlx.md,client.md,roadmap.md,validation.md}
 ```
