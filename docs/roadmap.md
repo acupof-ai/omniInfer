@@ -63,7 +63,7 @@ Existing chat and ASR paths keep working through it.
 
 | Check | Rule |
 | --- | --- |
-| Existing behavior | Chat JSON, chat SSE, and transcription still pass the default `zig build test` (which needs `-Ddeps-prefix` and `-Dcurl-prefix`). Realtime has no C++ unit test; it must still pass its two Python E2E scripts, run by hand with a real TinyCTC model. |
+| Existing behavior | Chat JSON and chat SSE still pass the default `zig build test`, which needs `-Ddeps-prefix` and `-Dcurl-prefix`. Transcription and realtime have no C++ case in that suite; they must still pass their hand-run Python E2E: `tests/client_smoke.py` for transcription and `tests/realtime_contract_e2e.py` plus `tests/realtime_client_contract_e2e.py` for realtime, each with a real TinyCTC model. |
 | Plan execution | A two-step plan with test workers returns ordered stream events and one terminal event. |
 | Cancel | Cancelling a running two-step plan reaches both workers and leaves `in_flight` at zero. |
 | Backpressure | A slow consumer bounds worker output without unbounded buffer growth; the test measures high-water bytes. |
