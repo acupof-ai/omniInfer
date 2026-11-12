@@ -20,7 +20,7 @@ HTTP task; the server observes disconnect at a token boundary.
 ## Build and test
 
 ```sh
-cd /Users/bytedance/code/omniInfer/clients/ummmlx
+cd clients/ummmlx
 swift test
 Scripts/build.sh release
 open build/ummmlx.app
@@ -29,15 +29,34 @@ open build/ummmlx.app
 The build creates `build/ummmlx.app` without signing, notarization, or a DMG.
 The raw executable is `build/ummmlx.app/Contents/MacOS/ummmlx`.
 
-## Start the real local service
+## Required paths
 
-Use separate terminals from the repository root.
-
-Terminal 1:
+Two inputs have no built-in path: the `umm-infer` server binary and the MLX
+model snapshot directory. The repository does not contain them. Get them from
+your build output and model cache, then export both:
 
 ```sh
-IPC_DIR=$(mktemp -d /tmp/ummmlx-ipc.XXXXXX)
-/tmp/umm-b3-client-r7/bin/umm-infer serve \
+export UMMMLX_SERVER=/path/to/umm-infer
+export UMMMLX_MODEL=/path/to/models--mlx-community--Qwen2.5-0.5B-Instruct-4bit/snapshots/<revision>
+export PYTHON=$(command -v python3)   # must have mlx-lm installed
+```
+
+`UMMMLX_MODEL` must be the snapshot directory itself: it must contain
+`config.json`, `tokenizer.json`, `tokenizer_config.json` with a chat template,
+and one `model.safetensors`.
+
+The acceptance run pins the server binary to SHA256
+`d51384fd053fb78d4ff0fa0b49a912d33639f225d727ea61991a9feb06105f01`. A binary
+with another hash needs `--allow-unfrozen`, and the report then records
+`"frozen": false`.
+
+## Start the real local service
+
+Use separate terminals from the repository root. Terminal 1:
+
+```sh
+IPC_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ummmlx-ipc.XXXXXX")
+"$UMMMLX_SERVER" serve \
   --host 127.0.0.1 --port 30000 --model Qwen2.5-0.5B-Instruct-4bit \
   --entry mlx --entry-endpoint "ipc://$IPC_DIR/entry" \
   --completion "ipc://$IPC_DIR/completion" --abort "ipc://$IPC_DIR/abort"
@@ -46,12 +65,11 @@ IPC_DIR=$(mktemp -d /tmp/ummmlx-ipc.XXXXXX)
 Terminal 2, with the same `IPC_DIR`:
 
 ```sh
-MODEL=/Users/bytedance/.cache/huggingface/hub/models--mlx-community--Qwen2.5-0.5B-Instruct-4bit/snapshots/a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-  /opt/homebrew/opt/python@3.11/bin/python3.11 -I python/umminfer_mlx_stage.py \
+  "$PYTHON" -I python/umminfer_mlx_stage.py \
   --name mlx --recv "ipc://$IPC_DIR/entry" \
   --coordinator "ipc://$IPC_DIR/completion" --abort "ipc://$IPC_DIR/abort" \
-  --model "$MODEL"
+  --model "$UMMMLX_MODEL"
 ```
 
 After `/ready` returns 200:
@@ -74,23 +92,40 @@ build/ummmlx.app/Contents/MacOS/ummmlx --automation \
   --output=/tmp/ummmlx-static.json --screenshots=/tmp/ummmlx-static
 ```
 
-The real runner uses the existing `/tmp/umminfer-mlx-perf.lock`, process patrol,
-frozen server, current stage, fixed local model, and offline environment. It
-stops one real stream after a delta, starts a fresh GUI conversation, completes
-it, and captures both appearances. The output directory must not exist:
+The real runner takes the shared `/tmp/umminfer-mlx-perf.lock`, checks process
+exclusivity, starts the configured server and the current stage over a private
+IPC directory, and drives the GUI. One run covers:
+
+1. Stop after the first real delta, then New chat.
+2. Two complete turns in one session. The second request must carry the first
+   exchange, so the request history is `user`, `assistant`, `user`.
+3. One rejected request with an unserved model name. The frozen server answers
+   400 and the client must show that message.
+4. Light, dark, and error screenshots, all distinct.
+
+The output directory must not exist. Run the runner with an interpreter that has
+`mlx-lm`, `msgpack`, and `pyzmq`:
 
 ```sh
-OUT=/tmp/ummmlx-e2e-manual
-/opt/homebrew/opt/python@3.11/bin/python3.11 -I Scripts/real_e2e.py \
-  --out "$OUT" > "$OUT.console.log" 2>&1 &
+OUT=/tmp/ummmlx-e2e-run
+"$PYTHON" -I Scripts/real_e2e.py --out "$OUT" \
+  --server "$UMMMLX_SERVER" --model "$UMMMLX_MODEL" \
+  > "$OUT.console.log" 2>&1 &
 E2E_PID=$!
 wait "$E2E_PID"
 REAL_EXIT=$?
 printf 'REAL_EXIT=%s\n' "$REAL_EXIT"
 ```
 
+`--server`/`--model` fall back to `UMMMLX_SERVER`/`UMMMLX_MODEL`.
+`--served-model` defaults to `Qwen2.5-0.5B-Instruct-4bit` (`UMMMLX_SERVED_MODEL`).
+The rejected model name is `<served-model>-not-served` unless
+`--error-model` sets one.
+
 See `report.json`, `automation.json`, `server.log`, `stage.log`, `app.log`, and
-`screenshots/` under that directory. Each captured process log is capped at
+`screenshots/` under that directory. `report.json` carries the before/after
+hashes of the server, stage, app, weights, runner, perf helper, model inputs,
+and the screenshot SHA256 values. Each captured process log is capped at
 64 KiB. A nonzero app exit is preserved as `REAL_EXIT`.
 
 ## Voxt reuse

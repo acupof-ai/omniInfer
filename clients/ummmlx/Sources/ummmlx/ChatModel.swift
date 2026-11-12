@@ -36,6 +36,8 @@ final class ChatModel: ObservableObject {
     private var stopping = false
     private var receivedDelta = false
     var onFirstDelta: (() -> Void)?
+    /// Automation hook: the exact messages sent for one request.
+    var onRequest: (([ChatMessage]) -> Void)?
 
     init() {
         let defaults = UserDefaults.standard
@@ -68,6 +70,7 @@ final class ChatModel: ObservableObject {
             UserDefaults.standard.set(model, forKey: "model")
         }
         let history = Self.requestMessages(turns: turns, prompt: text)
+        onRequest?(history)
 
         turns.append(ChatTurn(role: .user, text: text, state: .complete))
         let assistant = ChatTurn(role: .assistant, text: "", state: .streaming)
