@@ -313,11 +313,14 @@ applies to quantized Qwen2-architecture models whose Q, K, and V projections
 share one quantization layout; on another layout it is skipped.
 
 The recorded result for the current stage against that baseline is a **61.93%
-warm speedup on median total latency**: 63.75 ms to 39.37 ms warm median
-`total_ms`, that is `(63.75 / 39.37 - 1) * 100`, or 38.24% fewer milliseconds.
-Configuration: `http_sse`, `max_tokens=64`, 20 interleaved pairs, fresh process
-per sample, 2 warmups per process, `temperature=0`,
-Qwen2.5-0.5B-Instruct-4bit.
+warm speedup on median total latency**: warm median `total_ms` fell from
+63.75343748368323 ms to 39.37083296477795 ms. Using the unrounded sample
+medians, the speedup is `(baseline / candidate - 1) * 100` = 61.93%, and the
+same change is `(1 - candidate / baseline) * 100` = 38.25% fewer milliseconds.
+Computing either value from the two-decimal display figures gives a rounding
+artifact, not the measured result. Configuration: `http_sse`, `max_tokens=64`,
+20 interleaved pairs, fresh process per sample, 2 warmups per process,
+`temperature=0`, Qwen2.5-0.5B-Instruct-4bit.
 
 The fused QKV step alone is smaller: 3.92% in the direct in-process harness
 (391.05 to 406.39 output tokens per second) on the arm that already had the
