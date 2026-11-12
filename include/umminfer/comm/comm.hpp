@@ -12,10 +12,10 @@
 #include <string>
 #include <vector>
 
-#include "omniinfer/proto/messages.hpp"
-#include "omniinfer/relay/relay.hpp"
+#include "umminfer/proto/messages.hpp"
+#include "umminfer/relay/relay.hpp"
 
-namespace omniinfer {
+namespace umminfer {
 
 // Shared ZMQ context, one per process.
 class ControlPlaneContext {
@@ -102,12 +102,13 @@ class StageControlPlane {
   std::optional<Message> recv_nowait();
   void send_to_stage(const std::string& next_stage, const std::string& endpoint,
                      const Message& msg);
+  void send_ready(const StageReadyMessage& msg);
   void send_complete(const CompleteMessage& msg);
   void send_stream(const StreamMessage& msg);
   void send_admin_result(const AdminResultMessage& msg);
   AbortMessage recv_abort();
-  // Non-blocking check so the abort loop can observe shutdown.
-  bool recv_abort_ready(int timeout_ms);
+  // Waits up to timeout_ms for an abort; false on timeout.
+  bool poll_abort(int timeout_ms);
   void close();
 
  private:
@@ -250,4 +251,4 @@ class CommRouter {
 // Set of device types in a payload, as tensor_devices() computes it.
 std::set<std::string> tensor_devices(const Value& obj);
 
-}  // namespace omniinfer
+}  // namespace umminfer

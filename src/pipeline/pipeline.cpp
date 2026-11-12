@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/pipeline/pipeline.hpp"
+#include "umminfer/pipeline/pipeline.hpp"
 
 #include <chrono>
 #include <exception>
 #include <iostream>
+#include <limits>
 
-namespace omniinfer {
+namespace umminfer {
 namespace {
 
 // One DataRef per payload. The payload is msgpack bytes, so every edge moves one
@@ -36,6 +37,27 @@ DataRef make_payload_ref(const Value& payload_value, TransportKind transport,
 
 std::string object_id_for(const std::string& request_id, uint64_t n) {
   return request_id + ":" + std::to_string(n);
+}
+
+// Parses an id in the generated namespace, "req-" followed by decimal digits.
+// Leading zeros are accepted. Any other shape, including a number that does
+// not fit in 64 bits, returns nullopt so the caller leaves the counter alone.
+std::optional<uint64_t> generated_id_number(const std::string& id) {
+  constexpr size_t kPrefixSize = 4;  // "req-"
+  if (id.size() <= kPrefixSize || id.compare(0, kPrefixSize, "req-") != 0) {
+    return std::nullopt;
+  }
+  uint64_t value = 0;
+  for (size_t index = kPrefixSize; index < id.size(); ++index) {
+    const char digit = id[index];
+    if (digit < '0' || digit > '9') return std::nullopt;
+    const uint64_t add = static_cast<uint64_t>(digit - '0');
+    if (value > (std::numeric_limits<uint64_t>::max() - add) / 10) {
+      return std::nullopt;
+    }
+    value = value * 10 + add;
+  }
+  return value;
 }
 
 // Rejects a DataRef before the receiver allocates or touches a relay. The
@@ -121,25 +143,41 @@ Stage::~Stage() {
 }
 
 void Stage::start() {
-  if (running_) return;
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mu_);
+  if (running_ || stopped_) return;
   control_plane_ = std::make_unique<StageControlPlane>(
       config_.name, config_.recv_endpoint, config_.coordinator_endpoint,
       config_.abort_endpoint);
   control_plane_->start();
   running_ = true;
 
+  // Settle controls queued before start before compute can consume a Submit.
+  while (true) {
+    std::optional<Message> msg;
+    try {
+      msg = control_plane_->recv_nowait();
+    } catch (const ProtocolError&) {
+      // A malformed frame is consumed; it must not prevent stage readiness.
+      continue;
+    }
+    if (!msg) break;
+    handle_message(std::move(*msg));
+  }
+  if (!running_) return;
+
   scheduler_thread_ = std::thread([this] { scheduler_->start(); });
   outbox_thread_ = std::thread([this] { pump_outbox(); });
   reaper_thread_ = std::thread([this] {
     while (running_) {
       reap_pending(false);
+      scheduler_->reap_aborted();
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   });
   abort_thread_ = std::thread([this] {
     while (running_) {
       try {
-        if (!control_plane_ || !control_plane_->recv_abort_ready(50)) continue;
+        if (!control_plane_ || !control_plane_->poll_abort(50)) continue;
         const std::string id = control_plane_->recv_abort().request_id;
         scheduler_->abort(id);
         reap_pending(false, id);
@@ -152,10 +190,13 @@ void Stage::start() {
       }
     }
   });
+  if (config_.announce_ready) {
+    control_plane_->send_ready(StageReadyMessage{config_.name});
+  }
 }
 
 void Stage::run() {
-  if (!running_) start();
+  if (!running_ && !stopped_) start();
   while (running_) {
     std::optional<Message> msg;
     try {
@@ -169,37 +210,48 @@ void Stage::run() {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
       continue;
     }
-    std::visit(
-        [this](auto&& value) {
-          using T = std::decay_t<decltype(value)>;
-          std::string request_id;
-          if constexpr (requires { value.request_id; }) request_id = value.request_id;
-          try {
-            if constexpr (std::is_same_v<T, SubmitMessage>) {
-              on_submit(value);
-            } else if constexpr (std::is_same_v<T, DataReadyMessage>) {
-              on_data_ready(value);
-            } else if constexpr (std::is_same_v<T, DataAckMessage>) {
-              on_data_ack(value);
-            } else if constexpr (std::is_same_v<T, ShutdownMessage>) {
-              running_ = false;
-            } else {
-              // Admin and profiler messages are accepted by the control plane
-              // and have no behaviour in this build.
-            }
-          } catch (const std::exception& e) {
-            // A malformed message must fail its request, not kill the thread.
-            if (!request_id.empty()) fail_request(request_id, e.what());
-          }
-        },
-        *msg);
+    handle_message(std::move(*msg));
   }
 }
 
+void Stage::handle_message(Message msg) {
+  std::visit(
+      [this](auto&& value) {
+        using T = std::decay_t<decltype(value)>;
+        std::string request_id;
+        if constexpr (requires { value.request_id; }) request_id = value.request_id;
+        try {
+          if constexpr (std::is_same_v<T, SubmitMessage>) {
+            on_submit(value);
+          } else if constexpr (std::is_same_v<T, DataReadyMessage>) {
+            on_data_ready(value);
+          } else if constexpr (std::is_same_v<T, DataAckMessage>) {
+            on_data_ack(value);
+          } else if constexpr (std::is_same_v<T, AbortMessage>) {
+            scheduler_->abort(value.request_id);
+            reap_pending(false, value.request_id);
+            fail_request(value.request_id, "request aborted");
+          } else if constexpr (std::is_same_v<T, ShutdownMessage>) {
+            running_ = false;
+          } else {
+            // Admin and profiler messages are accepted by the control plane
+            // and have no behaviour in this build.
+          }
+        } catch (const std::exception& e) {
+          // A malformed message must fail its request, not kill the thread.
+          if (!request_id.empty()) fail_request(request_id, e.what());
+        }
+      },
+      msg);
+}
+
 void Stage::stop() {
-  // No early return on running_: a shutdown message may have cleared it, and
-  // the worker threads still need stopping and joining before destruction.
-  running_ = false;
+  // A shutdown message may have cleared running_; worker threads still join.
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mu_);
+    stopped_ = true;
+    running_ = false;
+  }
   // run() polls with a zero timeout and the abort loop with a bounded poll, so
   // clearing the flag ends both. Closing the sockets here would race with a
   // caller that still sits in run(); close happens in the destructor instead.
@@ -259,7 +311,10 @@ void Stage::on_submit(const SubmitMessage& msg) {
     payload.request_id = msg.request_id;
     payload.data = msg.data;
   }
-  if (payload.request_id.empty()) payload.request_id = msg.request_id;
+  if (!payload.request_id.empty() && payload.request_id != msg.request_id) {
+    throw ProtocolError("submit request_id differs from its payload");
+  }
+  payload.request_id = msg.request_id;
   execute(std::move(payload));
 }
 
@@ -317,7 +372,10 @@ void Stage::on_data_ready(const DataReadyMessage& msg) {
     relay.get(ref.buffer.info, dest);
 
     StagePayload payload = StagePayload::from_value(unpack(dest.bytes));
-    if (payload.request_id.empty()) payload.request_id = msg.request_id;
+    if (!payload.request_id.empty() && payload.request_id != msg.request_id) {
+      throw ProtocolError("data_ready request_id differs from its payload");
+    }
+    payload.request_id = msg.request_id;
 
     // Ack the sender so its credit is released. The ack goes back over the same
     // edge the payload came from.
@@ -402,16 +460,16 @@ void Stage::send_payload(const std::string& request_id, const std::string& targe
     throw ProtocolError("local-object dispatch needs a sibling stage handle");
   }
   const Value payload_value = payload.to_value();
-  const std::string bytes = pack(payload_value);
+  std::string bytes = pack(payload_value);
+  const int64_t nbytes = static_cast<int64_t>(bytes.size());
   Tensor tensor;
   tensor.device = "cpu";
   tensor.dtype = "uint8";
-  tensor.shape = {static_cast<int64_t>(bytes.size())};
-  tensor.bytes = bytes;
+  tensor.shape = {nbytes};
+  tensor.bytes = std::move(bytes);
 
   auto [transport, relay] =
-      router_.relay_for_payload(target, payload_value,
-                                static_cast<int64_t>(bytes.size()));
+      router_.relay_for_payload(target, payload_value, nbytes);
   auto op = std::shared_ptr<RelayOperation>(relay->put(tensor, request_id).release());
   const std::string object_id = object_id_for(request_id, next_object_seq_++);
   {
@@ -433,7 +491,7 @@ void Stage::send_payload(const std::string& request_id, const std::string& targe
     msg.from_stage = config_.name;
     msg.to_stage = target;
     msg.data_ref = make_payload_ref(payload_value, transport, op->metadata(),
-                                    static_cast<int64_t>(bytes.size()), object_id)
+                                    nbytes, object_id)
                        .to_value();
   } catch (...) {
     // ZMQ never saw a message, so no receiver can own this block.
@@ -543,9 +601,23 @@ Coordinator::Coordinator(std::string completion_endpoint, std::string abort_endp
 
 Coordinator::~Coordinator() { stop(); }
 
-void Coordinator::register_stage(const std::string& name, const std::string& endpoint) {
+void Coordinator::register_stage(const std::string& name, const std::string& endpoint,
+                                 bool require_ready) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (control_plane_) {
+    throw ProtocolError("stages must be registered before coordinator start");
+  }
   endpoints_[name] = endpoint;
+  if (require_ready) {
+    stages_requiring_ready_.insert(name);
+  } else {
+    stages_requiring_ready_.erase(name);
+  }
+}
+
+bool Coordinator::stage_ready(const std::string& name) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return ready_stages_.count(name) != 0;
 }
 
 void Coordinator::start() {
@@ -588,6 +660,13 @@ void Coordinator::stop() {
 }
 
 std::string Coordinator::next_request_id() {
+  // The counter never wraps: an explicit req-18446744073709551615 consumes the
+  // last number, so automatic allocation must fail instead of reissuing req-0.
+  // submit() holds mu_ here and has not recorded anything yet, so a throw
+  // leaves no request behind.
+  if (counter_.load() == std::numeric_limits<uint64_t>::max()) {
+    throw ProtocolError("request id space exhausted");
+  }
   return "req-" + std::to_string(++counter_);
 }
 
@@ -595,40 +674,52 @@ std::string Coordinator::submit(StagePayload payload,
                                 const std::string& entry_stage) {
   const bool explicit_id = !payload.request_id.empty();
   std::string request_id = payload.request_id;
-  std::string endpoint;
-  {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (!running_) throw ProtocolError("coordinator is stopping");
-    auto it = endpoints_.find(entry_stage);
-    if (it == endpoints_.end()) {
-      throw ProtocolError("unknown entry stage: " + entry_stage);
-    }
-    endpoint = it->second;
-    if (explicit_id) {
-      if (requests_.find(request_id) != requests_.end()) {
-        throw ProtocolError("duplicate request_id: " + request_id);
-      }
-    } else {
-      do {
-        request_id = next_request_id();
-      } while (requests_.find(request_id) != requests_.end());
-    }
-    payload.request_id = request_id;
-    RequestInfo info;
-    info.request_id = request_id;
-    info.state = "running";
-    info.current_stage = entry_stage;
-    requests_[request_id] = std::move(info);
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!running_) throw ProtocolError("coordinator is stopping");
+  auto it = endpoints_.find(entry_stage);
+  if (it == endpoints_.end()) {
+    throw ProtocolError("unknown entry stage: " + entry_stage);
   }
-
+  if (explicit_id) {
+    if (requests_.find(request_id) != requests_.end()) {
+      throw ProtocolError("duplicate request_id: " + request_id);
+    }
+    // An explicit id in the generated namespace must not be reissued later by
+    // the counter. The abort tombstone outlives the request record, so a reuse
+    // would be dropped by the stage. The counter only moves forward.
+    if (const auto number = generated_id_number(request_id)) {
+      uint64_t current = counter_.load();
+      while (*number > current &&
+             !counter_.compare_exchange_weak(current, *number)) {
+      }
+    }
+  } else {
+    do {
+      request_id = next_request_id();
+    } while (requests_.find(request_id) != requests_.end());
+  }
+  payload.request_id = request_id;
   SubmitMessage msg;
   msg.request_id = request_id;
   msg.data = payload.to_value();
+  RequestInfo info;
+  info.request_id = request_id;
+  info.state = "pending";
+  info.current_stage = entry_stage;
+  requests_[request_id] = std::move(info);
+
+  const bool wait_for_ready = stages_requiring_ready_.count(entry_stage) != 0 &&
+                              ready_stages_.count(entry_stage) == 0;
+  if (wait_for_ready) {
+    pending_submits_[entry_stage].push_back(std::move(msg));
+    return request_id;
+  }
   try {
-    control_plane_->submit_to_stage(entry_stage, endpoint, Message{msg});
+    // Keep the request lock across send and the state transition. abort() uses
+    // the same lock, so a ready flush cannot overtake an abort transition.
+    control_plane_->submit_to_stage(entry_stage, it->second, Message{msg});
+    requests_.at(request_id).state = "running";
   } catch (...) {
-    // A failed send leaves no phantom running request behind.
-    std::lock_guard<std::mutex> lock(mu_);
     requests_.erase(request_id);
     throw;
   }
@@ -636,6 +727,40 @@ std::string Coordinator::submit(StagePayload payload,
 }
 
 void Coordinator::handle_event(const Message& msg) {
+  if (const auto* ready = std::get_if<StageReadyMessage>(&msg)) {
+    std::vector<RequestInfo> failed;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      const auto endpoint = endpoints_.find(ready->from_stage);
+      if (endpoint == endpoints_.end()) return;
+      if (!ready_stages_.insert(ready->from_stage).second) return;
+      const auto queued = pending_submits_.find(ready->from_stage);
+      if (queued == pending_submits_.end()) return;
+      for (const auto& submit : queued->second) {
+        auto request = requests_.find(submit.request_id);
+        if (request == requests_.end() || request->second.state != "pending" ||
+            request->second.current_stage != ready->from_stage) {
+          continue;
+        }
+        try {
+          // Serialize every flush send with abort()'s terminal transition.
+          control_plane_->submit_to_stage(ready->from_stage, endpoint->second,
+                                          Message{submit});
+          request->second.state = "running";
+        } catch (const std::exception& error) {
+          request->second.state = "failed";
+          request->second.error = error.what();
+          failed.push_back(request->second);
+        }
+      }
+      pending_submits_.erase(queued);
+    }
+    if (!failed.empty()) cv_.notify_all();
+    for (const auto& request : failed) {
+      if (on_complete) on_complete(request);
+    }
+    return;
+  }
   if (const auto* done = std::get_if<CompleteMessage>(&msg)) {
     RequestInfo snapshot;
     {
@@ -658,7 +783,14 @@ void Coordinator::handle_event(const Message& msg) {
     return;
   }
   if (const auto* chunk = std::get_if<StreamMessage>(&msg)) {
-    if (on_stream) on_stream(*chunk);
+    bool active = false;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      const auto it = requests_.find(chunk->request_id);
+      active = it != requests_.end() &&
+               (it->second.state == "pending" || it->second.state == "running");
+    }
+    if (active && on_stream) on_stream(*chunk);
   }
 }
 
@@ -695,9 +827,17 @@ void Coordinator::abort(const std::string& request_id) {
     auto it = requests_.find(request_id);
     if (it == requests_.end()) return;
     if (it->second.state != "pending" && it->second.state != "running") return;
+    const std::string stage = it->second.current_stage;
     it->second.state = "aborted";
     it->second.error = "request aborted";
     snapshot = it->second;
+    const auto queued = pending_submits_.find(stage);
+    if (queued != pending_submits_.end()) {
+      std::erase_if(queued->second, [&](const SubmitMessage& submit) {
+        return submit.request_id == request_id;
+      });
+      if (queued->second.empty()) pending_submits_.erase(queued);
+    }
   }
   if (control_plane_) {
     try {
@@ -717,4 +857,4 @@ bool Coordinator::release(const std::string& request_id) {
   return requests_.erase(request_id) > 0;
 }
 
-}  // namespace omniinfer
+}  // namespace umminfer

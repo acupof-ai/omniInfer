@@ -14,9 +14,9 @@
 #include <variant>
 #include <vector>
 
-#include "omniinfer/proto/wire.hpp"
+#include "umminfer/proto/wire.hpp"
 
-namespace omniinfer {
+namespace umminfer {
 
 // ---- data_ref.py ---------------------------------------------------------
 
@@ -104,11 +104,6 @@ struct StagePayload {
 
   Value to_value() const;
   static StagePayload from_value(const Value& v);
-};
-
-struct RoutedPayloads {
-  std::map<std::string, StagePayload> payloads;
-  bool keep_request_state = false;
 };
 
 // ---- admin.py ------------------------------------------------------------
@@ -248,6 +243,12 @@ struct AbortMessage {
   static AbortMessage from_value(const Value& v);
 };
 
+struct StageReadyMessage {
+  std::string from_stage;
+  Value to_value() const;
+  static StageReadyMessage from_value(const Value& v);
+};
+
 struct CompleteMessage {
   std::string request_id;
   std::string from_stage;
@@ -323,7 +324,7 @@ struct AdminResultMessage {
 // Every control-plane message the stage and coordinator exchange.
 using Message = std::variant<DataReadyMessage, StreamChunkBatchMessage, DataAckMessage,
                              KVTransferPrepareMessage, KVTransferReadyMessage,
-                             AbortMessage, CompleteMessage, StreamMessage,
+                             AbortMessage, StageReadyMessage, CompleteMessage, StreamMessage,
                              SubmitMessage, ShutdownMessage, FreezeGCMessage,
                              ProfilerStartMessage, ProfilerStopMessage, AdminMessage,
                              AdminResultMessage>;
@@ -335,4 +336,4 @@ const char* message_type_name(const Message& msg);
 std::string serialize_message(const Message& msg);
 Message deserialize_message(const std::string& data);
 
-}  // namespace omniinfer
+}  // namespace umminfer

@@ -1,19 +1,27 @@
 const std = @import("std");
 
-fn configure(mod: *std.Build.Module, b: *std.Build, deps_prefix: ?[]const u8, cuda_prefix: ?[]const u8, cuda: bool, link_deps: bool) void {
+fn configure(mod: *std.Build.Module, b: *std.Build, deps_prefix: ?[]const u8, curl_prefix: ?[]const u8, cuda_prefix: ?[]const u8, cuda: bool, link_deps: bool) void {
     mod.addIncludePath(b.path("include"));
+    mod.addIncludePath(b.path("src"));
     if (deps_prefix) |prefix| {
         mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
+    }
+    if (curl_prefix) |prefix| {
+        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
+        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
+        mod.addRPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
     }
     if (cuda_prefix) |prefix| {
         mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib64" }) });
     }
-    if (cuda) mod.addCMacro("OMNIINFER_WITH_CUDA", "1");
+    if (cuda) mod.addCMacro("UMMINFER_WITH_CUDA", "1");
     if (link_deps) {
         mod.linkSystemLibrary("zmq", .{ .use_pkg_config = .no });
         mod.linkSystemLibrary("msgpackc", .{ .use_pkg_config = .no });
+        mod.linkSystemLibrary("curl", .{ .use_pkg_config = .no });
+        mod.linkSystemLibrary("websockets", .{ .use_pkg_config = .no });
         if (cuda) mod.linkSystemLibrary("cudart", .{ .use_pkg_config = .no });
     }
 }
@@ -30,15 +38,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const deps_prefix = b.option([]const u8, "deps-prefix", "Prefix containing include/ and lib/ for native dependencies");
+    const curl_prefix = b.option([]const u8, "curl-prefix", "Prefix of a libcurl build with WebSocket support");
     const cuda_prefix = b.option([]const u8, "cuda-prefix", "CUDA prefix containing include/ and lib64/");
     const cuda = b.option(bool, "cuda", "Enable the CUDA IPC relay") orelse (cuda_prefix != null);
+    const tsan = b.option(bool, "tsan", "Enable ThreadSanitizer") orelse false;
 
     const core = b.addLibrary(.{
-        .name = "omni_core",
+        .name = "umm_core",
         .linkage = .static,
         .root_module = module(b, target, optimize),
     });
-    configure(core.root_module, b, deps_prefix, cuda_prefix, cuda, false);
+    configure(core.root_module, b, deps_prefix, curl_prefix, cuda_prefix, cuda, false);
+    core.root_module.sanitize_thread = tsan;
     core.root_module.addCSourceFiles(.{
         .files = &.{
             "src/proto/wire.cpp",
@@ -48,15 +59,24 @@ pub fn build(b: *std.Build) void {
             "src/scheduling/simple_scheduler.cpp",
             "src/pipeline/pipeline.cpp",
             "src/serve/openai_api.cpp",
+            "src/serve/realtime_api.cpp",
+            "src/audio/audio.cpp",
+            "src/client/http.cpp",
+            "src/client/openai.cpp",
+            "src/client/asr.cpp",
+            "src/client/websocket.cpp",
+            "src/client/realtime.cpp",
+            "src/client/cli.cpp",
         },
         .flags = &.{"-std=c++20"},
     });
 
     const exe = b.addExecutable(.{
-        .name = "omni-infer",
+        .name = "umm-infer",
         .root_module = module(b, target, optimize),
     });
-    configure(exe.root_module, b, deps_prefix, cuda_prefix, cuda, true);
+    configure(exe.root_module, b, deps_prefix, curl_prefix, cuda_prefix, cuda, true);
+    exe.root_module.sanitize_thread = tsan;
     exe.root_module.linkLibrary(core);
     exe.root_module.addCSourceFiles(.{
         .files = &.{"src/main.cpp"},
@@ -71,6 +91,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "self_check", .source = "tests/self_check.cpp" },
         .{ .name = "wire_compat", .source = "tests/compat/wire_compat.cpp" },
         .{ .name = "runtime_compat", .source = "tests/compat/runtime_compat.cpp" },
+        .{ .name = "omni_transport_test", .source = "tests/omni_transport_test.cpp" },
+        .{ .name = "omni_serve_test", .source = "tests/omni_serve_test.cpp" },
+        .{ .name = "omni_client_test", .source = "tests/omni_client_test.cpp" },
         .{ .name = "cuda_ipc_test", .source = "tests/cuda_ipc_test.cpp", .cuda = true },
         .{ .name = "cuda_pipeline_test", .source = "tests/cuda_pipeline_test.cpp", .cuda = true },
     };
@@ -80,7 +103,8 @@ pub fn build(b: *std.Build) void {
             .name = item.name,
             .root_module = module(b, target, optimize),
         });
-        configure(test_exe.root_module, b, deps_prefix, cuda_prefix, cuda, true);
+        configure(test_exe.root_module, b, deps_prefix, curl_prefix, cuda_prefix, cuda, true);
+        test_exe.root_module.sanitize_thread = tsan;
         test_exe.root_module.linkLibrary(core);
         test_exe.root_module.addCSourceFiles(.{
             .files = &.{item.source},
@@ -93,6 +117,11 @@ pub fn build(b: *std.Build) void {
         }
         const run = b.addRunArtifact(test_exe);
         test_step.dependOn(&run.step);
+        if (std.mem.eql(u8, item.name, "runtime_compat")) {
+            if (b.args) |args| run.addArgs(args);
+            const runtime_test = b.step("runtime-test", "Run coordinator and stage runtime tests");
+            runtime_test.dependOn(&run.step);
+        }
     }
 
     const stress_step = b.step("cuda-stress", "Repeat the CUDA tests until a failure");
@@ -115,7 +144,7 @@ pub fn build(b: *std.Build) void {
             .name = "cuda_bench",
             .root_module = module(b, target, optimize),
         });
-        configure(bench_exe.root_module, b, deps_prefix, cuda_prefix, cuda, true);
+        configure(bench_exe.root_module, b, deps_prefix, curl_prefix, cuda_prefix, cuda, true);
         bench_exe.root_module.linkLibrary(core);
         bench_exe.root_module.addCSourceFiles(.{
             .files = &.{"tests/cuda_bench.cpp"},
@@ -134,4 +163,9 @@ pub fn build(b: *std.Build) void {
     smoke.addArtifactArg(exe);
     const smoke_step = b.step("smoke", "Run HTTP and process lifecycle tests");
     smoke_step.dependOn(&smoke.step);
+
+    const mlx_test = b.addSystemCommand(&.{ "python3", "-I" });
+    mlx_test.addFileArg(b.path("tests/mlx_stage_test.py"));
+    const mlx_test_step = b.step("mlx-test", "Run MLX stage unit tests");
+    mlx_test_step.dependOn(&mlx_test.step);
 }

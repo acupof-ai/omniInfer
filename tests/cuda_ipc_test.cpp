@@ -30,11 +30,11 @@
 #include <thread>
 #include <vector>
 
-#include "omniinfer/comm/comm.hpp"
-#include "omniinfer/relay/relay.hpp"
-#include "omniinfer/proto/wire.hpp"
+#include "umminfer/comm/comm.hpp"
+#include "umminfer/relay/relay.hpp"
+#include "umminfer/proto/wire.hpp"
 
-using namespace omniinfer;
+using namespace umminfer;
 
 namespace {
 
@@ -381,11 +381,11 @@ void test_roundtrip(bool empty, const char* label, int receiver_device) {
 }
 
 // Sizes around the msgpack and page boundaries. The two large cases only run
-// when OMNIINFER_CUDA_TEST_STRESS=1, so the default test stays fast.
+// when UMMINFER_CUDA_TEST_STRESS=1, so the default test stays fast.
 void test_sizes() {
   std::cerr << "[3] boundary sizes\n";
   std::vector<size_t> sizes = {1, 4095, 4096, 4097};
-  const bool stress = std::getenv("OMNIINFER_CUDA_TEST_STRESS") != nullptr;
+  const bool stress = std::getenv("UMMINFER_CUDA_TEST_STRESS") != nullptr;
   if (stress) {
     sizes.push_back(1u << 20);
     sizes.push_back(64u * 1024u * 1024u - 1);  // slot limit for this relay
@@ -757,8 +757,8 @@ void test_abandon_is_scoped_per_target() {
 }  // namespace
 
 int main(int argc, char** argv) {
-#if !defined(OMNIINFER_WITH_CUDA)
-  std::cerr << "cuda_ipc_test: built without OMNIINFER_WITH_CUDA, skipped\n";
+#if !defined(UMMINFER_WITH_CUDA)
+  std::cerr << "cuda_ipc_test: built without UMMINFER_WITH_CUDA, skipped\n";
   (void)argc;
   (void)argv;
   return 0;

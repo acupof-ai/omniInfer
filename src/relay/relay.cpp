@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/relay/relay.hpp"
+#include "umminfer/relay/relay.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -7,18 +7,17 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <random>
 
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
 #include <cuda_runtime_api.h>
 #endif
 
-namespace omniinfer {
+namespace umminfer {
 namespace {
 
 std::string fresh_shm_name(const std::string& engine_id) {
@@ -29,7 +28,7 @@ std::string fresh_shm_name(const std::string& engine_id) {
   std::lock_guard<std::mutex> lock(rng_mu);
   const uint64_t tag = std::hash<std::string>{}(engine_id);
   char buf[32];
-  std::snprintf(buf, sizeof(buf), "/omni_%08x_%016llx", static_cast<uint32_t>(tag),
+  std::snprintf(buf, sizeof(buf), "/umm_%08x_%016llx", static_cast<uint32_t>(tag),
                 static_cast<unsigned long long>(rng()));
   return buf;
 }
@@ -85,9 +84,7 @@ class ShmPutOperation : public ShmOperation {
       : ShmOperation(std::move(metadata)),
         shm_name_(std::move(shm_name)),
         credit_(credit),
-        credits_(std::move(credits)),
-        promise_(std::make_shared<std::promise<void>>()),
-        future_(promise_->get_future().share()) {}
+        credits_(std::move(credits)) {}
 
   ~ShmPutOperation() override {
     // The block must not outlive its sender, whether or not the receiver ever
@@ -96,33 +93,15 @@ class ShmPutOperation : public ShmOperation {
     release_credit();
   }
 
-  void wait_for_completion(double timeout_s = 30.0) override {
-    if (completed_) return;
-    if (future_.wait_for(std::chrono::duration<double>(timeout_s)) !=
-        std::future_status::ready) {
-      completed_ = true;
-      release_credit();
-      throw ProtocolError("SHM block " + shm_name_ + " was not consumed in time");
-    }
-    try {
-      future_.get();
-    } catch (...) {
-      completed_ = true;
-      throw;
-    }
-    completed_ = true;
-  }
-
   // A completion is reported once and frees the credit once, no matter whether
-  // it arrived through an ack, a timeout, or this operation's destruction.
+  // it arrived through an ack or this operation's destruction.
   void mark_receiver_done() override {
     if (acked_.exchange(true)) return;
-    promise_->set_value();
     release_credit();
   }
   void mark_receiver_failed(const std::string& error) override {
+    (void)error;
     if (acked_.exchange(true)) return;
-    promise_->set_exception(std::make_exception_ptr(ProtocolError(error)));
     release_credit();
   }
 
@@ -136,14 +115,11 @@ class ShmPutOperation : public ShmOperation {
   int64_t credit_;
   // Held by shared_ptr: the operation may outlive ShmRelay.
   std::shared_ptr<CreditAllocator> credits_;
-  std::shared_ptr<std::promise<void>> promise_;
-  std::shared_future<void> future_;
-  std::atomic<bool> completed_{false};
   std::atomic<bool> acked_{false};
   std::atomic<bool> released_{false};
 };
 
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
 
 void cuda_check(cudaError_t rc, const char* what) {
   if (rc == cudaSuccess) return;
@@ -253,9 +229,7 @@ class CudaIpcPutOperation : public RelayOperation {
                       int64_t credit)
       : metadata_(std::move(metadata)),
         shared_(std::move(shared)),
-        credit_(credit),
-        promise_(std::make_shared<std::promise<void>>()),
-        future_(promise_->get_future().share()) {}
+        credit_(credit) {}
 
   ~CudaIpcPutOperation() override {
     // An ack means the receiver finished with the block, so the slot stays in
@@ -267,34 +241,14 @@ class CudaIpcPutOperation : public RelayOperation {
 
   const Value& metadata() const override { return metadata_; }
 
-  void wait_for_completion(double timeout_s = 30.0) override {
-    if (completed_) return;
-    if (future_.wait_for(std::chrono::duration<double>(timeout_s)) !=
-        std::future_status::ready) {
-      completed_ = true;
-      // A late receiver may still read the block, so this is an abandonment,
-      // not a plain failure: retire the buffer and poison the relay.
-      mark_receiver_abandoned("CUDA IPC block was not consumed in time");
-      throw ProtocolError("CUDA IPC block was not consumed in time");
-    }
-    try {
-      future_.get();
-    } catch (...) {
-      completed_ = true;
-      throw;
-    }
-    completed_ = true;
-  }
-
   void mark_receiver_done() override {
     if (acked_.exchange(true)) return;
-    promise_->set_value();
     release_credit();
   }
 
   void mark_receiver_failed(const std::string& error) override {
+    (void)error;
     if (acked_.exchange(true)) return;
-    promise_->set_exception(std::make_exception_ptr(ProtocolError(error)));
     release_credit();
   }
 
@@ -314,7 +268,6 @@ class CudaIpcPutOperation : public RelayOperation {
     // The receiver may still map this block, so it must leave the pool before
     // the credit is released and a later put could reuse it.
     retire_slot(shared_, credit_);
-    promise_->set_exception(std::make_exception_ptr(ProtocolError(reason)));
     release_credit();
   }
 
@@ -327,9 +280,6 @@ class CudaIpcPutOperation : public RelayOperation {
   Value metadata_;
   std::shared_ptr<CudaIpcShared> shared_;
   int64_t credit_;
-  std::shared_ptr<std::promise<void>> promise_;
-  std::shared_future<void> future_;
-  std::atomic<bool> completed_{false};
   std::atomic<bool> acked_{false};
   std::atomic<bool> abandoned_{false};
   std::atomic<bool> released_{false};
@@ -487,7 +437,7 @@ class CudaIpcRelay : public Relay {
   std::shared_ptr<CudaIpcShared> shared_;
 };
 
-#endif  // OMNIINFER_WITH_CUDA
+#endif  // UMMINFER_WITH_CUDA
 
 }  // namespace
 
@@ -534,14 +484,24 @@ ShmRelay::ShmRelay(std::string engine_id, int slot_size_mb, int credits)
 std::unique_ptr<RelayOperation> ShmRelay::put(const Tensor& tensor,
                                               const std::string& request_id) {
   const int64_t credit = credits_->acquire();
+  struct CreditGuard {
+    std::shared_ptr<CreditAllocator> credits;
+    int64_t credit;
+    bool active = true;
+    ~CreditGuard() {
+      if (active) credits->release(credit);
+    }
+  } guard{credits_, credit};
   const std::string name = fresh_shm_name(engine_id_);
-  ShmBlock block;
-  try {
-    block = ShmBlock::create(name, tensor.bytes.data(), tensor.bytes.size());
-  } catch (...) {
-    credits_->release(credit);
-    throw;
-  }
+  ShmBlock block = ShmBlock::create(name, tensor.bytes.data(), tensor.bytes.size());
+
+  struct ShmGuard {
+    std::string name;
+    bool active = true;
+    ~ShmGuard() {
+      if (active) unlink_quiet(name);
+    }
+  } shm_guard{name};
 
   Value::Map transfer_info;
   transfer_info["shm_name"] = Value(block.name);
@@ -553,8 +513,11 @@ std::unique_ptr<RelayOperation> ShmRelay::put(const Tensor& tensor,
   metadata["transfer_info"] = Value(std::move(transfer_info));
   // The credit stays held until the receiver acks, so a sender cannot reuse a
   // block that a receiver has not read yet.
-  return std::make_unique<ShmPutOperation>(Value(std::move(metadata)), block.name,
-                                           credit, credits_);
+  auto operation = std::make_unique<ShmPutOperation>(Value(std::move(metadata)), block.name,
+                                                     credit, credits_);
+  guard.active = false;
+  shm_guard.active = false;
+  return operation;
 }
 
 void ShmRelay::get(const Value& metadata, Tensor& dest) {
@@ -604,7 +567,7 @@ std::unique_ptr<Relay> create_relay(const std::string& type,
                                       int_or("credits", 2));
   }
   if (type == "cuda_ipc") {
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
     auto it = config.find("engine_id");
     const std::string engine_id = it == config.end() ? "relay" : it->second.as_str();
     return std::make_unique<CudaIpcRelay>(
@@ -612,11 +575,11 @@ std::unique_ptr<Relay> create_relay(const std::string& type,
         int_or("slot_size_mb", 512));
 #else
     throw ProtocolError(
-        "cuda_ipc relay requires a build with OMNIINFER_WITH_CUDA");
+        "cuda_ipc relay requires a build with UMMINFER_WITH_CUDA");
 #endif
   }
   throw ProtocolError("Unknown relay type: '" + type +
                       "'. Available types: [shm, cuda_ipc]");
 }
 
-}  // namespace omniinfer
+}  // namespace umminfer

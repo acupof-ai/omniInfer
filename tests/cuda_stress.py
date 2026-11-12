@@ -170,7 +170,7 @@ def main():
 
     env = os.environ.copy()
     # Adds the 1 MiB and slot-limit-minus-one cases to cuda_ipc_test.
-    env["OMNIINFER_CUDA_TEST_STRESS"] = "1"
+    env["UMMINFER_CUDA_TEST_STRESS"] = "1"
     binaries = [args.ipc, args.pipeline]
 
     passed = 0

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/scheduling/simple_scheduler.hpp"
+#include "umminfer/scheduling/simple_scheduler.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <iostream>
 
-namespace omniinfer {
+namespace umminfer {
 
 SimpleScheduler::SimpleScheduler(ComputeFn compute_fn,
                                  BatchComputeFn batch_compute_fn,
@@ -15,7 +15,8 @@ SimpleScheduler::SimpleScheduler(ComputeFn compute_fn,
                                  std::optional<int> max_batch_cost, int max_concurrency,
                                  std::function<void(const std::string&)> abort_callback,
                                  std::function<void()> shutdown_callback,
-                                 RequestArrivalHook request_arrival_hook)
+                                 RequestArrivalHook request_arrival_hook,
+                                 std::chrono::milliseconds abort_retention)
     : fn_(std::move(compute_fn)),
       batch_fn_(std::move(batch_compute_fn)),
       max_batch_size_(std::max(max_batch_size, 1)),
@@ -27,7 +28,8 @@ SimpleScheduler::SimpleScheduler(ComputeFn compute_fn,
       max_concurrency_(std::max(max_concurrency, 1)),
       abort_callback_(std::move(abort_callback)),
       shutdown_callback_(std::move(shutdown_callback)),
-      request_arrival_hook_(std::move(request_arrival_hook)) {
+      request_arrival_hook_(std::move(request_arrival_hook)),
+      abort_retention_(std::max(abort_retention, std::chrono::milliseconds{1})) {
   if (max_concurrency_ > 1 && batch_fn_) {
     throw ProtocolError("max_concurrency > 1 and batch_compute_fn are mutually exclusive");
   }
@@ -41,12 +43,26 @@ void SimpleScheduler::enqueue(IncomingMessage msg) {
   inbox_.put(std::move(msg));
 }
 
+void SimpleScheduler::reap_aborted() {
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(abort_mu_);
+  for (auto it = aborted_.begin(); it != aborted_.end();) {
+    if (it->second <= now) {
+      it = aborted_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 bool SimpleScheduler::is_aborted(const std::string& request_id) {
+  reap_aborted();
   std::lock_guard<std::mutex> lock(abort_mu_);
   return aborted_.count(request_id) != 0;
 }
 
 bool SimpleScheduler::consume_if_aborted(const std::string& request_id) {
+  reap_aborted();
   std::lock_guard<std::mutex> lock(abort_mu_);
   return aborted_.erase(request_id) > 0;
 }
@@ -54,9 +70,9 @@ bool SimpleScheduler::consume_if_aborted(const std::string& request_id) {
 void SimpleScheduler::abort(const std::string& request_id) {
   {
     std::lock_guard<std::mutex> lock(abort_mu_);
-    // Do not evict an abort before its request arrives. Coordinator aborts are
-    // limited to known in-flight requests; a delayed submit may still follow.
-    aborted_.insert(request_id);
+    // Keep the tombstone through abort-before-submit reordering. Stage's
+    // reaper expires it after the normal request and transfer lifetime.
+    aborted_[request_id] = std::chrono::steady_clock::now() + abort_retention_;
   }
   if (abort_callback_) {
     try {
@@ -132,14 +148,12 @@ void SimpleScheduler::collect_batch(std::vector<IncomingMessage>& batch) {
 }
 
 void SimpleScheduler::emit_result(const std::string& request_id, Value result) {
-  outbox_.put(OutgoingMessage{request_id, "result", std::move(result), std::nullopt,
-                              std::nullopt});
+  outbox_.put(OutgoingMessage{request_id, "result", std::move(result)});
 }
 
 void SimpleScheduler::emit_error(const std::string& request_id,
                                  const std::string& error) {
-  outbox_.put(OutgoingMessage{request_id, "error", Value(error), std::nullopt,
-                              std::nullopt});
+  outbox_.put(OutgoingMessage{request_id, "error", Value(error)});
 }
 
 void SimpleScheduler::run_single(const IncomingMessage& msg) {
@@ -155,7 +169,7 @@ void SimpleScheduler::run_single(const IncomingMessage& msg) {
   emit_result(msg.request_id, std::move(result));
 }
 
-void SimpleScheduler::run_batch(const std::vector<IncomingMessage>& batch) {
+void SimpleScheduler::run_batch(std::vector<IncomingMessage> batch) {
   if (!batch_fn_ || batch.size() <= 1) {
     for (const auto& msg : batch) run_single(msg);
     return;
@@ -163,8 +177,8 @@ void SimpleScheduler::run_batch(const std::vector<IncomingMessage>& batch) {
 
   std::vector<IncomingMessage> active;
   active.reserve(batch.size());
-  for (const auto& msg : batch) {
-    if (!consume_if_aborted(msg.request_id)) active.push_back(msg);
+  for (auto& msg : batch) {
+    if (!consume_if_aborted(msg.request_id)) active.push_back(std::move(msg));
   }
   if (active.empty()) return;
   if (active.size() == 1) {
@@ -174,12 +188,25 @@ void SimpleScheduler::run_batch(const std::vector<IncomingMessage>& batch) {
 
   std::vector<Value> payloads;
   payloads.reserve(active.size());
-  for (const auto& msg : active) payloads.push_back(msg.data);
+  for (auto& msg : active) payloads.push_back(std::move(msg.data));
 
-  std::vector<Value> results = batch_fn_(payloads);
+  std::vector<Value> results;
+  try {
+    results = batch_fn_(payloads);
+  } catch (const std::exception& e) {
+    for (const auto& failed : active) {
+      if (!consume_if_aborted(failed.request_id)) emit_error(failed.request_id, e.what());
+    }
+    return;
+  }
   if (results.size() != active.size()) {
-    throw ProtocolError("batch_compute_fn returned " + std::to_string(results.size()) +
-                        " results for " + std::to_string(active.size()) + " requests");
+    const std::string error =
+        "batch_compute_fn returned " + std::to_string(results.size()) +
+        " results for " + std::to_string(active.size()) + " requests";
+    for (const auto& failed : active) {
+      if (!consume_if_aborted(failed.request_id)) emit_error(failed.request_id, error);
+    }
+    return;
   }
   for (size_t i = 0; i < active.size(); ++i) {
     // A Value is always a legitimate result, a string included. Python only
@@ -192,7 +219,11 @@ void SimpleScheduler::run_batch(const std::vector<IncomingMessage>& batch) {
 }
 
 void SimpleScheduler::start() {
-  running_ = true;
+  {
+    std::lock_guard<std::mutex> lock(lifecycle_mu_);
+    if (running_ || stopped_) return;
+    running_ = true;
+  }
   if (max_concurrency_ > 1) {
     run_concurrent();
   } else {
@@ -233,14 +264,15 @@ void SimpleScheduler::run_serial() {
     batch.push_back(std::move(msg));
     try {
       collect_batch(batch);
-      run_batch(batch);
     } catch (const std::exception& e) {
-      std::cerr << "SimpleScheduler: compute_fn failed: " << e.what() << "\n";
+      std::cerr << "SimpleScheduler: batch collection failed: " << e.what() << "\n";
       for (const auto& failed : batch) {
         if (consume_if_aborted(failed.request_id)) continue;
         emit_error(failed.request_id, e.what());
       }
+      continue;
     }
+    run_batch(std::move(batch));
   }
 }
 
@@ -272,7 +304,11 @@ void SimpleScheduler::run_concurrent() {
 }
 
 void SimpleScheduler::stop() {
-  running_ = false;
+  {
+    std::lock_guard<std::mutex> lock(lifecycle_mu_);
+    stopped_ = true;
+    running_ = false;
+  }
   // Release a blocked get().
   inbox_.put(IncomingMessage{"", "wakeup", Value()});
   std::function<void()> callback;
@@ -284,4 +320,4 @@ void SimpleScheduler::stop() {
   if (callback) callback();
 }
 
-}  // namespace omniinfer
+}  // namespace umminfer

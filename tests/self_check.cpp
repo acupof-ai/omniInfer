@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Runnable checks for the runtime core: wire format, relay, router, scheduler,
 // and one end-to-end pipeline request.
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -8,13 +9,14 @@
 #include <thread>
 #include <unistd.h>
 
-#include "omniinfer/comm/comm.hpp"
-#include "omniinfer/pipeline/pipeline.hpp"
-#include "omniinfer/proto/messages.hpp"
-#include "omniinfer/relay/relay.hpp"
-#include "omniinfer/scheduling/simple_scheduler.hpp"
+#include "umminfer/client/client.hpp"
+#include "umminfer/comm/comm.hpp"
+#include "umminfer/pipeline/pipeline.hpp"
+#include "umminfer/proto/messages.hpp"
+#include "umminfer/relay/relay.hpp"
+#include "umminfer/scheduling/simple_scheduler.hpp"
 
-using namespace omniinfer;
+using namespace umminfer;
 
 namespace {
 
@@ -119,10 +121,15 @@ void test_message_roundtrip() {
   const Message signal_decoded =
       deserialize_message(serialize_message(Message{signal}));
   CHECK(std::get<DataReadyMessage>(signal_decoded).is_done);
+
+  const Message ready_decoded = deserialize_message(
+      serialize_message(Message{StageReadyMessage{"entry"}}));
+  CHECK(std::get<StageReadyMessage>(ready_decoded).from_stage == "entry");
 }
 
 void test_shm_relay() {
-  ShmRelay relay("test_engine", 1, 2);
+  // One credit: the second put can only return after the first ack frees it.
+  ShmRelay relay("test_engine", 1, 1);
   Tensor src;
   src.device = "cpu";
   src.dtype = "uint8";
@@ -134,12 +141,24 @@ void test_shm_relay() {
   dst.bytes.assign(5, '\0');
   relay.get(op->metadata(), dst);
   CHECK(dst.bytes == "abcde");
-  op->mark_receiver_done();
-  op->wait_for_completion(1.0);
 
-  // A second transfer after the first frees its credit.
-  auto op2 = relay.put(src, "req-2");
-  CHECK(op2->metadata().contains("transfer_info"));
+  std::atomic<bool> started{false};
+  std::atomic<bool> second_returned{false};
+  std::unique_ptr<RelayOperation> op2;
+  std::thread waiter([&] {
+    started = true;
+    op2 = relay.put(src, "req-2");
+    second_returned = true;
+  });
+  while (!started.load()) std::this_thread::yield();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  CHECK(!second_returned);  // the credit is still held by req-1
+
+  op->mark_receiver_done();
+  waiter.join();
+  CHECK(second_returned);
+  CHECK(op2 != nullptr && op2->metadata().contains("transfer_info"));
+  if (op2) op2->mark_receiver_done();
 }
 
 void test_router_classification() {
@@ -247,6 +266,34 @@ void test_pipeline_end_to_end() {
   coordinator_thread.join();
 }
 
+void test_chat_rejects_reserved_extra_stream() {
+  client::OpenAIConfig config;
+  config.base_url = "http://127.0.0.1:1";
+  config.model = "test-model";
+  config.max_attempts = 1;
+  config.connect_timeout = client::Milliseconds{10};
+  const client::OpenAIClient api(config);
+
+  const auto expect_config_error = [&](nlohmann::json value, bool typed_stream) {
+    client::ChatRequest request;
+    request.messages = {{"user", "ping"}};
+    request.stream = typed_stream;
+    request.extra_body = nlohmann::json{{"stream", std::move(value)}};
+    try {
+      api.chat(request);
+      CHECK(false);
+    } catch (const client::Error& error) {
+      CHECK(error.code() == client::ErrorCode::kConfig);
+    } catch (...) {
+      CHECK(false);
+    }
+  };
+  expect_config_error(true, false);
+  expect_config_error(false, false);
+  expect_config_error(1, false);
+  expect_config_error(true, true);
+}
+
 }  // namespace
 
 int main() {
@@ -265,6 +312,8 @@ int main() {
   test_scheduler_serial_and_batch();
   std::cerr << "[7] pipeline\n";
   test_pipeline_end_to_end();
+  std::cerr << "[8] chat reserved stream\n";
+  test_chat_rejects_reserved_extra_stream();
   std::cerr << "[done]\n";
 
   if (failures != 0) {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "omniinfer/comm/comm.hpp"
+#include "umminfer/comm/comm.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -10,11 +10,11 @@
 #include <set>
 #include <thread>
 
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
 #include <cuda_runtime_api.h>
 #endif
 
-namespace omniinfer {
+namespace umminfer {
 
 void* ControlPlaneContext::ctx_ = nullptr;
 std::mutex ControlPlaneContext::mu_;
@@ -276,7 +276,8 @@ Message StageControlPlane::recv() {
       std::holds_alternative<FreezeGCMessage>(msg) ||
       std::holds_alternative<ProfilerStartMessage>(msg) ||
       std::holds_alternative<ProfilerStopMessage>(msg) ||
-      std::holds_alternative<AdminMessage>(msg);
+      std::holds_alternative<AdminMessage>(msg) ||
+      std::holds_alternative<AbortMessage>(msg);
   if (!accepted) {
     throw ProtocolError(std::string("Unexpected message type: ") +
                         message_type_name(msg));
@@ -301,6 +302,11 @@ void StageControlPlane::send_to_stage(const std::string& next_stage,
   }
   // The send runs outside the map lock; PushSocket guards its own socket.
   sock->send(msg);
+}
+
+void StageControlPlane::send_ready(const StageReadyMessage& msg) {
+  if (!coordinator_socket_) throw ProtocolError("Control plane not started");
+  coordinator_socket_->send(Message{msg});
 }
 
 void StageControlPlane::send_complete(const CompleteMessage& msg) {
@@ -328,7 +334,7 @@ AbortMessage StageControlPlane::recv_abort() {
   return abort_socket_->recv();
 }
 
-bool StageControlPlane::recv_abort_ready(int timeout_ms) {
+bool StageControlPlane::poll_abort(int timeout_ms) {
   if (!abort_socket_) throw ProtocolError("Control plane not started");
   return abort_socket_->poll(timeout_ms);
 }
@@ -382,24 +388,26 @@ void CoordinatorControlPlane::submit_to_stage(const std::string& stage_name,
 Message CoordinatorControlPlane::recv_event() {
   if (!completion_socket_) throw ProtocolError("Control plane not started");
   Message msg = completion_socket_->recv();
-  if (std::holds_alternative<CompleteMessage>(msg) ||
+  if (std::holds_alternative<StageReadyMessage>(msg) ||
+      std::holds_alternative<CompleteMessage>(msg) ||
       std::holds_alternative<StreamMessage>(msg) ||
       std::holds_alternative<AdminResultMessage>(msg)) {
     return msg;
   }
-  throw ProtocolError("Expected CompleteMessage, StreamMessage, or AdminResultMessage");
+  throw ProtocolError("Expected StageReadyMessage, CompleteMessage, StreamMessage, or AdminResultMessage");
 }
 
 std::optional<Message> CoordinatorControlPlane::recv_event_timeout(int timeout_ms) {
   if (!completion_socket_) throw ProtocolError("Control plane not started");
   std::optional<Message> msg = completion_socket_->recv_timeout(timeout_ms);
   if (!msg) return std::nullopt;
-  if (std::holds_alternative<CompleteMessage>(*msg) ||
+  if (std::holds_alternative<StageReadyMessage>(*msg) ||
+      std::holds_alternative<CompleteMessage>(*msg) ||
       std::holds_alternative<StreamMessage>(*msg) ||
       std::holds_alternative<AdminResultMessage>(*msg)) {
     return msg;
   }
-  throw ProtocolError("Expected CompleteMessage, StreamMessage, or AdminResultMessage");
+  throw ProtocolError("Expected StageReadyMessage, CompleteMessage, StreamMessage, or AdminResultMessage");
 }
 
 void CoordinatorControlPlane::send_admin(const std::string& stage_name,
@@ -410,7 +418,27 @@ void CoordinatorControlPlane::send_admin(const std::string& stage_name,
 
 void CoordinatorControlPlane::broadcast_abort(const AbortMessage& msg) {
   if (!abort_socket_) throw ProtocolError("Control plane not started");
+  std::vector<std::shared_ptr<PushSocket>> sockets;
+  {
+    std::lock_guard<std::mutex> lock(stage_sockets_mu_);
+    sockets.reserve(stage_sockets_.size());
+    for (const auto& [key, socket] : stage_sockets_) {
+      (void)key;
+      sockets.push_back(socket);
+    }
+  }
+  std::exception_ptr failure;
+  for (const auto& socket : sockets) {
+    try {
+      socket->send(Message{msg});
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  }
+  // PUB remains a low-latency supplement. PUSH is the reliable ordered path,
+  // including aborts queued before a stage binds its input socket.
   abort_socket_->publish(msg);
+  if (failure) std::rethrow_exception(failure);
 }
 
 void CoordinatorControlPlane::send_shutdown(const std::string& stage_name,
@@ -434,7 +462,7 @@ void CoordinatorControlPlane::close() {
 const Platform& Platform::current() {
   static const Platform platform = [] {
     Platform detected;
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
     int count = 0;
     if (cudaGetDeviceCount(&count) == cudaSuccess && count > 0) {
       detected.device_type = "cuda";
@@ -452,7 +480,7 @@ const Platform& Platform::current() {
 namespace {
 
 bool cuda_ipc_disabled_by_env() {
-  const char* value = std::getenv("OMNIINFER_DISABLE_CUDA_IPC");
+  const char* value = std::getenv("UMMINFER_DISABLE_CUDA_IPC");
   return value != nullptr && *value != '\0' && std::string(value) != "0";
 }
 
@@ -504,7 +532,7 @@ bool CommRouter::cuda_ipc_peer_available(const std::string& target) {
                                ? it->second[0]
                                : -1;
     warn_cuda_ipc_fallback(target, placement_gpu_id_.value_or(-1), target_gpu,
-                           "disabled by OMNIINFER_DISABLE_CUDA_IPC");
+                           "disabled by UMMINFER_DISABLE_CUDA_IPC");
     cuda_ipc_peer_cache_[target] = false;
     return false;
   }
@@ -530,7 +558,7 @@ bool CommRouter::cuda_ipc_peer_available(const std::string& target) {
     cuda_ipc_peer_cache_[target] = true;
     return true;
   }
-#if defined(OMNIINFER_WITH_CUDA)
+#if defined(UMMINFER_WITH_CUDA)
   // The receiver opens the sender's handle from the target device, so both
   // directions must be available. Cache only a complete positive answer.
   auto accessible = [](int from, int to, std::string& reason) {
@@ -876,4 +904,4 @@ std::set<std::string> tensor_devices(const Value& obj) {
   return out;
 }
 
-}  // namespace omniinfer
+}  // namespace umminfer
