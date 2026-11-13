@@ -613,26 +613,39 @@ def ipc_paths(root):
 
 
 def start_workers(python, root, asr_backend, omni_backend,
-                  need_asr=True, need_omni=True):
+                  need_asr=True, need_omni=True, asr_concurrency=1,
+                  omni_concurrency=1, perf_dir=None):
     paths = ipc_paths(root)
     workers = {}
     if need_asr:
-        workers["asr-worker"] = CappedProcess([
+        args = [
             python, "-I", "python/umminfer_qwen_asr_stage.py", "serve",
             "--name", "asr", "--recv", paths["asr"],
             "--coordinator", paths["done"], "--abort", paths["abort"],
             "--model", "qwen3-asr", "--backend-url", asr_backend,
             "--timeout", "300",
-        ], "asr-worker")
+        ]
+        if asr_concurrency != 1:
+            args += ["--concurrency", str(asr_concurrency)]
+        if perf_dir:
+            args += ["--perf-log", os.path.join(perf_dir,
+                                                "asr-worker-perf.jsonl")]
+        workers["asr-worker"] = CappedProcess(args, "asr-worker")
     if not need_omni:
         return workers, paths
-    workers["omni-worker"] = CappedProcess([
+    args = [
         python, "-I", "python/umminfer_qwen_omni_worker.py",
         "--name", "vlm", "--recv", paths["vlm"],
         "--coordinator", paths["done"], "--abort", paths["abort"],
         "--upstream-base-url", omni_backend + "/v1",
         "--upstream-model", "qwen3-omni", "--request-timeout", "300",
-    ], "omni-worker")
+    ]
+    if omni_concurrency != 1:
+        args += ["--concurrency", str(omni_concurrency)]
+    if perf_dir:
+        args += ["--perf-log", os.path.join(perf_dir,
+                                            "omni-worker-perf.jsonl")]
+    workers["omni-worker"] = CappedProcess(args, "omni-worker")
     return workers, paths
 
 
@@ -686,6 +699,11 @@ def main():
     parser.add_argument("--asr-max-new-tokens", type=int, default=256)
     parser.add_argument("--scenarios", default=",".join(SCENARIOS))
     parser.add_argument("--gpu-command", default="")
+    # Worker-side upstream concurrency. 1 is the serial loop the baseline used.
+    parser.add_argument("--asr-concurrency", type=int, default=1)
+    parser.add_argument("--omni-concurrency", type=int, default=1)
+    # Keep the workers' JSON-lines queue/perf records next to the raw samples.
+    parser.add_argument("--worker-perf-log", action="store_true")
     args = parser.parse_args()
     if not args.evidence_dir:
         parser.print_help()
@@ -695,6 +713,9 @@ def main():
         parser.error("max_new_tokens must be at least 256")
     if args.samples < 1:
         parser.error("--samples must be positive")
+    for name in ("asr_concurrency", "omni_concurrency"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
 
     root = Path(args.evidence_dir)
     raw = root / "raw"
@@ -729,6 +750,9 @@ def main():
         "samples_per_scenario": args.samples,
         "warmup_per_scenario": args.warmup,
         "unified_concurrency": list(UNIFIED_CONCURRENCY),
+        "asr_worker_concurrency": args.asr_concurrency,
+        "omni_worker_concurrency": args.omni_concurrency,
+        "worker_perf_log": bool(args.worker_perf_log),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     for label, path in (("audio_en", args.audio_en),
@@ -760,7 +784,9 @@ def main():
             os.makedirs(omni_root, exist_ok=True)
             workers, paths = start_workers(
                 args.python, omni_root, args.asr_backend, args.omni_backend,
-                need_asr=False)
+                need_asr=False,
+                omni_concurrency=args.omni_concurrency,
+                perf_dir=str(raw) if args.worker_perf_log else None)
             processes.update(workers)
             server = start_server(args.binary, "omni-server", 0, paths, False)
             processes["omni-server"] = server
@@ -807,7 +833,10 @@ def main():
             unified_root = str(ipc_root / "unified")
             os.makedirs(unified_root, exist_ok=True)
             workers, paths = start_workers(
-                args.python, unified_root, args.asr_backend, args.omni_backend)
+                args.python, unified_root, args.asr_backend, args.omni_backend,
+                asr_concurrency=args.asr_concurrency,
+                omni_concurrency=args.omni_concurrency,
+                perf_dir=str(raw) if args.worker_perf_log else None)
             processes.update(workers)
             server = start_server(args.binary, "unified-server", 0, paths, True)
             processes["unified-server"] = server

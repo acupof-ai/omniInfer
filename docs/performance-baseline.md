@@ -1,6 +1,13 @@
 # Unified performance baseline — real H20B, 2026-11-13
 
 Baseline commit `127907e2a12406af3e1074a5f66144ac6f77b20b`, branch `phase4/bench`.
+> **Update 2026-11-13.** The queueing described below comes from one serial
+> worker per model. A joint worker-concurrency change removes it: at unified
+> concurrency 4, total p95 falls from 55.2 s to 14.9 s and aggregate output
+> throughput rises 3.6×. See
+> [Joint worker concurrency optimization](joint-optimization.md). The numbers
+> below stay as the pre-change baseline.
+
 Every number below comes from one recorded run on real models, real audio, and a
 real image. Raw per-request records are in
 `/tmp/umminfer-phase4-bench-evidence/raw/`; `summary.json` and `summary.csv` are

@@ -3,10 +3,13 @@
 
 import argparse
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
+import queue
 import signal
 import sys
+import threading
 import time
 
 import msgpack
@@ -312,9 +315,23 @@ def unpack_message(data):
     return msgpack.unpackb(data, raw=False, strict_map_key=False)
 
 
+class _Finished:
+    """Control-thread marker that a request thread left the pool."""
+
+    __slots__ = ("request_id",)
+
+    def __init__(self, request_id):
+        self.request_id = request_id
+
+
 class MLXStage:
     def __init__(self, name, recv_endpoint, coordinator_endpoint, abort_endpoint,
-                 model_path, loader=load_mlx_backend, perf_log=None):
+                 model_path, loader=load_mlx_backend, perf_log=None,
+                 concurrency=1):
+        if (isinstance(concurrency, bool) or not isinstance(concurrency, int)
+                or concurrency < 1):
+            raise ValueError("concurrency must be a positive integer")
+        self.concurrency = concurrency
         self.name = name
         self.recv_endpoint = recv_endpoint
         self.coordinator_endpoint = coordinator_endpoint
@@ -324,6 +341,8 @@ class MLXStage:
         # Optional JSON-lines measurement sink. When None, nothing is written.
         self.perf_log = perf_log
         self.perf_sink = None
+        # A stage that generates on several threads writes one sink.
+        self.perf_lock = threading.Lock()
         self.tokenizer = None
         self.generate = None
         self.context = None
@@ -334,6 +353,14 @@ class MLXStage:
         self.pending = deque()
         # request id -> tombstone deadline. See ABORT_TOMBSTONE_TTL_S.
         self.aborted = {}
+        # Request threads never touch a ZeroMQ socket. They queue frames, and
+        # the one control thread owns recv, abort, and coordinator send.
+        self.outbox = queue.Queue()
+        # Control-thread state: request id -> cancel flag; running set.
+        self.abort_flags = {}
+        self.inflight = set()
+        # Pool threads mark themselves here: no ZeroMQ, abort by flag only.
+        self.local = threading.local()
         self.running = True
 
     def load(self):
@@ -365,10 +392,11 @@ class MLXStage:
     def write_perf(self, record):
         """Append one JSON line. Measurement must never stop a request."""
         try:
-            if self.perf_sink is None:
-                self.perf_sink = open(self.perf_log, "a", encoding="utf-8")
-            self.perf_sink.write(json.dumps(record, sort_keys=True) + "\n")
-            self.perf_sink.flush()
+            with self.perf_lock:
+                if self.perf_sink is None:
+                    self.perf_sink = open(self.perf_log, "a", encoding="utf-8")
+                self.perf_sink.write(json.dumps(record, sort_keys=True) + "\n")
+                self.perf_sink.flush()
         except OSError as exc:
             print(f"MLX stage perf log write failed: {exc}", file=sys.stderr)
 
@@ -414,6 +442,10 @@ class MLXStage:
             context.term()
 
     def emit(self, message):
+        if getattr(self.local, "pool_thread", False):
+            # Only the control thread owns the coordinator socket.
+            self.outbox.put(message)
+            return
         self.coordinator_socket.send(pack_message(message))
 
     def result_metadata(self, parts, max_tokens, last_response):
@@ -434,22 +466,33 @@ class MLXStage:
             raise ValueError("MLX-LM did not report generation_tokens")
         return count, reason
 
-    def complete(self, request_id, success, text="", error=None,
-                 generated_tokens=None, finish_reason=None):
+    def complete_message(self, request_id, success, text="", error=None,
+                         generated_tokens=None, finish_reason=None):
         result = {"text": text}
         # Only report counts this stage actually observed.
         if generated_tokens is not None:
             result["generated_token_count"] = generated_tokens
         if finish_reason is not None:
             result["finish_reason"] = finish_reason
-        self.emit({"type": "complete", "request_id": request_id,
-                   "from_stage": self.name, "success": success,
-                   "result": result, "error": error})
+        return {"type": "complete", "request_id": request_id,
+                "from_stage": self.name, "success": success,
+                "result": result, "error": error}
+
+    def complete(self, request_id, success, text="", error=None,
+                 generated_tokens=None, finish_reason=None):
+        self.emit(self.complete_message(
+            request_id, success, text=text, error=error,
+            generated_tokens=generated_tokens,
+            finish_reason=finish_reason))
 
     def receive(self, socket):
         return unpack_message(socket.recv())
 
     def poll_events(self, timeout_ms=0):
+        # Request threads never touch ZeroMQ. The control thread polls for them
+        # and delivers cancellation through the request's own flag.
+        if getattr(self.local, "pool_thread", False):
+            return
         if self.poller is None:
             return
         for index in range(64):
@@ -510,6 +553,14 @@ class MLXStage:
         """Cancel a queued submit at once, and keep a tombstone for a submit
         that arrives later. Capacity is not a cancellation condition."""
         self.expire_aborts()
+        # A running request owns no queue entry, so it is cancelled by flag.
+        flag = self.abort_flags.get(request_id)
+        if flag is not None:
+            flag.set()
+            if self.perf_log is not None:
+                self.write_perf({"event": "abort", "request_id": request_id,
+                                 "removed_pending": False})
+            return
         removed = any(message.get("request_id") == request_id
                       for message in self.pending)
         self.pending = deque(message for message in self.pending
@@ -522,6 +573,9 @@ class MLXStage:
                              "removed_pending": removed})
 
     def consume_abort(self, request_id):
+        if getattr(self.local, "pool_thread", False):
+            flag = getattr(self.local, "abort_flag", None)
+            return flag is not None and flag.is_set()
         self.expire_aborts()
         return self.aborted.pop(request_id, None) is not None
 
@@ -630,14 +684,61 @@ class MLXStage:
             print(f"MLX request {request_id} failed: {error}", file=sys.stderr)
             self.complete(request_id, False, error=error)
 
+    def dispatch(self, pool):
+        """Move queued submits to request threads, up to the concurrency cap."""
+        while self.pending and len(self.inflight) < self.concurrency:
+            message = self.pending.popleft()
+            request_id = message.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                print("MLX stage discarded submit without a request id",
+                      file=sys.stderr)
+                continue
+            # A tombstone means the cancel arrived before the submit.
+            if self.consume_abort(request_id):
+                continue
+            flag = threading.Event()
+            self.abort_flags[request_id] = flag
+            self.inflight.add(request_id)
+            pool.submit(self.process_pool_request, message, flag)
+
+    def process_pool_request(self, message, flag):
+        """One request thread. It reuses process() with ZeroMQ disabled."""
+        self.local.pool_thread = True
+        self.local.abort_flag = flag
+        try:
+            self.process(message)
+        finally:
+            self.local.pool_thread = False
+            self.local.abort_flag = None
+            self.outbox.put(_Finished(message.get("request_id")))
+
+    def drain_outbox(self):
+        """Forward frames queued by request threads from the control thread."""
+        while True:
+            try:
+                item = self.outbox.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, _Finished):
+                self.inflight.discard(item.request_id)
+                self.abort_flags.pop(item.request_id, None)
+            else:
+                self.emit(item)
+
     def run(self):
+        # The control thread owns every socket. Request threads only generate
+        # and queue frames, so the upstream backend can batch them.
+        pool = ThreadPoolExecutor(max_workers=self.concurrency,
+                                  thread_name_prefix=f"{self.name}-request")
         try:
             while self.running:
-                if self.pending:
-                    self.process(self.pending.popleft())
-                else:
-                    self.poll_events(100)
+                self.poll_events(5 if self.inflight else 100)
+                self.dispatch(pool)
+                self.drain_outbox()
         finally:
+            self.running = False
+            pool.shutdown(wait=True)
+            self.drain_outbox()
             self.close()
 
 

@@ -258,13 +258,45 @@ class SGLangBackend:
 
 class QwenASRStage(MLXStage):
     def __init__(self, name, recv_endpoint, coordinator_endpoint, abort_endpoint,
-                 model_path, backend_url, timeout=120.0):
+                 model_path, backend_url, timeout=120.0, concurrency=1,
+                 perf_log=None):
         super().__init__(name, recv_endpoint, coordinator_endpoint, abort_endpoint,
-                         model_path)
-        self.backend = SGLangBackend(backend_url, model_path, timeout)
+                         model_path, perf_log=perf_log,
+                         concurrency=concurrency)
+        # One backend object owns one in-flight HTTP connection. A request
+        # thread takes a free backend, so SGLang can batch concurrent ASR legs.
+        self.backends = [SGLangBackend(backend_url, model_path, timeout)
+                         for _ in range(concurrency)]
+        self.backend = self.backends[0]
+        self.free_backends = queue.Queue()
         self.poll_interval = 0.1
         self._backend_request_id = None
         self._stream_requested = False
+
+    def _request_backend(self):
+        return getattr(self.local, "backend", None) or self.backend
+
+    def _request_backend_id(self):
+        return getattr(self.local, "backend_request_id",
+                       self._backend_request_id)
+
+    def process_pool_request(self, message, flag):
+        backend = self.free_backends.get()
+        self.local.backend = backend
+        try:
+            super().process_pool_request(message, flag)
+        finally:
+            self.local.backend = None
+            self.free_backends.put(backend)
+
+    def start(self):
+        # Build the free list here, not in __init__, so a replaced primary
+        # backend is the one request threads take.
+        self.backends[0] = self.backend
+        self.free_backends = queue.Queue()
+        for backend in self.backends:
+            self.free_backends.put(backend)
+        super().start()
 
     def load(self):
         if self.generate is not None:
@@ -274,7 +306,8 @@ class QwenASRStage(MLXStage):
         self.generate = self._generate
 
     def close(self):
-        self.backend.close_active()
+        for backend in self.backends:
+            backend.close_active()
         super().close()
 
     def parse_request(self, message):
@@ -304,22 +337,28 @@ class QwenASRStage(MLXStage):
             raise ValueError("stream must be a boolean")
         self._stream_requested = stream
         self._backend_request_id = "umminfer-" + message["request_id"]
+        # Request threads keep their own stream mode and backend id.
+        self.local.stream_requested = stream
+        self.local.backend_request_id = self._backend_request_id
         return pcm, max_tokens, 0.0, stream
 
     def _abort_backend(self, reason):
         """Ask SGLang to stop the active request on the GPU scheduler."""
-        request_id = self._backend_request_id
+        request_id = self._request_backend_id()
         print(f"SGLANG_ABORT_REQUEST rid={request_id} reason={reason}",
               flush=True)
         try:
-            self.backend.abort_request(request_id)
+            self._request_backend().abort_request(request_id)
             print(f"SGLANG_ABORT_ACCEPTED rid={request_id} http=ok", flush=True)
         except Exception as exc:
             print(f"SGLang abort_request failed for {request_id}: {exc}",
                   file=sys.stderr, flush=True)
 
     def _generate(self, pcm, max_tokens, temperature):
-        if getattr(self, "_stream_requested", False):
+        # A request thread owns its backend; the serial path uses self.backend.
+        backend = self._request_backend()
+        request_id = self._request_backend_id()
+        if getattr(self.local, "stream_requested", self._stream_requested):
             yield from self._generate_stream(pcm, max_tokens, temperature)
             return
         results = queue.Queue(maxsize=1)
@@ -327,13 +366,13 @@ class QwenASRStage(MLXStage):
 
         def call():
             try:
-                results.put(self.backend.transcribe(
-                    pcm, max_tokens, temperature, self._backend_request_id))
+                results.put(backend.transcribe(
+                    pcm, max_tokens, temperature, request_id))
             except Exception as exc:
                 results.put(exc)
 
         thread = threading.Thread(target=call, name="qwen-asr-http", daemon=True)
-        self.backend.prepare_request()
+        backend.prepare_request()
         thread.start()
         try:
             while True:
@@ -350,7 +389,7 @@ class QwenASRStage(MLXStage):
         finally:
             if not completed:
                 self._abort_backend("cancelled-before-completion")
-            self.backend.close_active()
+            backend.close_active()
             thread.join(5)
             if thread.is_alive():
                 print("SGLang HTTP thread did not exit after connection close",
@@ -358,18 +397,19 @@ class QwenASRStage(MLXStage):
 
     def _generate_stream(self, pcm, max_tokens, temperature):
         """Yield deltas as SGLang decodes, not one buffered final result."""
+        backend = self._request_backend()
+        request_id = self._request_backend_id()
         events = queue.Queue()
         end_of_stream = object()
 
         def call():
             try:
-                for event in self.backend.iter_stream(
-                        pcm, max_tokens, temperature,
-                        self._backend_request_id):
+                for event in backend.iter_stream(
+                        pcm, max_tokens, temperature, request_id):
                     events.put(event)
                     if event.finish_reason == "abort":
                         print(f"SGLANG_ABORT_CONFIRMED "
-                              f"rid={self._backend_request_id} finish=abort "
+                              f"rid={request_id} finish=abort "
                               f"tokens={event.generation_tokens}", flush=True)
                         break
             except Exception as exc:
@@ -379,7 +419,7 @@ class QwenASRStage(MLXStage):
 
         thread = threading.Thread(target=call, name="qwen-asr-stream",
                                   daemon=True)
-        self.backend.prepare_request()
+        backend.prepare_request()
         thread.start()
         completed = False
         prefix_seen = False
@@ -401,7 +441,7 @@ class QwenASRStage(MLXStage):
                     if item.finish_reason == "abort":
                         raise ValueError("SGLang aborted the transcription")
                     completed = True
-                    print(f"SGLANG_STREAM_DONE rid={self._backend_request_id} "
+                    print(f"SGLANG_STREAM_DONE rid={request_id} "
                           f"tokens={item.generation_tokens} "
                           f"finish={item.finish_reason}", flush=True)
                     yield SimpleNamespace(text="",
@@ -426,7 +466,7 @@ class QwenASRStage(MLXStage):
                 if delta:
                     emitted += 1
                     print(f"SGLANG_STREAM_DELTA "
-                          f"rid={self._backend_request_id} index={emitted} "
+                          f"rid={request_id} index={emitted} "
                           f"chars={len(delta)}", flush=True)
                     yield SimpleNamespace(text=delta)
         finally:
@@ -434,10 +474,10 @@ class QwenASRStage(MLXStage):
                 self._abort_backend("cancelled-during-stream")
             thread.join(10)
             if thread.is_alive():
-                self.backend.close_active()
+                backend.close_active()
                 thread.join(2)
             if not completed:
-                print(f"SGLANG_ABORT_THREAD rid={self._backend_request_id} "
+                print(f"SGLANG_ABORT_THREAD rid={request_id} "
                       f"alive={thread.is_alive()}", flush=True)
             if thread.is_alive():
                 print("SGLang stream thread did not exit after abort",
@@ -455,9 +495,14 @@ def main():
     serve.add_argument("--model", required=True)
     serve.add_argument("--backend-url", required=True)
     serve.add_argument("--timeout", type=float, default=120.0)
+    serve.add_argument("--concurrency", type=int, default=1)
+    serve.add_argument("--perf-log", default=None)
     args = parser.parse_args()
+    if args.concurrency < 1:
+        parser.error("--concurrency must be a positive integer")
     stage = QwenASRStage(args.name, args.recv, args.coordinator, args.abort,
-                         args.model, args.backend_url, args.timeout)
+                         args.model, args.backend_url, args.timeout,
+                         args.concurrency, args.perf_log)
 
     def stop(signum, frame):
         stage.running = False

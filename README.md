@@ -432,6 +432,11 @@ contains VLM output only; the ASR transcript is in the `asr_final` metadata.
 `/ready` requires both workers. `/abort` cancels the unified request, and
 `/health.in_flight` reports unified requests in this mode.
 
+Both Qwen workers accept `--concurrency N`, where 1 is the serial default and N
+runs up to N upstream requests in parallel so the SGLang backend can batch
+them. The H20B A/B used 4; see
+[Joint worker concurrency optimization](docs/joint-optimization.md).
+
 The Qwen Omni worker's optional `--log-requests` records the messages it actually
 received. Its optional `--perf-log` writes JSON-lines queue, request-start, abort
 and completion records. Both are intended for validation and are off by default.

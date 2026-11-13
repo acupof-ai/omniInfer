@@ -3,9 +3,11 @@
 import base64
 import io
 import math
+import queue
 from pathlib import Path
 import sys
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -46,6 +48,9 @@ class FakeCoordinator:
 
     def send(self, data):
         self.messages.append(unpack_message(data))
+
+    def close(self, linger=None):
+        pass
 
 
 class FakeBackend:
@@ -347,6 +352,46 @@ class StageTests(unittest.TestCase):
         stage.backend = FakeBackend()
         stage.process(submit(request_id="after-stream-abort"))
         self.assertTrue(stage.coordinator_socket.messages[-1]["success"])
+
+    def test_concurrency_two_requests_reach_backend_together(self):
+        """Both request threads must be inside their backend at the same time."""
+        barrier = threading.Barrier(2, timeout=5)
+
+        class OverlapBackend(FakeBackend):
+            def transcribe(self, pcm, max_tokens, temperature, request_id):
+                self.calls.append((pcm, max_tokens, temperature, request_id))
+                barrier.wait()  # serial dispatch would time out here
+                return response()
+
+        first, second = OverlapBackend(), OverlapBackend()
+        stage = QwenASRStage("test", "in", "out", "abort", "qwen3-asr",
+                             "http://127.0.0.1:13100", concurrency=2)
+        stage.backends = [first, second]
+        stage.backend = first
+        stage.free_backends = queue.Queue()
+        for backend in stage.backends:
+            stage.free_backends.put(backend)
+        stage.generate = stage._generate
+        coordinator = FakeCoordinator()
+        stage.coordinator_socket = coordinator
+        stage.poll_interval = 0.01
+        stage.pending.append(submit(request_id="one"))
+        stage.pending.append(submit(request_id="two"))
+        thread = threading.Thread(target=stage.run)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5
+            while (len(coordinator.messages) < 2
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+        finally:
+            stage.running = False
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        results = [m for m in coordinator.messages
+                   if m["type"] == "complete"]
+        self.assertEqual({m["request_id"] for m in results}, {"one", "two"})
+        self.assertTrue(all(m["success"] for m in results))
 
     def test_real_zmq_ready_submit_and_shutdown(self):
         context = zmq.Context()

@@ -134,5 +134,28 @@ class SummaryTests(unittest.TestCase):
         json.dumps(stats)
 
 
+class WorkerArgTests(unittest.TestCase):
+    def test_worker_concurrency_and_perf_flags_are_forwarded(self):
+        captured = {}
+
+        class Capture:
+            def __init__(self, args, name):
+                captured[name] = args
+
+        original = bench.CappedProcess
+        bench.CappedProcess = Capture
+        try:
+            bench.start_workers("python3", "/tmp/ipc-root", "http://asr",
+                                "http://omni", asr_concurrency=3,
+                                omni_concurrency=4, perf_dir="/tmp/raw")
+        finally:
+            bench.CappedProcess = original
+        for name, expected in (("asr-worker", "3"), ("omni-worker", "4")):
+            args = captured[name]
+            self.assertEqual(args[args.index("--concurrency") + 1], expected)
+            perf = args[args.index("--perf-log") + 1]
+            self.assertTrue(perf.endswith(f"{name}-perf.jsonl"))
+
+
 if __name__ == "__main__":
     sys.exit(unittest.main())

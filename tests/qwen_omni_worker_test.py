@@ -75,6 +75,39 @@ class FakeSGLang(BaseHTTPRequestHandler):
             if cancel:
                 self.server.cancelled.set()
 
+class OverlapSGLang(FakeSGLang):
+    """Slow stream that records how many requests are inside it at once."""
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def do_POST(self):
+        if self.path != "/v1/chat/completions":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        json.loads(self.rfile.read(length))
+        with OverlapSGLang.lock:
+            OverlapSGLang.active += 1
+            OverlapSGLang.max_active = max(OverlapSGLang.max_active,
+                                           OverlapSGLang.active)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.chunk("a")
+            time.sleep(0.3)
+            self.chunk("b")
+            self.chunk(finish="stop")
+            self.event({"choices": [], "usage": {"completion_tokens": 2}})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        finally:
+            with OverlapSGLang.lock:
+                OverlapSGLang.active -= 1
+
 
 class WorkerProtocolTests(unittest.TestCase):
     def setUp(self):
@@ -185,6 +218,64 @@ class WorkerProtocolTests(unittest.TestCase):
             coordinator.close(linger=0)
             abort.close(linger=0)
             context.term()
+
+    def test_concurrency_runs_two_upstream_requests_at_once(self):
+        """A serial worker would reach max_active == 1 and take two waves."""
+        OverlapSGLang.active = 0
+        OverlapSGLang.max_active = 0
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), OverlapSGLang)
+        upstream_thread = threading.Thread(target=upstream.serve_forever,
+                                           daemon=True)
+        upstream_thread.start()
+        context = zmq.Context()
+        coordinator = context.socket(zmq.PULL)
+        coordinator.RCVTIMEO = 5000
+        coordinator.bind("tcp://127.0.0.1:*")
+        abort = context.socket(zmq.PUB)
+        abort.bind("tcp://127.0.0.1:*")
+        base_url = f"http://127.0.0.1:{upstream.server_port}/v1"
+        stage = QwenOmniWorker(
+            "qwen", "tcp://127.0.0.1:*", coordinator.last_endpoint.decode(),
+            abort.last_endpoint.decode(), base_url, "qwen3-omni",
+            concurrency=2)
+        sender = None
+        run_thread = None
+        try:
+            stage.start()
+            self.assertEqual(unpack_message(coordinator.recv()),
+                             {"type": "stage_ready", "from_stage": "qwen"})
+            sender = context.socket(zmq.PUSH)
+            sender.connect(stage.recv_socket.last_endpoint.decode())
+            run_thread = threading.Thread(target=stage.run)
+            run_thread.start()
+            sender.send(pack_message(self.submit(request_id="one")))
+            sender.send(pack_message(self.submit(request_id="two")))
+            completions = []
+            while len(completions) < 2:
+                message = unpack_message(coordinator.recv())
+                if message["type"] == "complete":
+                    completions.append(message)
+            self.assertEqual({m["request_id"] for m in completions},
+                             {"one", "two"})
+            self.assertTrue(all(m["success"] for m in completions))
+            # Both requests were inside the backend at the same time.
+            self.assertEqual(OverlapSGLang.max_active, 2)
+            sender.send(pack_message({"type": "shutdown"}))
+            run_thread.join(5)
+            self.assertFalse(run_thread.is_alive())
+        finally:
+            stage.running = False
+            if run_thread is not None:
+                run_thread.join(3)
+            stage.close()
+            if sender is not None:
+                sender.close(linger=0)
+            coordinator.close(linger=0)
+            abort.close(linger=0)
+            context.term()
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(3)
 
     def test_bad_content_fails_without_upstream_request(self):
         stage = QwenOmniWorker("qwen", "in", "out", "abort",

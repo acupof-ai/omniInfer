@@ -63,9 +63,13 @@ MLXStage = load_pipeline_stage()
 class QwenOmniWorker(MLXStage):
     def __init__(self, name, recv_endpoint, coordinator_endpoint, abort_endpoint,
                  upstream_base_url, upstream_model, request_timeout=300.0,
-                 log_requests=False, perf_log=None):
+                 log_requests=False, perf_log=None, concurrency=1):
+        # The upstream SGLang server batches concurrent requests. Running
+        # several request threads is what lets it: the model call is an HTTP
+        # stream, not local compute.
         super().__init__(name, recv_endpoint, coordinator_endpoint, abort_endpoint,
-                         upstream_base_url.rstrip("/"), perf_log=perf_log)
+                         upstream_base_url.rstrip("/"), perf_log=perf_log,
+                         concurrency=concurrency)
         self.upstream_model = upstream_model
         self.request_timeout = request_timeout
         self.log_requests = log_requests
@@ -207,16 +211,21 @@ def main():
     parser.add_argument("--upstream-base-url", required=True)
     parser.add_argument("--upstream-model", required=True)
     parser.add_argument("--request-timeout", type=float, default=300.0)
+    # Concurrent upstream requests let SGLang batch. 1 restores the serial
+    # worker loop this flag was added to remove.
+    parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--log-requests", action="store_true")
     # Optional JSON-lines record of queue, abort, start and completion events.
     parser.add_argument("--perf-log", default=None)
     args = parser.parse_args()
     if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
         parser.error("--request-timeout must be positive and finite")
+    if args.concurrency < 1:
+        parser.error("--concurrency must be a positive integer")
     stage = QwenOmniWorker(
         args.name, args.recv, args.coordinator, args.abort,
         args.upstream_base_url, args.upstream_model, args.request_timeout,
-        args.log_requests, args.perf_log)
+        args.log_requests, args.perf_log, args.concurrency)
 
     def stop(signum, frame):
         stage.running = False
