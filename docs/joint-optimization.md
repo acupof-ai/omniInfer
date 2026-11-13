@@ -178,7 +178,11 @@ identity. Text quality is not measured here.
 * The perf log has no timestamps, so queue depth is ordering evidence, not a
   time series.
 * GPU utilization is sampled every 2 s, so short bursts can be missed.
-* Model revisions remain `UNKNOWN`. Weights hashes were not recorded.
+* Model revision: the SGLang `revision` field is `UNKNOWN` (local-path
+  launch, no `.git` metadata). All 35 deployed files are byte-identical to
+  pinned HF `main` commits with full SHA256 evidence; see
+  [performance-baseline.md](performance-baseline.md#model-snapshot-and-provenance)
+  and `/tmp/umminfer-phase5-provenance-evidence/`.
 
 ## Checks
 

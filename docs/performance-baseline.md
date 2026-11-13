@@ -32,9 +32,46 @@ Both backends were already running and healthy. The benchmark reused them and
 did not start or stop any backend process. Local SSH forwards carried
 `127.0.0.1:43100 → 172.17.0.2:31000` and `127.0.0.1:43101 → 172.17.0.2:31001`.
 
-Model revisions are `UNKNOWN`: the local model configs contain no commit hash.
-Weights hashes were not recorded. This is a baseline of the deployed snapshot,
-not of a named upstream revision.
+## Model snapshot and provenance
+
+Collected 2026-11-13 with `tests/model_provenance.py`; full evidence and the
+reproduction commands are in
+`/tmp/umminfer-phase5-provenance-evidence/` (`provenance.json`,
+`SHA256SUMS`). Every remote operation was read-only; weight hashes were
+computed on the H20B host, no weight byte was copied out, and no backend
+process was started or stopped.
+
+| Item | qwen3-asr | qwen3-omni |
+| --- | --- | --- |
+| Upstream HF repo | `Qwen/Qwen3-ASR-0.6B` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` |
+| HF `main` commit | `5eb144179a02acc5e5ba31e748d22b0cf3e303b0` | `26291f793822fb6be9555850f06dfe95f2d7e695` |
+| HF last modified | 2026-01-30 | 2025-09-22 |
+| Deployed directory | `…/models/asr` (10 files) | `…/models/omni` (25 files) |
+| Weight files | 1 × `model.safetensors` | 15 shards `model-00001…00015-of-00015.safetensors` |
+| Weight bytes | 1,876,091,704 | 70,523,299,202 |
+| `config.json` SHA256 | `76d3ae46…1a478c` | `eab5093d…88f2e0d` |
+| HF byte identity | 10/10 files identical | 25/25 files identical |
+
+The byte-identity claim has two independent checks. For the 16 safetensors
+weight files, the SHA256 computed on the host equals the Hugging Face LFS OID
+of the same file (the LFS OID is the SHA256 of the content). For the 19
+metadata files, the upstream file was downloaded once and its content SHA256
+was compared with the host file. Full per-file hashes are in
+`provenance.json`.
+
+The SGLang `revision` field stays `UNKNOWN`: both servers were launched from
+local directory paths, the directories contain no `.git` metadata, the HF
+cache holds no model snapshot, and `/get_server_info` reports
+`revision=null` and `model_checksum=null`. Provenance is therefore pinned by
+content matching against the HF `main` commits above, not by a revision
+recorded at launch.
+
+The backend processes were restarted after the benchmark run (the baseline
+PIDs 34134/35212 no longer exist; the replacement processes use the same
+launch flags and model directories). The config hashes in the environment
+table match the files now on disk, and every deployed file is byte-identical
+to the pinned upstream commits, so the restart did not change the model
+snapshot this baseline measured.
 
 ## Path
 
@@ -135,7 +172,10 @@ request at a time. Concurrency 1 is the recommended mode for this deployment.
 * Cancellation latency, queue depth, and per-worker model-time attribution were
   not measured by this benchmark. Cancellation correctness is covered by the
   separate Phase 4 cancel/failure evidence.
-* Model revision and weights hashes: `UNKNOWN`.
+* Model revision and weights hashes: see [Model snapshot and
+  provenance](#model-snapshot-and-provenance). The server-reported revision
+  is `UNKNOWN` (local-path launch, no `.git` metadata); all 35 deployed files
+  are byte-identical to pinned HF `main` commits, with full SHA256 evidence.
 * The host was not exclusive for the whole window. Other sessions ran separate
   SGLang instances on GPU 2/3 during part of the run. GPU 0/1 were used only by
   this benchmark's two backends, and GPU utilization on those two GPUs was
