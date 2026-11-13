@@ -999,6 +999,8 @@ void test_cancel_cannot_overtake_partial_dispatch() {
   release_partial.set_value();
   partial_done_future.wait();
   check(engine.wait(id, 5.0), "cancel during partial dispatch did not settle");
+  wait_until([&] { return log.terminal_count(id) == 1; },
+             "cancel during partial dispatch did not emit its terminal");
 
   const auto events = log.snapshot();
   check(events.size() == 2 &&
@@ -1030,12 +1032,106 @@ void test_cancel_cannot_overtake_partial_dispatch() {
   h.stream(reentrant_id, "asr", text_chunk("reentrant", false));
   reentrant_partial_future.wait();
   check(engine.wait(reentrant_id, 5.0), "reentrant cancel did not settle");
+  wait_until([&] { return reentrant_log.terminal_count(reentrant_id) == 1; },
+             "reentrant cancel did not emit its terminal");
   const auto reentrant_events = reentrant_log.snapshot();
   check(reentrant_events.size() == 2 &&
             reentrant_events[0].kind == UnifiedEvent::Kind::kAsrPartial &&
             reentrant_events[1].kind == UnifiedEvent::Kind::kCancelled,
         "reentrant cancel recursively overtook the partial callback");
   engine.release(reentrant_id);
+}
+
+// Forwarded callbacks share the unified event order. Cancel either from another
+// thread or from inside on_event; neither may complete the old sink before the
+// earlier stream callback has returned.
+void test_forwarded_sink_cancel_order(bool reentrant) {
+  Harness h(reentrant ? "fwdreenter" : "fwdthread");
+  std::mutex forwarded_mu;
+  std::vector<std::string> forwarded;
+  bool stream_active = false;
+  bool complete_overlapped_stream = false;
+  std::promise<void> stream_entered;
+  auto stream_entered_future = stream_entered.get_future();
+  std::promise<void> release_stream;
+  auto release_stream_future = release_stream.get_future().share();
+  h.coordinator.on_stream = [&](const StreamMessage&) {
+    {
+      std::lock_guard<std::mutex> lock(forwarded_mu);
+      forwarded.push_back("stream");
+      stream_active = true;
+    }
+    stream_entered.set_value();
+    release_stream_future.wait();
+    std::lock_guard<std::mutex> lock(forwarded_mu);
+    stream_active = false;
+  };
+  h.coordinator.on_complete = [&](const RequestInfo&) {
+    std::lock_guard<std::mutex> lock(forwarded_mu);
+    complete_overlapped_stream |= stream_active;
+    forwarded.push_back("complete");
+  };
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
+
+  EventLog log;
+  std::promise<void> partial_entered;
+  auto partial_entered_future = partial_entered.get_future();
+  std::promise<void> release_partial;
+  auto release_partial_future = release_partial.get_future().share();
+  const std::string id = engine.submit(audio_request());
+  engine.on_event = [&](const UnifiedEvent& event) {
+    if (event.kind == UnifiedEvent::Kind::kAsrPartial) {
+      if (reentrant) {
+        check(engine.cancel(id), "reentrant cancel rejected the forwarding request");
+      } else {
+        partial_entered.set_value();
+        release_partial_future.wait();
+      }
+    }
+    log.add(event);
+  };
+  engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
+
+  check(h.next_submit(h.asr_recv).has_value(), "ASR stage received no forwarding submit");
+  h.stream(id, "asr", text_chunk("partial", false));
+  if (!reentrant) {
+    partial_entered_future.wait();
+    check(engine.cancel(id), "cross-thread cancel rejected the forwarding request");
+    release_partial.set_value();
+  }
+  check(engine.wait(id, 5.0), "cancel during forwarding did not settle");
+  stream_entered_future.wait();
+  release_stream.set_value();
+  wait_until([&] {
+    std::lock_guard<std::mutex> lock(forwarded_mu);
+    return forwarded.size() == 2 && !stream_active &&
+           log.terminal_count(id) == 1;
+  }, "forwarded stream/completion or unified terminal did not arrive");
+
+  const auto events = log.snapshot();
+  check(events.size() == 2 &&
+            events[0].kind == UnifiedEvent::Kind::kAsrPartial &&
+            events[0].seq == 0 &&
+            events[1].kind == UnifiedEvent::Kind::kCancelled &&
+            events[1].seq == 1,
+        "forwarding changed unified partial/cancelled order");
+  check(log.terminal_count(id) == 1, "forwarding produced a duplicate terminal");
+
+  std::vector<std::string> order;
+  bool overlapped = false;
+  {
+    std::lock_guard<std::mutex> lock(forwarded_mu);
+    order = forwarded;
+    overlapped = complete_overlapped_stream;
+  }
+  check(!overlapped, "forwarded completion reentered the active stream sink");
+  std::cerr << (reentrant ? "FORWARD_ORDER_REENTRANT=" : "FORWARD_ORDER_THREAD=");
+  for (const auto& call : order) std::cerr << call << ",";
+  std::cerr << "\n";
+  check(order == std::vector<std::string>{"stream", "complete"},
+        "forwarded completion overtook the earlier stream callback");
+  engine.release(id);
 }
 
 // A previous sink blocked on the pump proves run() is active. Construction must
@@ -1149,6 +1245,8 @@ int main() {
   test_cancel_handoff_race_stress();
   test_previous_sink_reentry_does_not_deadlock();
   test_cancel_cannot_overtake_partial_dispatch();
+  test_forwarded_sink_cancel_order(false);
+  test_forwarded_sink_cancel_order(true);
   test_construction_after_pump_start_rejected();
   test_destructor_synchronizes_inflight_callback();
   return g_failures == 0 ? 0 : 1;

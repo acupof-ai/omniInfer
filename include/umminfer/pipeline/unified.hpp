@@ -27,6 +27,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <variant>
 
 #include "umminfer/pipeline/pipeline.hpp"
 #include "umminfer/proto/messages.hpp"
@@ -148,7 +149,7 @@ class UnifiedEngine {
 
   void handle_stream(const StreamMessage& msg);
   void handle_complete(const RequestInfo& info);
-  void drain_events();
+  void drain_dispatch();
   void start_vlm_locked(const std::string& request_id, Record& record);
   UnifiedEvent finish_locked(const std::string& request_id, Record& record,
                              UnifiedEvent::Kind kind, std::string error,
@@ -169,7 +170,8 @@ class UnifiedEngine {
   // FIFO of active unified ids, bounded by config_.max_in_flight.
   std::deque<std::string> admission_;
   std::map<std::string, Record> records_;
-  std::deque<UnifiedEvent> event_queue_;
+  using DispatchItem = std::variant<UnifiedEvent, StreamMessage, RequestInfo>;
+  std::deque<DispatchItem> dispatch_queue_;
   bool dispatching_ = false;  // guarded by mu_; reentrant callbacks only queue
   std::atomic<uint64_t> session_counter_{0};
 };
