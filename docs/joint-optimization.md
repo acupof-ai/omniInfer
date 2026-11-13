@@ -191,8 +191,28 @@ identity. Text quality is not measured here.
 | `python3 -I tests/unified_benchmark_test.py` | 10 tests pass |
 | `python3 -I tests/qwen_omni_worker_test.py` | 3 tests pass |
 | `python3 -I tests/qwen_asr_stage_test.py` | 14 tests pass |
-| `python3 -I tests/mlx_stage_test.py` | 27 tests pass |
+| `python3 -I tests/mlx_stage_test.py` | 28 tests pass |
 | `git diff --check` | clean |
+
+## Regression found before push (2026-11-13)
+
+A `ReleaseFast` build failed `tests/realtime_client_contract_e2e.py` at
+`wait_abort(abort_events, "realtime-1")` in 4 of 5 runs. The request-thread pool
+made the abort arrive after `dispatch`, where `record_abort` set the cancel flag
+and returned without registering a tombstone. The cancel itself worked; the
+registration the contract test observes was missing. Debug timing delivered the
+abort before `dispatch`, so the queued path hid the defect.
+
+`record_abort` now registers the tombstone for every request state, and
+`drain_outbox` releases it when the request thread finishes.
+`test_running_abort_is_registered_and_released` pins the running-request path.
+
+Re-verified on the same H20B backends: 10/10 realtime client runs, 10/10
+realtime server runs, all unit suites, and a concurrency-4 unified smoke with
+6/6 blocks and 30/30 successes. The worker perf logs show peak request overlap 4
+on both workers. A real-backend cancel reported `SGLANG_ABORT_CONFIRMED
+finish=abort`, and the next request succeeded. Evidence:
+`/tmp/umminfer-phase5-optimization-evidence/regression-20261113/`.
 
 ## Reproduce
 

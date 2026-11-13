@@ -554,13 +554,12 @@ class MLXStage:
         that arrives later. Capacity is not a cancellation condition."""
         self.expire_aborts()
         # A running request owns no queue entry, so it is cancelled by flag.
+        # The tombstone is recorded for it as well: a cancel is registered once
+        # per request whatever its state, and drain_outbox removes it when the
+        # request thread finishes.
         flag = self.abort_flags.get(request_id)
         if flag is not None:
             flag.set()
-            if self.perf_log is not None:
-                self.write_perf({"event": "abort", "request_id": request_id,
-                                 "removed_pending": False})
-            return
         removed = any(message.get("request_id") == request_id
                       for message in self.pending)
         self.pending = deque(message for message in self.pending
@@ -722,6 +721,10 @@ class MLXStage:
             if isinstance(item, _Finished):
                 self.inflight.discard(item.request_id)
                 self.abort_flags.pop(item.request_id, None)
+                # A cancel of a running request left a tombstone. The
+                # request thread is gone, so the control thread, which owns
+                # this map, releases it here instead of waiting for the TTL.
+                self.aborted.pop(item.request_id, None)
             else:
                 self.emit(item)
 

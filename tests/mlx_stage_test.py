@@ -298,6 +298,48 @@ class StageTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["request_id"], "next")
 
+    def test_running_abort_is_registered_and_released(self):
+        """A cancel of a running request must leave the same tombstone evidence."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        stage = self.make_stage()
+        started = threading.Event()
+        release = threading.Event()
+
+        def generate(prompt, max_tokens, temperature):
+            stage.calls.append((prompt, max_tokens, temperature))
+            started.set()
+            release.wait(3)
+            yield response("late", 1, "stop")
+
+        stage.generate = generate
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            stage.pending.append(submit())
+            stage.dispatch(pool)
+            self.assertTrue(started.wait(3), "request thread did not start")
+            self.assertIn("r", stage.inflight)
+            stage.record_abort("r")
+            # The running request is cancelled by flag, and the cancel is
+            # registered where a pre-submit cancel is registered too.
+            self.assertTrue(stage.abort_flags["r"].is_set())
+            self.assertIn("r", stage.aborted)
+            release.set()
+            for _ in range(300):
+                stage.drain_outbox()
+                if not stage.inflight:
+                    break
+                threading.Event().wait(0.01)
+            self.assertEqual(stage.inflight, set())
+            # The control thread releases the tombstone when the thread ends.
+            self.assertNotIn("r", stage.aborted)
+            self.assertNotIn("r", stage.abort_flags)
+            # The cancel suppressed the completion frame.
+            self.assertEqual(stage.coordinator_socket.messages, [])
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+
     def test_queued_abort_removes_the_pending_submit(self):
         stage = self.make_stage(["unused"])
         stage.pending.append(submit(request_id="queued"))
