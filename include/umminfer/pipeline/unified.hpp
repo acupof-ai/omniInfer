@@ -22,6 +22,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -87,9 +88,12 @@ class QueueFullError : public std::runtime_error {
   QueueFullError() : std::runtime_error("unified engine queue is full") {}
 };
 
-// Owns no threads. The caller pumps the Coordinator (Coordinator::run) exactly
-// as today; the engine attaches stream/completion sinks and chains any sinks
-// the embedded server installed earlier.
+// Owns no threads. The caller owns the Coordinator pump and must stop and join
+// it before destroying the Coordinator. The Coordinator must outlive the engine.
+// Quiesce other engine API calls before destruction. Do not destroy the engine
+// from one of its callbacks: the destructor waits for active callbacks.
+// Destruction does not require stopping the pump; retired sinks keep forwarding
+// to the sinks that preceded this engine.
 class UnifiedEngine {
  public:
   UnifiedEngine(Coordinator& coordinator, UnifiedConfig config);
@@ -107,10 +111,11 @@ class UnifiedEngine {
   // Returns false when the request is unknown or already terminal.
   bool cancel(const std::string& request_id);
 
-  // Blocks until the request reaches a terminal state.
+  // Returns false for an unknown id or timeout, true only for a terminal record.
   bool wait(const std::string& request_id, double timeout_s);
   // Drops the terminal engine record. Mirrors Coordinator::release.
   bool release(const std::string& request_id);
+  // Returns only unified state: unified id, public stage id, and unified result.
   std::optional<RequestInfo> info(const std::string& request_id);
   size_t in_flight() const;
 
@@ -121,10 +126,12 @@ class UnifiedEngine {
 
  private:
   enum class Phase { kAsr, kVlm, kDone };
+  struct CallbackGate;
 
   struct Record {
     std::string session_id;
     Phase phase = Phase::kAsr;
+    RequestInfo public_info;
     int64_t next_seq = 0;
     bool asr_final_seen = false;
     // Set by cancel() under mu_ before any coordinator call. A completion that
@@ -154,6 +161,7 @@ class UnifiedEngine {
   UnifiedConfig config_;
   std::function<void(const StreamMessage&)> previous_stream_;
   std::function<void(const RequestInfo&)> previous_complete_;
+  std::shared_ptr<CallbackGate> callback_gate_;
 
   mutable std::mutex mu_;
   std::condition_variable cv_;

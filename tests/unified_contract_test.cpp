@@ -7,6 +7,7 @@
 // order, deterministic aggregation, cancellation, stage failures,
 // backpressure, and duplicate/out-of-order handling. They are not real-model
 // E2E tests.
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -348,13 +350,26 @@ void test_streaming_asr_to_vlm() {
           "VLM prompt is not the final ASR transcript");
   }
 
+  const auto asr_leg_info = h.coordinator.info(id);
+  check(asr_leg_info && asr_leg_info->state == "completed",
+        "the ASR parent leg did not complete before the VLM barrier");
+  const auto vlm_phase_info = engine.info(id);
+  check(vlm_phase_info && vlm_phase_info->request_id == id &&
+            vlm_phase_info->state == "running" &&
+            vlm_phase_info->current_stage == kVlmStageId,
+        "info() exposed the completed ASR parent leg instead of unified VLM state");
+
   h.stream(id + ":vlm", "vlm", text_chunk("hi", false));
   h.stream(id + ":vlm", "vlm", text_chunk(" there", false));
   h.complete(id + ":vlm", "vlm", true, text_result("hi there"));
   check(engine.wait(id, 5.0), "unified request did not complete");
 
   const auto events = log.snapshot();
-  check(events.size() == 6, "wrong event count for the full ASR -> VLM flow");
+  if (events.size() != 6) {
+    check(false, "wrong event count for the full ASR -> VLM flow");
+    engine.release(id);
+    return;
+  }
   const UnifiedEvent::Kind expected_kinds[] = {
       UnifiedEvent::Kind::kAsrPartial, UnifiedEvent::Kind::kAsrPartial,
       UnifiedEvent::Kind::kAsrFinal,   UnifiedEvent::Kind::kVlmDelta,
@@ -368,7 +383,12 @@ void test_streaming_asr_to_vlm() {
   check(events[2].is_final && events[2].text == "hello world",
         "ASR final event has the wrong text");
   check(events[5].text == "hi there", "complete event lost the VLM aggregation");
-  check(engine.info(id)->state == "completed", "coordinator state is not completed");
+  const auto final_info = engine.info(id);
+  check(final_info && final_info->state == "completed" &&
+            final_info->current_stage == kVlmStageId &&
+            final_info->result.find("text") != nullptr &&
+            final_info->result.find("text")->as_str() == "hi there",
+        "info() did not retain the unified VLM terminal state");
   engine.release(id);
 }
 
@@ -463,6 +483,53 @@ void test_asr_malformed_result_fails() {
   }
 }
 
+// A malformed streaming final must fail before the completion can start VLM.
+void test_streaming_asr_malformed_final_fails() {
+  std::vector<Value> bad_finals;
+  Value::Map missing_text;
+  missing_text["is_final"] = Value(true);
+  bad_finals.emplace_back(std::move(missing_text));
+  Value::Map numeric_text;
+  numeric_text["is_final"] = Value(true);
+  numeric_text["text"] = Value(42);
+  bad_finals.emplace_back(std::move(numeric_text));
+
+  for (const Value& bad : bad_finals) {
+    Harness h("streammalformed");
+    UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+    EventLog log;
+    engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
+    engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
+
+    const std::string id = engine.submit(audio_request());
+    check(h.next_submit(h.asr_recv).has_value(), "ASR stage received no submit");
+    h.stream(id, "asr", bad);
+    // The same PUSH -> PULL queue makes this completion a FIFO barrier: the old
+    // code treats the malformed final as valid and starts VLM here.
+    h.complete(id, "asr", true, text_result("must not run"));
+    check(engine.wait(id, 5.0), "a malformed streaming final did not settle");
+
+    const auto terminal = log.terminal_for(id);
+    check(terminal && terminal->kind == UnifiedEvent::Kind::kError &&
+              terminal->stage_id == kAsrStageId && !terminal->error.empty(),
+          "a malformed streaming final did not produce one ASR kError");
+    check(log.terminal_count(id) == 1,
+          "a malformed streaming final produced duplicate terminals");
+    check(log.size() == 1 && log.snapshot()[0].kind == UnifiedEvent::Kind::kError,
+          "a malformed streaming final emitted an ASR final or success event");
+    check(h.no_submit(h.vlm_recv),
+          "a malformed streaming final still started the VLM leg");
+    engine.release(id);
+  }
+}
+
+void test_unknown_id_wait_fails() {
+  Harness h("unknownwait");
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  check(!engine.wait("unknown", 0.0), "wait() reported success for an unknown id");
+  check(!engine.info("unknown"), "info() returned state for an unknown id");
+}
+
 // cancel() broadcasts an abort to both stages and settles the request.
 void test_cancel_propagates_to_both_stages() {
   Harness h("cancel");
@@ -531,6 +598,67 @@ void test_vlm_failure() {
             log.terminal_event()->error == "vlm broke",
         "VLM failure produced the wrong terminal event");
   engine.release(id);
+}
+
+// VLM results accept exactly the public bare-string/text/content shapes.
+void test_vlm_result_text_contract() {
+  std::vector<std::pair<Value, std::string>> valid_results;
+  valid_results.emplace_back(Value("bare answer"), "bare answer");
+  valid_results.emplace_back(Value(text_result("text answer")), "text answer");
+  Value::Map content_result;
+  content_result["content"] = Value("content answer");
+  valid_results.emplace_back(Value(std::move(content_result)), "content answer");
+
+  for (const auto& [result, expected] : valid_results) {
+    Harness h("vlmresult");
+    UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+    EventLog log;
+    engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
+
+    const std::string id = engine.submit(audio_request());
+    check(h.next_submit(h.asr_recv).has_value(), "ASR stage received no submit");
+    h.complete(id, "asr", true, text_result("transcript"));
+    check(h.next_submit(h.vlm_recv).has_value(), "VLM stage received no submit");
+    h.complete(id + ":vlm", "vlm", true, result);
+    check(engine.wait(id, 5.0), "a valid VLM result did not settle");
+
+    const auto terminal = log.terminal_for(id);
+    check(terminal && terminal->kind == UnifiedEvent::Kind::kComplete &&
+              terminal->text == expected,
+          "a valid VLM result shape lost its text");
+    check(log.terminal_count(id) == 1,
+          "a valid VLM result produced duplicate terminals");
+    engine.release(id);
+  }
+
+  std::vector<Value> bad_results;
+  bad_results.emplace_back(Value(42));
+  bad_results.emplace_back(Value::Map{});
+  Value::Map numeric_text;
+  numeric_text["text"] = Value(42);
+  bad_results.emplace_back(std::move(numeric_text));
+  for (const Value& bad : bad_results) {
+    Harness h("vlmmalformed");
+    UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+    EventLog log;
+    engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
+
+    const std::string id = engine.submit(audio_request());
+    check(h.next_submit(h.asr_recv).has_value(), "ASR stage received no submit");
+    h.complete(id, "asr", true, text_result("transcript"));
+    check(h.next_submit(h.vlm_recv).has_value(), "VLM stage received no submit");
+    h.stream(id + ":vlm", "vlm", text_chunk("delta", false));
+    h.complete(id + ":vlm", "vlm", true, bad);
+    check(engine.wait(id, 5.0), "a malformed VLM result did not settle");
+
+    const auto terminal = log.terminal_for(id);
+    check(terminal && terminal->kind == UnifiedEvent::Kind::kError &&
+              terminal->stage_id == kVlmStageId && !terminal->error.empty(),
+          "a malformed VLM result did not produce exactly one VLM kError");
+    check(log.terminal_count(id) == 1,
+          "a malformed VLM result produced duplicate terminals");
+    engine.release(id);
+  }
 }
 
 // The admission cap is a hard bound: overflow throws, a finished slot reopens.
@@ -795,6 +923,59 @@ void test_cancel_after_asr_completed_swallows_vlm() {
   engine.release(id);
 }
 
+// The destructor cannot return while a pump callback still uses the engine.
+// Promises, not sleeps, fix the interleaving. A sink copied before destruction
+// must also remain safe when invoked after destruction.
+void test_destructor_synchronizes_inflight_callback() {
+  Harness h("destruct");
+  std::atomic<int> forwarded_calls{0};
+  std::promise<void> entered;
+  std::future<void> entered_future = entered.get_future();
+  std::promise<void> release;
+  std::shared_future<void> release_future = release.get_future().share();
+  h.coordinator.on_stream = [&](const StreamMessage&) {
+    if (forwarded_calls.fetch_add(1) == 0) {
+      entered.set_value();
+      release_future.wait();
+    }
+  };
+
+  auto engine = std::make_unique<UnifiedEngine>(h.coordinator, UnifiedConfig{});
+  EventLog log;
+  engine->on_event = [&](const UnifiedEvent& event) { log.add(event); };
+  const std::string id = engine->submit(audio_request());
+  check(h.next_submit(h.asr_recv).has_value(), "ASR stage received no submit");
+  h.stream(id, "asr", text_chunk("partial", false));
+  entered_future.wait();
+  const auto copied_sink = h.coordinator.on_stream;
+
+  std::promise<void> destroy_started;
+  std::future<void> destroy_started_future = destroy_started.get_future();
+  std::promise<void> destroyed;
+  std::future<void> destroyed_future = destroyed.get_future();
+  std::thread destroyer([&] {
+    destroy_started.set_value();
+    engine.reset();
+    destroyed.set_value();
+  });
+  destroy_started_future.wait();
+  const std::future_status early = destroyed_future.wait_for(std::chrono::seconds(1));
+  check(early == std::future_status::timeout,
+        "destructor returned while an inflight callback still used the engine");
+  release.set_value();
+  destroyed_future.wait();
+  destroyer.join();
+  check(log.size() == 1, "the inflight callback did not finish before destruction");
+
+  StreamMessage after;
+  after.request_id = "unknown";
+  after.from_stage = "asr";
+  after.chunk = text_chunk("after", false);
+  copied_sink(after);
+  check(forwarded_calls.load() == 2,
+        "a copied sink did not forward safely after engine destruction");
+}
+
 }  // namespace
 
 int main() {
@@ -803,14 +984,18 @@ int main() {
   test_nonstream_asr_synthesizes_final();
   test_asr_plain_string_result();
   test_asr_malformed_result_fails();
+  test_streaming_asr_malformed_final_fails();
+  test_unknown_id_wait_fails();
   test_cancel_propagates_to_both_stages();
   test_asr_failure();
   test_vlm_failure();
+  test_vlm_result_text_contract();
   test_queue_cap_backpressure();
   test_duplicate_final_and_out_of_order();
   test_image_video_rejected();
   test_cancel_before_pumped_completion();
   test_cancel_after_asr_completed_swallows_vlm();
   test_cancel_handoff_race_stress();
+  test_destructor_synchronizes_inflight_callback();
   return g_failures == 0 ? 0 : 1;
 }

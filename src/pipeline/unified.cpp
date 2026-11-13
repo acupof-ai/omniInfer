@@ -41,7 +41,75 @@ std::optional<std::string> asr_result_text(const Value& result) {
   return std::nullopt;
 }
 
+// Matches serve_detail::result_text's three valid shapes. Unlike the HTTP
+// compatibility fallback, a malformed stage result is an orchestration error.
+std::optional<std::string> vlm_result_text(const Value& result) {
+  if (auto text = asr_result_text(result)) return text;
+  if (result.is_map()) {
+    const Value* content = result.find("content");
+    if (content != nullptr && content->is_str()) return content->as_str();
+  }
+  return std::nullopt;
+}
+
 }  // namespace
+
+struct UnifiedEngine::CallbackGate {
+  CallbackGate(
+      UnifiedEngine* owner,
+      const std::function<void(const StreamMessage&)>& stream,
+      const std::function<void(const RequestInfo&)>& complete)
+      : engine(owner), previous_stream(stream), previous_complete(complete) {}
+
+  template <typename Arg>
+  void dispatch(const Arg& arg, void (UnifiedEngine::*method)(const Arg&),
+                const std::function<void(const Arg&)>& previous) {
+    UnifiedEngine* target = nullptr;
+    std::function<void(const Arg&)> fallback;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      target = engine;
+      if (target != nullptr) {
+        ++active;
+      } else {
+        fallback = previous;
+      }
+    }
+    if (target == nullptr) {
+      // The Coordinator may have copied this sink before retirement. The gate
+      // keeps both the copy and the previous sink alive after engine teardown.
+      if (fallback) fallback(arg);
+      return;
+    }
+    struct ActiveGuard {
+      CallbackGate& gate;
+      ~ActiveGuard() {
+        std::lock_guard<std::mutex> lock(gate.mu);
+        if (--gate.active == 0) gate.cv.notify_all();
+      }
+    } guard{*this};
+    (target->*method)(arg);
+  }
+
+  void stream(const StreamMessage& msg) {
+    dispatch(msg, &UnifiedEngine::handle_stream, previous_stream);
+  }
+  void complete(const RequestInfo& info) {
+    dispatch(info, &UnifiedEngine::handle_complete, previous_complete);
+  }
+  void retire() {
+    std::unique_lock<std::mutex> lock(mu);
+    engine = nullptr;
+    cv.wait(lock, [&] { return active == 0; });
+  }
+
+  std::mutex mu;
+  std::condition_variable cv;
+  UnifiedEngine* engine;
+  size_t active = 0;
+  std::function<void(const StreamMessage&)> previous_stream;
+  std::function<void(const RequestInfo&)> previous_complete;
+};
 
 const char* to_string(UnifiedModality modality) {
   switch (modality) {
@@ -82,13 +150,21 @@ UnifiedEngine::UnifiedEngine(Coordinator& coordinator, UnifiedConfig config)
   // HTTP SSE path and this engine share one Coordinator.
   previous_stream_ = std::move(coordinator_.on_stream);
   previous_complete_ = std::move(coordinator_.on_complete);
-  coordinator_.on_stream = [this](const StreamMessage& msg) { handle_stream(msg); };
-  coordinator_.on_complete = [this](const RequestInfo& info) { handle_complete(info); };
+  callback_gate_ = std::make_shared<CallbackGate>(
+      this, previous_stream_, previous_complete_);
+  coordinator_.on_stream = [gate = callback_gate_](const StreamMessage& msg) {
+    gate->stream(msg);
+  };
+  coordinator_.on_complete = [gate = callback_gate_](const RequestInfo& info) {
+    gate->complete(info);
+  };
 }
 
 UnifiedEngine::~UnifiedEngine() {
-  coordinator_.on_stream = std::move(previous_stream_);
-  coordinator_.on_complete = std::move(previous_complete_);
+  // ponytail: leave a retired forwarding shell in the Coordinator instead of
+  // racing its unsynchronized std::function reads. Repeated engine recreation
+  // chains shells; add synchronized sink exchange if that becomes a workload.
+  callback_gate_->retire();
 }
 
 std::string UnifiedEngine::submit(StagePayload payload) {
@@ -150,6 +226,9 @@ std::string UnifiedEngine::submit(StagePayload payload) {
   Record record;
   record.session_id = std::move(session_id);
   record.original_inputs = inputs;
+  record.public_info.request_id = request_id;
+  record.public_info.state = "running";
+  record.public_info.current_stage = kAsrStageId;
   records_[request_id] = std::move(record);
   return request_id;
 }
@@ -177,12 +256,15 @@ bool UnifiedEngine::wait(const std::string& request_id, double timeout_s) {
   std::unique_lock<std::mutex> lock(mu_);
   return cv_.wait_for(lock, std::chrono::duration<double>(timeout_s), [&] {
     auto it = records_.find(request_id);
-    return it == records_.end() || it->second.phase == Phase::kDone;
+    return it != records_.end() && it->second.phase == Phase::kDone;
   });
 }
 
 std::optional<RequestInfo> UnifiedEngine::info(const std::string& request_id) {
-  return coordinator_.info(request_id);
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = records_.find(request_id);
+  if (it == records_.end()) return std::nullopt;
+  return it->second.public_info;
 }
 
 bool UnifiedEngine::release(const std::string& request_id) {
@@ -232,6 +314,7 @@ UnifiedEngine::find_record_locked(const std::string& event_request_id) {
 
 void UnifiedEngine::handle_stream(const StreamMessage& msg) {
   std::vector<UnifiedEvent> due;
+  std::optional<UnifiedEvent> terminal_event;
   {
     std::lock_guard<std::mutex> lock(mu_);
     auto record_it = find_record_locked(msg.request_id);
@@ -273,26 +356,40 @@ void UnifiedEngine::handle_stream(const StreamMessage& msg) {
           if (previous_stream_) previous_stream_(msg);
           return;
         }
-        record.asr_final_seen = true;
-        record.transcript = chunk_text(msg.chunk);  // final replaces partials
+        const auto text = asr_result_text(msg.chunk);
+        if (!text) {
+          terminal_event = finish_locked(
+              unified_id, record, UnifiedEvent::Kind::kError,
+              "ASR stage returned no text", {});
+        } else {
+          record.asr_final_seen = true;
+          record.transcript = *text;  // final replaces partials
+        }
       } else {
         record.transcript += chunk_text(msg.chunk);  // partials are deltas
       }
-      UnifiedEvent event;
-      event.request_id = unified_id;
-      event.session_id = record.session_id;
-      event.stage_id = kAsrStageId;
-      event.kind = is_final ? UnifiedEvent::Kind::kAsrFinal
-                            : UnifiedEvent::Kind::kAsrPartial;
-      event.seq = record.next_seq++;
-      event.is_final = is_final;
-      event.text = chunk_text(msg.chunk);
-      due.push_back(std::move(event));
+      if (!terminal_event) {
+        UnifiedEvent event;
+        event.request_id = unified_id;
+        event.session_id = record.session_id;
+        event.stage_id = kAsrStageId;
+        event.kind = is_final ? UnifiedEvent::Kind::kAsrFinal
+                              : UnifiedEvent::Kind::kAsrPartial;
+        event.seq = record.next_seq++;
+        event.is_final = is_final;
+        event.text = chunk_text(msg.chunk);
+        due.push_back(std::move(event));
+      }
     }
   }
   if (previous_stream_) previous_stream_(msg);
   for (const auto& event : due) {
     if (on_event) on_event(event);
+  }
+  if (terminal_event) {
+    if (on_event) on_event(*terminal_event);
+    if (on_terminal) on_terminal(*terminal_event);
+    cv_.notify_all();
   }
 }
 
@@ -329,6 +426,7 @@ void UnifiedEngine::start_vlm_locked(const std::string& request_id,
   vlm_payload.request.inputs =
       build_vlm_inputs(record.transcript, record.original_inputs);
   record.phase = Phase::kVlm;
+  record.public_info.current_stage = kVlmStageId;
   coordinator_.submit(vlm_payload, config_.vlm_stage);
 }
 
@@ -351,6 +449,15 @@ UnifiedEvent UnifiedEngine::finish_locked(const std::string& request_id,
   } else if (kind == UnifiedEvent::Kind::kError) {
     event.stage_id = record.vlm_id.empty() ? kAsrStageId : kVlmStageId;
   }
+  record.public_info.state = kind == UnifiedEvent::Kind::kComplete
+                                 ? "completed"
+                                 : kind == UnifiedEvent::Kind::kError ? "failed"
+                                                                      : "aborted";
+  record.public_info.current_stage = event.stage_id;
+  record.public_info.result = kind == UnifiedEvent::Kind::kComplete
+                                  ? event.result
+                                  : Value{};
+  record.public_info.error = event.error;
   for (auto it = admission_.begin(); it != admission_.end(); ++it) {
     if (*it == request_id) {
       admission_.erase(it);
@@ -419,15 +526,17 @@ void UnifiedEngine::handle_complete(const RequestInfo& info) {
           }
         }
       } else {
-        if (record.vlm_text.empty() && info.result.is_map()) {
-          if (const Value* value = info.result.find("text");
-              value != nullptr && value->is_str()) {
-            record.vlm_text = value->as_str();
-          }
+        const auto text = vlm_result_text(info.result);
+        if (!text) {
+          terminal_event = finish_locked(
+              unified_id, record, UnifiedEvent::Kind::kError,
+              "VLM stage returned no text", {});
+        } else {
+          if (record.vlm_text.empty()) record.vlm_text = *text;
+          terminal_event = finish_locked(unified_id, record,
+                                         UnifiedEvent::Kind::kComplete, {},
+                                         info.result);
         }
-        terminal_event = finish_locked(unified_id, record,
-                                       UnifiedEvent::Kind::kComplete, {},
-                                       info.result);
       }
     }
   }
