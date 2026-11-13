@@ -108,8 +108,9 @@ flowchart TB
   class EXPORT,REWARD,TRAIN future
 ```
 
-Image and video are optional modalities: no local image or video worker exists,
-and their only routes are the proxy.
+Image and video are optional modalities: no local image or video worker exists.
+Image input reaches the VLM leg of unified mode unchanged; video has no route
+outside the proxy.
 
 ### Current call paths
 
@@ -148,10 +149,10 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | Bearer authentication | `serve --api-key` | Implemented |
 | Image generation and edit, video jobs | `image`, `video`, `/v1/images/*`, `/v1/videos*` | Fixed upstream proxy only |
 | Trained ASR worker | `umminfer_qwen_asr_stage.py` | Real `qwen3-asr` transcription verified on H20B |
-| Real VLM worker | `umminfer_qwen_omni_worker.py` | Real `qwen3-omni` streamed text verified on H20B; image input `NOT_COVERED` |
+| Real VLM worker | `umminfer_qwen_omni_worker.py` | Real `qwen3-omni` streamed text and image input verified on H20B |
 | Cross-model orchestration | `UnifiedEngine`, `serve --vlm-entry-endpoint` | Public HTTP/SSE and real CLI ASR -> VLM verified on H20B |
-| Shared session across modalities | — | `NOT_COVERED` |
-| Unified multimodal end-to-end acceptance | `chat --audio`, `/v1/chat/completions` | Partial: real H20B audio-only success, cancel, failure, and recovery; full Phase 2/3 gates `NOT_COVERED` |
+| Shared session across modalities | `session_id` on `/v1/chat/completions` | Implemented as a grouping label; sequential, concurrent, error, and cancel cases verified on H20B |
+| Unified multimodal end-to-end acceptance | `chat --audio`, `/v1/chat/completions` | Real joint image+audio, same-session reuse, cancel, failure, and recovery verified on H20B; full Phase 2/3 gates `NOT_COVERED` |
 | H20B verification | Two SGLang workers | Accessible; Qwen ASR GPU 1 and Qwen Omni GPU 0 verified; CUDA build/IPC/sanitizer/stress `NOT_COVERED` |
 
 TinyCTC has deterministic initialized weights; it is not a speech recognizer.
@@ -392,10 +393,25 @@ python3 -I python/umminfer_qwen_omni_worker.py \
   --stream --max-tokens 128 --temperature 0
 ```
 
-The public request accepts exactly one WAV `input_audio` part and no additional
-text, image, or video part in this mode. WAV must be PCM16, mono, 16 kHz. ASR
-runs as one non-streaming request. Its final transcript becomes the VLM user
-message. The VLM keeps the public sampling and streaming parameters.
+The public request accepts exactly one WAV `input_audio` part, at most one
+`image_url` part, and at most one `text` part. Video parts are rejected. WAV must
+be PCM16, mono, 16 kHz. The `text` part is an optional client instruction, for
+example "describe this image". ASR runs as one non-streaming request and receives
+PCM only; it never sees the image or the instruction. The VLM receives the
+instruction, the original `image_url` part, and the final transcript as the last
+`text` part. It keeps the public sampling and streaming parameters.
+
+The optional top-level `session_id` is a nonempty string of at most 128
+characters. It is a grouping label, not conversation history:
+
+- every event of every request carrying it reports the same `session_id`;
+- each request keeps its own `request_id`, its own gap-free `seq` from 0, and
+  its own terminal event;
+- requests in one session may run one after another or concurrently;
+- no transcript, answer, or message history crosses between requests.
+
+There is no multi-turn context in this mode. A client that needs history must
+send it as its own state.
 
 SSE remains `chat.completion.chunk`. A chunk can carry a `unified` object with
 `kind`, `stage`, `seq`, `session_id`, `is_final`, and `text`. Assistant `content`
@@ -443,9 +459,55 @@ run evidence is under `/tmp/umminfer-integration-logs/h20b-final/`; it is not a
 committed artifact. `SHA256SUMS` records the evidence hashes.
 
 These cases remain `NOT_COVERED`: incremental ASR partials, realtime partials,
-GPU-side abort confirmation, session reuse, joint image+audio input, and natural
-`real_control_frame_interleaving`. Audio-only evidence does not complete every
-Phase 2 or Phase 3 gate.
+GPU-side abort confirmation, and natural `real_control_frame_interleaving`. The
+Phase 4 joint-input and session-reuse cases are verified below.
+
+### Joint image + audio and same-session reuse, recorded on 2026-11-13
+
+The Phase 4 run used the same topology on dedicated local ports: public HTTP/SSE
+on `127.0.0.1:43210`, the same `UnifiedEngine`, the same Qwen ASR and Omni
+workers, and the same H20B backends. No other process was stopped. The image was
+the real screenshot `persona-home.png` (PNG, 1260x2800, 507922 bytes). The audio
+was the real English recording `asr_en_pcm16.wav`, the same file used for the
+audio-only run.
+
+Five requests ran in one `session_id`, `phase4-joint-session`:
+
+| Case | Public request id | Terminal | Notes |
+| --- | --- | --- | --- |
+| Joint image + audio, first | `http-8` | `complete` | `asr_final` seq 0; VLM deltas seq 1..; answer describes the screenshot |
+| Joint image + audio, second | `http-9` | `complete` | New request id, same session label, own seq from 0 |
+| ASR rejects `max_tokens=4097` | `http-10` | `error` | No `asr_final`, no VLM leg |
+| Cancel at `asr_final` | `http-11` | `cancelled` | `/abort` returned 200; no VLM delta |
+| Recovery in the same session | `http-12` | `complete` | Full joint answer again |
+
+The VLM worker log records the exact prompt it received. For `http-8:vlm`,
+`http-9:vlm`, and `http-12:vlm` it was the client instruction, then the image
+part, then the transcript as the last text part. The worker log replaces the
+base64 payload with the decoded byte length and SHA256, so the log stays small
+while still proving which bytes arrived:
+
+```text
+[{"text": "请先描述这张图片里可见的内容，再结合语音转写回答。", "type": "text"},
+ {"type": "image_url", "url_prefix": "data:image/png;base64", "bytes": 507922,
+  "sha256": "2c30598cfa191d551afda87e21d57702ba2452ff6a75025e4b6abdf3586d8338"},
+ {"text": "Oh yeah, yeah. He wasn't even that big ...", "type": "text"}]
+```
+
+The answer proves image use with content that the audio does not contain: the
+screenshot's `16:37` clock, the `VPN`/`5G`/`Wi-Fi`/`100%` status row, the
+"操作结果待确认，请回到会话核对" notice, and the disk list (`Library` 122.3 GiB,
+`code` 28.7 GiB, `.cache` 19.1 GiB). The answer then quotes the transcript.
+
+Input SHA256 values for this run were
+`2c30598cfa191d551afda87e21d57702ba2452ff6a75025e4b6abdf3586d8338` for
+`persona-home.png` and
+`64fbd9f7ecafc160ba457595570f4a8b338f10e16acc0933be30aedc7eedf86d` for
+`asr_en_pcm16.wav`. Evidence is under
+`/tmp/umminfer-integration-logs/phase4-joint/evidence/`: raw SSE per request
+(about 120 KiB each), event timelines, worker logs (1870 bytes), the two inputs,
+and `SHA256SUMS`. It is not a committed artifact.
+
 
 ### Cancel and failure closure run recorded on 2026-11-13
 
@@ -616,8 +678,9 @@ Rules of this mode:
 
 The CLI multimodal flags need a capable backend. `chat --audio` works in the
 unified local mode above or against an `omni` upstream. `--audio-out` needs an
-`omni` upstream. Image and video input need an `omni` upstream; local unified
-image input is `NOT_COVERED`. `image generate`, `image edit`, and the `video`
+`omni` upstream. Image input needs an `omni` upstream; local unified image input
+is verified above. Video input needs an `omni` upstream. `image generate`,
+`image edit`, and the `video`
 subcommands need an `image` or `video` upstream.
 
 The default test suite checks configuration validation, route gating, error

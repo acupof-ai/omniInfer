@@ -11,9 +11,10 @@
 //   - deterministic aggregation of ASR output into one VLM prompt,
 //   - a bounded admission queue (backpressure).
 //
-// Image and video are declared as optional modalities/capabilities only. No
-// worker handles them in v1; a request that requires them is rejected at
-// submission so the executed path stays audio -> ASR -> text -> VLM.
+// One request may carry one image_url content part and one client text
+// instruction next to the audio. The ASR leg still receives PCM only; the VLM
+// leg receives the instruction, the image part, and the final ASR transcript as
+// the last text part. Video has no worker and is rejected at submission.
 #pragma once
 
 #include <atomic>
@@ -110,9 +111,13 @@ class UnifiedEngine {
   //   payload.request.inputs = {"messages": [...], "modalities": [...]}
   // An additional binary "audio" value selects the real ASR worker contract.
   // The ASR leg then receives only that audio with stream=false/temperature=0;
-  // the VLM leg keeps the original sampling parameters and receives the text.
+  // the VLM leg keeps the original sampling parameters and receives the image
+  // parts (at most one) plus the ASR transcript as text.
+  // inputs.session_id is optional. It is a grouping label: every event of every
+  // request carrying it reports the same session_id, and requests in one
+  // session stay independent (own request id, own seq, own terminal, no history).
   // Returns the Coordinator-allocated request id. Throws ProtocolError on a
-  // bad contract (including image/video) and QueueFullError on backpressure.
+  // bad contract (including video) and QueueFullError on backpressure.
   std::string submit(StagePayload payload);
 
   // Cancels the request on both stages via the Coordinator abort broadcast.

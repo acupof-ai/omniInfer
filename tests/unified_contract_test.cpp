@@ -171,17 +171,49 @@ StagePayload audio_request(const std::string& modality = "audio") {
   return payload;
 }
 
-StagePayload image_part_request() {
+Value image_part(const std::string& url = "data:image/png;base64,AA") {
+  Value::Map image_url;
+  image_url["url"] = Value(url);
+  Value::Map out = part("image_url");
+  out["image_url"] = Value(std::move(image_url));
+  return Value(std::move(out));
+}
+
+StagePayload image_part_request(const std::string& url = "data:image/png;base64,AA") {
   StagePayload payload;
   Value::Map message;
   message["role"] = Value("user");
   Value::Array content;
-  content.push_back(Value(part("image_url")));
+  content.push_back(image_part(url));
   message["content"] = Value(std::move(content));
   Value::Array messages;
   messages.push_back(Value(std::move(message)));
   Value::Map inputs;
   inputs["messages"] = Value(std::move(messages));
+  payload.request.inputs = Value(std::move(inputs));
+  return payload;
+}
+
+// One request carrying real PCM for the ASR leg and one image part for the VLM
+// leg. The image rides on the original messages; the ASR leg never sees it.
+StagePayload joint_request(const std::string& session_id = "") {
+  StagePayload payload;
+  Value::Map message;
+  message["role"] = Value("user");
+  Value::Array content;
+  content.push_back(image_part());
+  content.push_back(Value(part("input_audio")));
+  message["content"] = Value(std::move(content));
+  Value::Array messages;
+  messages.push_back(Value(std::move(message)));
+  Value::Array modalities;
+  modalities.push_back(Value("audio"));
+  modalities.push_back(Value("image"));
+  Value::Map inputs;
+  inputs["messages"] = Value(std::move(messages));
+  inputs["modalities"] = Value(std::move(modalities));
+  inputs["audio"] = Value::bin(std::string(800, '\0'));
+  if (!session_id.empty()) inputs["session_id"] = Value(session_id);
   payload.request.inputs = Value(std::move(inputs));
   return payload;
 }
@@ -748,44 +780,198 @@ void test_duplicate_final_and_out_of_order() {
   engine.release(id);
 }
 
-// Image and video stay declarations: any request requiring them is rejected.
-void test_image_video_rejected() {
-  Harness h("media");
+// Image + audio: the ASR leg receives PCM only, the VLM leg receives the
+// original image part plus the final transcript as a text part. Video stays
+// rejected.
+void test_joint_image_audio() {
+  Harness h("joint");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
   h.start_pump();
+  EventLog log;
+  engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
 
-  bool image_modality_rejected = false;
-  try {
-    engine.submit(audio_request("image"));
-  } catch (const ProtocolError&) {
-    image_modality_rejected = true;
+  const std::string id = engine.submit(joint_request());
+  auto asr_submit = h.next_submit(h.asr_recv);
+  check(asr_submit.has_value(), "ASR stage received no submit");
+  if (asr_submit) {
+    StagePayload payload = StagePayload::from_value(asr_submit->data);
+    check(payload.request.inputs.find("audio") != nullptr &&
+              payload.request.inputs.find("messages") == nullptr,
+          "the ASR leg did not receive PCM only");
   }
-  check(image_modality_rejected, "an image modality was accepted without a worker");
+  h.complete(id, "asr", true, text_result("what is on screen"));
+  auto vlm_submit = h.next_submit(h.vlm_recv);
+  check(vlm_submit.has_value(), "VLM stage received no submit");
+  if (vlm_submit) {
+    StagePayload payload = StagePayload::from_value(vlm_submit->data);
+    const Value& content = *payload.request.inputs.find("messages")
+                                ->as_array()
+                                .at(0)
+                                .find("content");
+    check(content.is_array() && content.as_array().size() == 2,
+          "the VLM prompt is not image part + transcript text part");
+    if (content.is_array() && content.as_array().size() == 2) {
+      const Value& image = content.as_array()[0];
+      const Value& text = content.as_array()[1];
+      check(image.find("type")->as_str() == "image_url" &&
+                image.find("image_url")->find("url")->as_str() ==
+                    "data:image/png;base64,AA",
+            "the VLM lost the original image part");
+      check(text.find("type")->as_str() == "text" &&
+                text.find("text")->as_str() == "what is on screen",
+            "the VLM lost the ASR transcript");
+    }
+    const Value& modalities = *payload.request.inputs.find("modalities");
+    check(modalities.as_array().size() == 2 &&
+              modalities.as_array()[0].as_str() == "text" &&
+              modalities.as_array()[1].as_str() == "image",
+          "the VLM did not declare both text and image modalities");
+  }
+  h.complete(id + ":vlm", "vlm", true, text_result("a settings screen"));
+  check(engine.wait(id, 5.0), "joint request did not complete");
+  const auto events = log.snapshot();
+  check(!events.empty() &&
+            events.front().kind == UnifiedEvent::Kind::kAsrFinal &&
+            events.back().kind == UnifiedEvent::Kind::kComplete,
+        "joint event order is not asr_final .. complete");
+  engine.release(id);
+}
 
-  bool video_modality_rejected = false;
-  try {
-    engine.submit(audio_request("video"));
-  } catch (const ProtocolError&) {
-    video_modality_rejected = true;
-  }
-  check(video_modality_rejected, "a video modality was accepted without a worker");
+// Malformed media contracts are rejected before any stage sees the work.
+void test_media_contract_errors() {
+  Harness h("mediaerr");
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
 
-  bool image_part_rejected = false;
-  try {
-    engine.submit(image_part_request());
-  } catch (const ProtocolError&) {
-    image_part_rejected = true;
-  }
-  check(image_part_rejected, "an image content part was accepted without a worker");
+  auto rejects = [&](StagePayload payload, const char* message) {
+    bool rejected = false;
+    try {
+      engine.submit(std::move(payload));
+    } catch (const ProtocolError&) {
+      rejected = true;
+    }
+    check(rejected, message);
+  };
 
-  bool bad_contract_rejected = false;
-  try {
-    StagePayload empty;
-    engine.submit(empty);
-  } catch (const ProtocolError&) {
-    bad_contract_rejected = true;
+  rejects(audio_request("video"), "a video modality was accepted");
+  rejects(image_part_request(""), "an empty image URL was accepted");
+
+  StagePayload no_url = image_part_request("data:image/png;base64,AA");
+  no_url.request.inputs =
+      Value(Value::Map{{"messages", Value::Array{Value::Map{
+                          {"role", Value("user")},
+                          {"content", Value::Array{part("image_url")}}}}}});
+  rejects(std::move(no_url), "an image part without image_url.url was accepted");
+
+  StagePayload two_images;
+  Value::Map message;
+  message["role"] = Value("user");
+  message["content"] = Value::Array{image_part(), image_part(), Value(part("input_audio"))};
+  two_images.request.inputs = Value::Map{{"messages", Value::Array{Value(std::move(message))}}};
+  rejects(std::move(two_images), "a request with two image parts was accepted");
+
+  StagePayload empty;
+  rejects(std::move(empty), "a request without messages was accepted");
+}
+
+// Two sequential requests in one session. session_id is a grouping label only:
+// ids, sequences and terminals stay per request, and neither request inherits
+// the other's transcript or VLM answer.
+void test_session_reuse() {
+  Harness h("session");
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
+  EventLog log;
+  engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
+
+  auto run = [&](const std::string& transcript, const std::string& answer) {
+    const std::string id = engine.submit(joint_request("session-1"));
+    auto asr = h.next_submit(h.asr_recv);
+    check(asr && asr->request_id == id, "ASR leg id does not match the request");
+    h.complete(id, "asr", true, text_result(transcript));
+    auto vlm = h.next_submit(h.vlm_recv);
+    check(vlm && vlm->request_id == id + ":vlm", "VLM leg id is not a child id");
+    if (vlm) {
+      // Keep the payload alive: content points into it.
+      const StagePayload payload = StagePayload::from_value(vlm->data);
+      const Value& content = *payload.request.inputs.find("messages")
+                                  ->as_array()
+                                  .at(0)
+                                  .find("content");
+      check(content.is_array() && content.as_array().size() == 2 &&
+                content.as_array()[1].find("text")->as_str() == transcript,
+            "the VLM leg did not receive this request's transcript");
+    }
+    h.stream(id + ":vlm", "vlm", text_chunk(answer, false));
+    h.complete(id + ":vlm", "vlm", true, text_result(answer));
+    check(engine.wait(id, 5.0), "session request did not complete");
+    return id;
+  };
+
+  const std::string first = run("first transcript", "first answer");
+  const std::string second = run("second transcript", "second answer");
+  check(first != second, "two session requests shared a request id");
+
+  for (const std::string& id : {first, second}) {
+    int64_t next_seq = 0;
+    int terminals = 0;
+    for (const auto& event : log.snapshot()) {
+      if (event.request_id != id) continue;
+      check(event.session_id == "session-1", "event lost the session label");
+      check(event.seq == next_seq++, "event sequence is not gap-free per request");
+      if (event.is_final) ++terminals;
+    }
+    check(next_seq == 3, "unexpected event count for one session request");
+    check(terminals == 2, "a session request did not emit asr_final and complete");
   }
-  check(bad_contract_rejected, "a request without messages was accepted");
+  engine.release(first);
+  engine.release(second);
+}
+
+// Concurrent requests in the same session interleave. Each event keeps its own
+// request id and sequence; no delta or terminal crosses over.
+void test_session_reuse_concurrent() {
+  Harness h("sessionconc");
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
+  EventLog log;
+  engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
+
+  const std::string a = engine.submit(joint_request("session-2"));
+  const std::string b = engine.submit(joint_request("session-2"));
+  auto asr_a = h.next_submit(h.asr_recv);
+  auto asr_b = h.next_submit(h.asr_recv);
+  check(asr_a && asr_b && asr_a->request_id != asr_b->request_id,
+        "concurrent session requests did not reach the ASR stage separately");
+
+  h.complete(a, "asr", true, text_result("alpha"));
+  h.complete(b, "asr", true, text_result("beta"));
+  auto vlm_a = h.next_submit(h.vlm_recv);
+  auto vlm_b = h.next_submit(h.vlm_recv);
+  check(vlm_a && vlm_b, "both concurrent VLM legs did not start");
+
+  h.stream(a + ":vlm", "vlm", text_chunk("A", false));
+  h.stream(b + ":vlm", "vlm", text_chunk("B", false));
+  h.complete(b + ":vlm", "vlm", true, text_result("B"));
+  h.complete(a + ":vlm", "vlm", true, text_result("A"));
+  check(engine.wait(a, 5.0) && engine.wait(b, 5.0),
+        "concurrent session requests did not settle");
+
+  for (const std::string& id : {a, b}) {
+    const std::string expected = id == a ? "A" : "B";
+    int64_t next_seq = 0;
+    std::string delta, terminal;
+    for (const auto& event : log.snapshot()) {
+      if (event.request_id != id) continue;
+      check(event.session_id == "session-2", "event lost the session label");
+      check(event.seq == next_seq++, "concurrent event sequence is not per request");
+      if (event.kind == UnifiedEvent::Kind::kVlmDelta) delta = event.text;
+      if (event.kind == UnifiedEvent::Kind::kComplete) terminal = event.text;
+    }
+    check(delta == expected, "a VLM delta crossed between session requests");
+    check(terminal == expected, "a terminal crossed between session requests");
+  }
+  engine.release(a);
+  engine.release(b);
 }
 
 // Cancel before the queued ASR completion is pumped. With no pump thread the
@@ -1617,6 +1803,144 @@ void test_public_http_unified_sse() {
              "public unified request stayed in flight after completion");
 }
 
+// Public joint request: one instruction, one image, one WAV. The ASR leg sees
+// PCM only; the VLM leg sees instruction, image, transcript in that order and
+// every SSE unified event carries the public session label.
+void test_public_http_joint_input() {
+  Harness h("publicjoint");
+  ApiConfig config;
+  config.host = "127.0.0.1";
+  config.port = 0;
+  config.model = "qwen3-unified";
+  config.request_timeout_s = 5.0;
+  OpenAIApi api(h.coordinator, config);
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  api.set_unified_engine(engine, "vlm");
+  check(api.bind(), "public joint server did not bind");
+  h.start_pump();
+  std::thread server_thread([&] { api.listen(); });
+
+  const std::string pcm(800, '\0');
+  const std::string wav = audio::wav_from_pcm16(pcm);
+  nlohmann::json audio_part = {
+      {"type", "input_audio"},
+      {"input_audio", {{"data", client::detail::base64_encode(wav)}, {"format", "wav"}}}};
+  nlohmann::json instruction = {{"type", "text"}, {"text", "describe this image"}};
+  nlohmann::json image = {{"type", "image_url"},
+                          {"image_url", {{"url", "data:image/png;base64,AA"}}}};
+  nlohmann::json body = {
+      {"model", "qwen3-unified"},
+      {"session_id", "public-session"},
+      {"messages", nlohmann::json::array({nlohmann::json{
+           {"role", "user"},
+           {"content", nlohmann::json::array({instruction, image, audio_part})}}})},
+      {"stream", true}};
+  auto response_future = std::async(std::launch::async, [&] {
+    client::detail::HttpRequest request;
+    request.url = "http://127.0.0.1:" + std::to_string(api.bound_port()) +
+                  "/v1/chat/completions";
+    request.body = body.dump();
+    request.headers.emplace("Content-Type", "application/json");
+    request.timeout = client::Milliseconds{10000};
+    return client::detail::perform(request);
+  });
+
+  auto asr_submit = h.next_submit(h.asr_recv);
+  check(asr_submit.has_value(), "public joint request did not submit the ASR leg");
+  if (asr_submit) {
+    StagePayload payload = StagePayload::from_value(asr_submit->data);
+    check(payload.request.inputs.as_map().size() == 1 &&
+              payload.request.inputs.find("audio")->as_bin() == pcm,
+          "the ASR leg received more than PCM");
+    h.complete(asr_submit->request_id, "asr", true, text_result("spoken"));
+  }
+  auto vlm_submit = h.next_submit(h.vlm_recv);
+  check(vlm_submit.has_value(), "public joint request did not submit the VLM leg");
+  if (vlm_submit) {
+    StagePayload payload = StagePayload::from_value(vlm_submit->data);
+    const Value& content = *payload.request.inputs.find("messages")
+                                ->as_array()
+                                .at(0)
+                                .find("content");
+    check(content.is_array() && content.as_array().size() == 3,
+          "the VLM prompt is not instruction + image + transcript");
+    if (content.is_array() && content.as_array().size() == 3) {
+      check(content.as_array()[0].find("text")->as_str() == "describe this image" &&
+                content.as_array()[1].find("type")->as_str() == "image_url" &&
+                content.as_array()[2].find("text")->as_str() == "spoken",
+            "the VLM part order or content is wrong");
+    }
+    h.complete(vlm_submit->request_id, "vlm", true, text_result("answer"));
+  }
+  const auto response = response_future.get();
+  api.stop();
+  server_thread.join();
+  check(response.status == 200, "public joint SSE returned an HTTP error");
+  check(response.body.find("\"session_id\":\"public-session\"") !=
+            std::string::npos,
+        "public SSE lost the session label");
+}
+
+// Bad unified media fields are rejected before any stage sees the work.
+void test_public_http_unified_errors() {
+  Harness h("publicbad");
+  ApiConfig config;
+  config.host = "127.0.0.1";
+  config.port = 0;
+  config.model = "qwen3-unified";
+  config.request_timeout_s = 5.0;
+  OpenAIApi api(h.coordinator, config);
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  api.set_unified_engine(engine, "vlm");
+  check(api.bind(), "public error-path server did not bind");
+  h.start_pump();
+  std::thread server_thread([&] { api.listen(); });
+
+  const std::string wav = audio::wav_from_pcm16(std::string(800, '\0'));
+  const nlohmann::json audio_part = {
+      {"type", "input_audio"},
+      {"input_audio", {{"data", client::detail::base64_encode(wav)}, {"format", "wav"}}}};
+  const nlohmann::json image = {{"type", "image_url"},
+                                {"image_url", {{"url", "data:image/png;base64,AA"}}}};
+  // The public client throws on a non-2xx response; a 400 is the expected result.
+  auto rejected = [&](nlohmann::json body) {
+    body["model"] = "qwen3-unified";
+    body["stream"] = false;
+    client::detail::HttpRequest request;
+    request.url = "http://127.0.0.1:" + std::to_string(api.bound_port()) +
+                  "/v1/chat/completions";
+    request.body = body.dump();
+    request.headers.emplace("Content-Type", "application/json");
+    request.timeout = client::Milliseconds{5000};
+    try {
+      client::detail::perform(request);
+    } catch (const client::Error& exc) {
+      return std::string(exc.what()).find("HTTP 400") != std::string::npos;
+    }
+    return false;
+  };
+  auto body_with = [](nlohmann::json content) {
+    return nlohmann::json{{"messages", nlohmann::json::array({nlohmann::json{
+                               {"role", "user"}, {"content", std::move(content)}}})}};
+  };
+
+  auto two_images = body_with(nlohmann::json::array({image, image, audio_part}));
+  check(rejected(two_images), "two image parts were accepted");
+  auto two_texts = body_with(nlohmann::json::array(
+      {nlohmann::json{{"type", "text"}, {"text", "a"}},
+       nlohmann::json{{"type", "text"}, {"text", "b"}}, image, audio_part}));
+  check(rejected(two_texts), "two text parts were accepted");
+  auto empty_text = body_with(nlohmann::json::array(
+      {nlohmann::json{{"type", "text"}, {"text", ""}}, image, audio_part}));
+  check(rejected(empty_text), "an empty text part was accepted");
+  auto empty_session = body_with(nlohmann::json::array({image, audio_part}));
+  empty_session["session_id"] = "";
+  check(rejected(empty_session), "an empty session_id was accepted");
+  check(h.no_submit(h.asr_recv), "an invalid unified request reached the ASR stage");
+  api.stop();
+  server_thread.join();
+}
+
 size_t occurrences(const std::string& text, const std::string& needle) {
   size_t count = 0;
   for (size_t pos = text.find(needle); pos != std::string::npos;
@@ -1871,7 +2195,7 @@ void test_public_http_asr_model_failure() {
 }  // namespace
 
 int main() {
-  alarm(60);
+  alarm(120);
   test_streaming_asr_to_vlm();
   test_nonstream_asr_synthesizes_final();
   test_asr_plain_string_result();
@@ -1884,7 +2208,10 @@ int main() {
   test_vlm_result_text_contract();
   test_queue_cap_backpressure();
   test_duplicate_final_and_out_of_order();
-  test_image_video_rejected();
+  test_joint_image_audio();
+  test_media_contract_errors();
+  test_session_reuse();
+  test_session_reuse_concurrent();
   test_cancel_before_pumped_completion();
   test_cancel_after_asr_completed_swallows_vlm();
   test_cancel_handoff_race_stress();
@@ -1903,5 +2230,7 @@ int main() {
   test_public_http_unified_sse();
   test_public_http_cancel_during_vlm();
   test_public_http_asr_model_failure();
+  test_public_http_joint_input();
+  test_public_http_unified_errors();
   return g_failures == 0 ? 0 : 1;
 }

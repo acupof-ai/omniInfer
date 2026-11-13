@@ -205,21 +205,57 @@ json unified_event_json(const UnifiedEvent& event) {
           {"text", event.text}};
 }
 
-// The public chat schema carries WAV base64; the real ASR worker carries PCM16
-// binary in MessagePack. Convert only at the existing HTTP boundary.
-bool unified_audio_pcm(const json& body, std::string& pcm, std::string& error) {
+// The public chat schema carries WAV base64, an optional image URL, and one
+// optional client instruction; the real ASR worker carries PCM16 binary in
+// MessagePack. Convert only at the existing HTTP boundary. A unified request
+// accepts exactly one input_audio part, at most one image_url part, and at most
+// one text part; anything else is rejected.
+bool unified_input_parts(const json& body, std::string& pcm, std::string& error) {
   size_t audio_count = 0;
+  size_t image_count = 0;
+  size_t text_count = 0;
   try {
     for (const auto& message : body["messages"]) {
       const json& content = message["content"];
       if (!content.is_array()) {
-        error = "unified chat requires one input_audio content part and no text content";
+        error = "unified chat content must be a content part array";
         return false;
       }
       for (const auto& part : content) {
-        if (!part.is_object() || !part.contains("type") || !part["type"].is_string() ||
-            part["type"] != "input_audio") {
-          error = "unified chat supports input_audio parts only";
+        if (!part.is_object() || !part.contains("type") ||
+            !part["type"].is_string()) {
+          error = "unified chat supports input_audio, image_url and text parts only";
+          return false;
+        }
+        const std::string type = part["type"].get<std::string>();
+        if (type == "image_url") {
+          if (!part.contains("image_url") || !part["image_url"].is_object() ||
+              !part["image_url"].contains("url") ||
+              !part["image_url"]["url"].is_string() ||
+              part["image_url"]["url"].get<std::string>().empty()) {
+            error = "image_url part requires a nonempty image_url.url";
+            return false;
+          }
+          if (++image_count > 1) {
+            error = "unified chat accepts at most one image_url part";
+            return false;
+          }
+          continue;
+        }
+        if (type == "text") {
+          if (!part.contains("text") || !part["text"].is_string() ||
+              part["text"].get<std::string>().empty()) {
+            error = "text part requires a nonempty text string";
+            return false;
+          }
+          if (++text_count > 1) {
+            error = "unified chat accepts at most one text part";
+            return false;
+          }
+          continue;
+        }
+        if (type != "input_audio") {
+          error = "unified chat supports input_audio, image_url and text parts only";
           return false;
         }
         ++audio_count;
@@ -990,7 +1026,7 @@ class OpenAIApi::Impl {
     static const std::set<std::string> kAllowedFields = {
         "model", "messages", "stream", "temperature", "max_tokens",
         "max_completion_tokens", "top_p", "seed", "stop", "response_format",
-        "stream_options"};
+        "stream_options", "session_id"};
     for (auto it = body.begin(); it != body.end(); ++it) {
       if (!kAllowedFields.count(it.key()) && !it.value().is_null()) {
         reject("unsupported field: " + it.key());
@@ -1053,11 +1089,22 @@ class OpenAIApi::Impl {
       if (unified_engine_) {
         std::string pcm;
         std::string error;
-        if (!unified_audio_pcm(body, pcm, error)) {
+        if (!unified_input_parts(body, pcm, error)) {
           reject(error);
           return;
         }
         inputs["audio"] = Value::bin(std::move(pcm));
+        // session_id is a grouping label, not conversation history. It reaches
+        // the engine so every event of every request in the group carries it.
+        if (body.contains("session_id") && !body["session_id"].is_null()) {
+          if (!body["session_id"].is_string() ||
+              body["session_id"].get<std::string>().empty() ||
+              body["session_id"].get<std::string>().size() > 128) {
+            reject("session_id must be a nonempty string of at most 128 characters");
+            return;
+          }
+          inputs["session_id"] = Value(body["session_id"].get<std::string>());
+        }
       }
     } catch (const std::exception& exc) {
       reject(exc.what());

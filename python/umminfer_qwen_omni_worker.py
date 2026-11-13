@@ -2,6 +2,8 @@
 """Real Qwen3-Omni worker using the existing external-stage Coordinator protocol."""
 
 import argparse
+import base64
+import hashlib
 import importlib.util
 import json
 import math
@@ -9,6 +11,42 @@ from pathlib import Path
 import signal
 from types import SimpleNamespace
 import urllib.request
+
+
+def summarize_images(messages):
+    """Replace base64 image payloads with length and SHA256.
+
+    The request log is evidence, not a data dump: one screenshot data URL would
+    exceed a usable log bound. The digest still proves which bytes arrived.
+    """
+    summarized = []
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(
+                message.get("content"), list):
+            summarized.append(message)
+            continue
+        parts = []
+        for part in message["content"]:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                url = part.get("image_url", {}).get("url", "")
+                entry = {"type": "image_url"}
+                if url.startswith("data:") and "," in url:
+                    header, payload = url.split(",", 1)
+                    try:
+                        raw = base64.b64decode(payload, validate=True)
+                    except ValueError:
+                        entry.update({"url_prefix": header,
+                                      "base64_bytes": len(payload)})
+                    else:
+                        entry.update({"url_prefix": header, "bytes": len(raw),
+                                      "sha256": hashlib.sha256(raw).hexdigest()})
+                else:
+                    entry["url"] = url
+                parts.append(entry)
+            else:
+                parts.append(part)
+        summarized.append({**message, "content": parts})
+    return summarized
 
 
 def load_pipeline_stage():
@@ -86,7 +124,8 @@ class QwenOmniWorker(MLXStage):
             raise ValueError("stream must be a boolean")
         if self.log_requests:
             print(f"Qwen Omni request {message['request_id']} received "
-                  f"messages={json.dumps(messages, ensure_ascii=False)}", flush=True)
+                  f"messages={json.dumps(summarize_images(messages), ensure_ascii=False)}",
+                  flush=True)
         payload = {
             "model": self.upstream_model,
             "messages": messages,

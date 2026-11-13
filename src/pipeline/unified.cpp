@@ -205,8 +205,10 @@ std::string UnifiedEngine::submit(StagePayload payload) {
     throw ProtocolError("unified request inputs must contain a messages array");
   }
 
-  // Image and video have no worker in v1. Reject an explicit modality claim or
-  // a matching content part before any stage sees the work.
+  // Image reaches the VLM leg unchanged. Video still has no worker: reject an
+  // explicit video modality claim or a matching content part before any stage
+  // sees the work. At most one image part is accepted so the VLM prompt is
+  // unambiguous.
   if (const Value* declared = inputs.find("modalities"); declared != nullptr) {
     if (!declared->is_array()) {
       throw ProtocolError("unified request modalities must be an array");
@@ -217,13 +219,13 @@ std::string UnifiedEngine::submit(StagePayload payload) {
       }
       const auto modality = modality_from_string(token.as_str());
       if (!modality) throw ProtocolError("unknown modality: " + token.as_str());
-      if (*modality == UnifiedModality::kImage ||
-          *modality == UnifiedModality::kVideo) {
+      if (*modality == UnifiedModality::kVideo) {
         throw ProtocolError("modality " + token.as_str() +
                             " is declared but has no worker in unified engine v1");
       }
     }
   }
+  size_t image_count = 0;
   for (const Value& message : inputs.find("messages")->as_array()) {
     if (!message.is_map()) continue;
     const Value* content = message.find("content");
@@ -233,9 +235,21 @@ std::string UnifiedEngine::submit(StagePayload payload) {
       const Value* type = part.find("type");
       if (type == nullptr || !type->is_str()) continue;
       const UnifiedModality modality = modality_of_part_type(type->as_str());
-      if (modality == UnifiedModality::kImage || modality == UnifiedModality::kVideo) {
+      if (modality == UnifiedModality::kVideo) {
         throw ProtocolError(std::string("content part ") + type->as_str() +
                             " is declared but has no worker in unified engine v1");
+      }
+      if (modality == UnifiedModality::kImage) {
+        const Value* image_url = part.find("image_url");
+        if (image_url == nullptr || !image_url->is_map() ||
+            image_url->find("url") == nullptr ||
+            !image_url->find("url")->is_str() ||
+            image_url->find("url")->as_str().empty()) {
+          throw ProtocolError("image_url part requires a nonempty image_url.url");
+        }
+        if (++image_count > 1) {
+          throw ProtocolError("unified request accepts at most one image_url part");
+        }
       }
     }
   }
@@ -256,8 +270,10 @@ std::string UnifiedEngine::submit(StagePayload payload) {
     payload.request.params["temperature"] = Value(0.0);
   }
 
+  // Read from original_inputs: the audio branch above replaced inputs with the
+  // PCM-only ASR map, so inputs no longer holds the session label.
   std::string session_id;
-  if (const Value* session = inputs.find("session_id");
+  if (const Value* session = original_inputs.find("session_id");
       session != nullptr && session->is_str() && !session->as_str().empty()) {
     session_id = session->as_str();
   } else {
@@ -486,14 +502,50 @@ Value UnifiedEngine::build_vlm_inputs(const std::string& transcript,
       }
     }
   }
+  // The VLM sees the original image and text parts next to the ASR transcript.
+  // A text part is an optional client instruction; the transcript is appended
+  // last so the spoken request stays the final turn. With no extra part the
+  // content stays a plain string, which older workers already accept.
+  Value::Array extra_parts;
+  bool has_image = false;
+  if (original_inputs.is_map()) {
+    const Value* messages = original_inputs.find("messages");
+    if (messages != nullptr && messages->is_array()) {
+      for (const Value& message : messages->as_array()) {
+        if (!message.is_map()) continue;
+        const Value* content = message.find("content");
+        if (content == nullptr || !content->is_array()) continue;
+        for (const Value& part : content->as_array()) {
+          const Value* type = part.find("type");
+          if (type == nullptr || !type->is_str()) continue;
+          const UnifiedModality modality = modality_of_part_type(type->as_str());
+          if (modality == UnifiedModality::kImage) {
+            has_image = true;
+            extra_parts.push_back(part);
+          } else if (modality == UnifiedModality::kText) {
+            extra_parts.push_back(part);
+          }
+        }
+      }
+    }
+  }
   Value::Map user_message;
   user_message["role"] = Value("user");
-  user_message["content"] = Value(transcript);
+  if (!extra_parts.empty()) {
+    Value::Map text_part;
+    text_part["type"] = Value("text");
+    text_part["text"] = Value(transcript);
+    extra_parts.push_back(Value(std::move(text_part)));
+    user_message["content"] = Value(std::move(extra_parts));
+  } else {
+    user_message["content"] = Value(transcript);
+  }
   Value::Array messages;
   messages.push_back(Value(std::move(user_message)));
   out["messages"] = Value(std::move(messages));
   Value::Array modalities;
   modalities.push_back(Value("text"));
+  if (has_image) modalities.push_back(Value("image"));
   out["modalities"] = Value(std::move(modalities));
   return Value(std::move(out));
 }

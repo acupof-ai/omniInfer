@@ -2,6 +2,8 @@
 """Protocol unit tests with a fake SGLang; this is not a model E2E test."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -13,7 +15,7 @@ import zmq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 from umminfer_mlx_stage import pack_message, unpack_message
-from umminfer_qwen_omni_worker import QwenOmniWorker
+from umminfer_qwen_omni_worker import QwenOmniWorker, summarize_images
 
 
 class FakeSGLang(BaseHTTPRequestHandler):
