@@ -55,11 +55,7 @@ std::optional<std::string> vlm_result_text(const Value& result) {
 }  // namespace
 
 struct UnifiedEngine::CallbackGate {
-  CallbackGate(
-      UnifiedEngine* owner,
-      const std::function<void(const StreamMessage&)>& stream,
-      const std::function<void(const RequestInfo&)>& complete)
-      : engine(owner), previous_stream(stream), previous_complete(complete) {}
+  explicit CallbackGate(UnifiedEngine* owner) : engine(owner) {}
 
   template <typename Arg>
   void dispatch(const Arg& arg, void (UnifiedEngine::*method)(const Arg&),
@@ -147,17 +143,14 @@ UnifiedEngine::UnifiedEngine(Coordinator& coordinator, UnifiedConfig config)
     throw ProtocolError("unified engine requires distinct asr and vlm stages");
   }
   // Chain sinks the embedded server installed instead of replacing them: the
-  // HTTP SSE path and this engine share one Coordinator.
-  previous_stream_ = std::move(coordinator_.on_stream);
-  previous_complete_ = std::move(coordinator_.on_complete);
-  callback_gate_ = std::make_shared<CallbackGate>(
-      this, previous_stream_, previous_complete_);
-  coordinator_.on_stream = [gate = callback_gate_](const StreamMessage& msg) {
-    gate->stream(msg);
-  };
-  coordinator_.on_complete = [gate = callback_gate_](const RequestInfo& info) {
-    gate->complete(info);
-  };
+  // HTTP SSE path and this engine share one Coordinator. The Coordinator rejects
+  // this exchange if a pump has already started.
+  callback_gate_ = std::make_shared<CallbackGate>(this);
+  auto previous = coordinator_.exchange_sinks_before_run(
+      [gate = callback_gate_](const StreamMessage& msg) { gate->stream(msg); },
+      [gate = callback_gate_](const RequestInfo& info) { gate->complete(info); });
+  callback_gate_->previous_stream = std::move(previous.first);
+  callback_gate_->previous_complete = std::move(previous.second);
 }
 
 UnifiedEngine::~UnifiedEngine() {
@@ -313,84 +306,93 @@ UnifiedEngine::find_record_locked(const std::string& event_request_id) {
 }
 
 void UnifiedEngine::handle_stream(const StreamMessage& msg) {
-  std::vector<UnifiedEvent> due;
-  std::optional<UnifiedEvent> terminal_event;
   {
     std::lock_guard<std::mutex> lock(mu_);
     auto record_it = find_record_locked(msg.request_id);
-    if (record_it == records_.end() || record_it->second.phase == Phase::kDone) {
-      // Unknown or terminal: idempotent drop, matching the Coordinator's own
-      // in-flight-only stream filter.
-      if (previous_stream_) previous_stream_(msg);
-      return;
-    }
-    Record& record = record_it->second;
-    const std::string& unified_id = record_it->first;
-    if (msg.from_stage == config_.vlm_stage) {
-      if (record.phase != Phase::kVlm) {
+    if (record_it != records_.end() && record_it->second.phase != Phase::kDone) {
+      Record& record = record_it->second;
+      const std::string& unified_id = record_it->first;
+      if (msg.from_stage == config_.vlm_stage) {
+        if (record.phase == Phase::kVlm) {
+          record.vlm_text += chunk_text(msg.chunk);
+          UnifiedEvent event;
+          event.request_id = unified_id;  // contract id, never the child id
+          event.session_id = record.session_id;
+          event.stage_id = kVlmStageId;
+          event.kind = UnifiedEvent::Kind::kVlmDelta;
+          event.seq = record.next_seq++;
+          event.text = chunk_text(msg.chunk);
+          event_queue_.push_back(std::move(event));
+        }
         // A VLM chunk before the VLM leg starts is out of order: drop it.
-        if (previous_stream_) previous_stream_(msg);
-        return;
-      }
-      record.vlm_text += chunk_text(msg.chunk);
-      UnifiedEvent event;
-      event.request_id = unified_id;  // contract id, never the child id
-      event.session_id = record.session_id;
-      event.stage_id = kVlmStageId;
-      event.kind = UnifiedEvent::Kind::kVlmDelta;
-      event.seq = record.next_seq++;
-      event.text = chunk_text(msg.chunk);
-      due.push_back(std::move(event));
-    } else {
-      if (record.phase == Phase::kVlm) {
-        // An ASR chunk after the VLM leg started is late and out of order:
-        // the ASR final already fixed the transcript, so drop it.
-        if (previous_stream_) previous_stream_(msg);
-        return;
-      }
-      const bool is_final = chunk_is_final(msg.chunk);
-      if (is_final) {
-        // A repeated final is idempotent: the first owns the transcript, a
-        // later one changes nothing and emits no second event.
-        if (record.asr_final_seen) {
-          if (previous_stream_) previous_stream_(msg);
-          return;
-        }
-        const auto text = asr_result_text(msg.chunk);
-        if (!text) {
-          terminal_event = finish_locked(
-              unified_id, record, UnifiedEvent::Kind::kError,
-              "ASR stage returned no text", {});
+      } else if (record.phase != Phase::kVlm) {
+        const bool is_final = chunk_is_final(msg.chunk);
+        bool emit = true;
+        if (is_final) {
+          // A repeated final is idempotent: the first owns the transcript.
+          if (record.asr_final_seen) {
+            emit = false;
+          } else {
+            const auto text = asr_result_text(msg.chunk);
+            if (!text) {
+              emit = false;
+              event_queue_.push_back(finish_locked(
+                  unified_id, record, UnifiedEvent::Kind::kError,
+                  "ASR stage returned no text", {}));
+            } else {
+              record.asr_final_seen = true;
+              record.transcript = *text;  // final replaces partials
+            }
+          }
         } else {
-          record.asr_final_seen = true;
-          record.transcript = *text;  // final replaces partials
+          record.transcript += chunk_text(msg.chunk);  // partials are deltas
         }
-      } else {
-        record.transcript += chunk_text(msg.chunk);  // partials are deltas
+        if (emit) {
+          UnifiedEvent event;
+          event.request_id = unified_id;
+          event.session_id = record.session_id;
+          event.stage_id = kAsrStageId;
+          event.kind = is_final ? UnifiedEvent::Kind::kAsrFinal
+                                : UnifiedEvent::Kind::kAsrPartial;
+          event.seq = record.next_seq++;
+          event.is_final = is_final;
+          event.text = chunk_text(msg.chunk);
+          event_queue_.push_back(std::move(event));
+        }
       }
-      if (!terminal_event) {
-        UnifiedEvent event;
-        event.request_id = unified_id;
-        event.session_id = record.session_id;
-        event.stage_id = kAsrStageId;
-        event.kind = is_final ? UnifiedEvent::Kind::kAsrFinal
-                              : UnifiedEvent::Kind::kAsrPartial;
-        event.seq = record.next_seq++;
-        event.is_final = is_final;
-        event.text = chunk_text(msg.chunk);
-        due.push_back(std::move(event));
-      }
+      // An ASR chunk after the VLM leg started is late and out of order.
     }
+    // Unknown or terminal records drop the event, as the Coordinator does.
   }
-  if (previous_stream_) previous_stream_(msg);
-  for (const auto& event : due) {
-    if (on_event) on_event(event);
+  drain_events();
+  // Never call a foreign sink under mu_: it may reenter info() or cancel().
+  if (callback_gate_->previous_stream) callback_gate_->previous_stream(msg);
+}
+
+void UnifiedEngine::drain_events() {
+  std::unique_lock<std::mutex> lock(mu_);
+  if (dispatching_) return;
+  dispatching_ = true;
+  try {
+    while (!event_queue_.empty()) {
+      UnifiedEvent event = std::move(event_queue_.front());
+      event_queue_.pop_front();
+      const bool terminal = event.kind == UnifiedEvent::Kind::kComplete ||
+                            event.kind == UnifiedEvent::Kind::kError ||
+                            event.kind == UnifiedEvent::Kind::kCancelled;
+      lock.unlock();
+      if (on_event) on_event(event);
+      if (terminal && on_terminal) on_terminal(event);
+      if (terminal) cv_.notify_all();
+      lock.lock();
+    }
+  } catch (...) {
+    if (!lock.owns_lock()) lock.lock();
+    dispatching_ = false;
+    throw;
   }
-  if (terminal_event) {
-    if (on_event) on_event(*terminal_event);
-    if (on_terminal) on_terminal(*terminal_event);
-    cv_.notify_all();
-  }
+  // The queue is empty and mu_ is held, so no producer can race this reset.
+  dispatching_ = false;
 }
 
 Value UnifiedEngine::build_vlm_inputs(const std::string& transcript,
@@ -468,8 +470,6 @@ UnifiedEvent UnifiedEngine::finish_locked(const std::string& request_id,
 }
 
 void UnifiedEngine::handle_complete(const RequestInfo& info) {
-  std::vector<UnifiedEvent> due;
-  std::optional<UnifiedEvent> terminal_event;
   {
     std::lock_guard<std::mutex> lock(mu_);
     // The completion carries either the ASR leg id or the VLM child id.
@@ -478,19 +478,19 @@ void UnifiedEngine::handle_complete(const RequestInfo& info) {
       Record& record = it->second;
       const std::string& unified_id = it->first;
       if (info.state == "aborted") {
-        terminal_event = finish_locked(unified_id, record,
-                                       UnifiedEvent::Kind::kCancelled, {}, {});
+        event_queue_.push_back(finish_locked(
+            unified_id, record, UnifiedEvent::Kind::kCancelled, {}, {}));
       } else if (info.state == "failed") {
-        terminal_event = finish_locked(
+        event_queue_.push_back(finish_locked(
             unified_id, record, UnifiedEvent::Kind::kError,
-            info.error.empty() ? "stage failure" : info.error, {});
+            info.error.empty() ? "stage failure" : info.error, {}));
       } else if (record.cancel_requested) {
         // A successful completion beat the abort frame through the
         // Coordinator. The intent was recorded under mu_ first, so this path is
         // deterministic: settle as kCancelled and never run (or trust) the VLM
         // leg. A record that already failed is kDone and cannot reach here.
-        terminal_event = finish_locked(unified_id, record,
-                                       UnifiedEvent::Kind::kCancelled, {}, {});
+        event_queue_.push_back(finish_locked(
+            unified_id, record, UnifiedEvent::Kind::kCancelled, {}, {}));
       } else if (record.vlm_id.empty()) {
         // ASR leg succeeded. A non-streaming stage sends no final chunk, so
         // synthesize the ASR final from the result text.
@@ -499,9 +499,9 @@ void UnifiedEngine::handle_complete(const RequestInfo& info) {
           if (!text) {
             // No usable text means a malformed stage result: fail here and
             // never start the VLM leg with an empty or invented prompt.
-            terminal_event = finish_locked(
+            event_queue_.push_back(finish_locked(
                 unified_id, record, UnifiedEvent::Kind::kError,
-                "ASR stage returned no text", {});
+                "ASR stage returned no text", {}));
           } else {
             record.asr_final_seen = true;
             record.transcript = *text;
@@ -513,43 +513,36 @@ void UnifiedEngine::handle_complete(const RequestInfo& info) {
             event.seq = record.next_seq++;
             event.is_final = true;
             event.text = *text;
-            due.push_back(std::move(event));
+            event_queue_.push_back(std::move(event));
           }
         }
-        if (!terminal_event) {
+        if (record.phase != Phase::kDone) {
           try {
             start_vlm_locked(unified_id, record);
           } catch (const std::exception& error) {
-            terminal_event = finish_locked(unified_id, record,
-                                           UnifiedEvent::Kind::kError,
-                                           error.what(), {});
+            event_queue_.push_back(finish_locked(
+                unified_id, record, UnifiedEvent::Kind::kError,
+                error.what(), {}));
           }
         }
       } else {
         const auto text = vlm_result_text(info.result);
         if (!text) {
-          terminal_event = finish_locked(
+          event_queue_.push_back(finish_locked(
               unified_id, record, UnifiedEvent::Kind::kError,
-              "VLM stage returned no text", {});
+              "VLM stage returned no text", {}));
         } else {
           if (record.vlm_text.empty()) record.vlm_text = *text;
-          terminal_event = finish_locked(unified_id, record,
-                                         UnifiedEvent::Kind::kComplete, {},
-                                         info.result);
+          event_queue_.push_back(finish_locked(
+              unified_id, record, UnifiedEvent::Kind::kComplete, {},
+              info.result));
         }
       }
     }
   }
 
-  if (previous_complete_) previous_complete_(info);
-  for (const auto& event : due) {
-    if (on_event) on_event(event);
-  }
-  if (terminal_event) {
-    if (on_event) on_event(*terminal_event);
-    if (on_terminal) on_terminal(*terminal_event);
-    cv_.notify_all();
-  }
+  drain_events();
+  if (callback_gate_->previous_complete) callback_gate_->previous_complete(info);
 }
 
 }  // namespace umminfer

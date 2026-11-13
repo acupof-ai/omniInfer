@@ -628,7 +628,23 @@ void Coordinator::start() {
   running_ = true;
 }
 
+std::pair<Coordinator::StreamSink, Coordinator::CompleteSink>
+Coordinator::exchange_sinks_before_run(StreamSink stream, CompleteSink complete) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (pump_started_) {
+    throw ProtocolError("coordinator sink exchange must precede the first pump run");
+  }
+  auto previous = std::make_pair(std::move(on_stream), std::move(on_complete));
+  on_stream = std::move(stream);
+  on_complete = std::move(complete);
+  return previous;
+}
+
 void Coordinator::run() {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    pump_started_ = true;
+  }
   if (!control_plane_) start();
   while (running_) {
     std::optional<Message> msg;

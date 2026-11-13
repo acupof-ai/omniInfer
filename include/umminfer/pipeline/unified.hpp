@@ -88,8 +88,10 @@ class QueueFullError : public std::runtime_error {
   QueueFullError() : std::runtime_error("unified engine queue is full") {}
 };
 
-// Owns no threads. The caller owns the Coordinator pump and must stop and join
-// it before destroying the Coordinator. The Coordinator must outlive the engine.
+// Owns no threads. Construction must precede the first Coordinator::run call;
+// exchange_sinks_before_run enforces this. Keep other Coordinator calls quiescent
+// during construction. The caller owns the pump and must stop and join it before
+// destroying the Coordinator. The Coordinator must outlive the engine.
 // Quiesce other engine API calls before destruction. Do not destroy the engine
 // from one of its callbacks: the destructor waits for active callbacks.
 // Destruction does not require stopping the pump; retired sinks keep forwarding
@@ -146,6 +148,7 @@ class UnifiedEngine {
 
   void handle_stream(const StreamMessage& msg);
   void handle_complete(const RequestInfo& info);
+  void drain_events();
   void start_vlm_locked(const std::string& request_id, Record& record);
   UnifiedEvent finish_locked(const std::string& request_id, Record& record,
                              UnifiedEvent::Kind kind, std::string error,
@@ -159,8 +162,6 @@ class UnifiedEngine {
 
   Coordinator& coordinator_;
   UnifiedConfig config_;
-  std::function<void(const StreamMessage&)> previous_stream_;
-  std::function<void(const RequestInfo&)> previous_complete_;
   std::shared_ptr<CallbackGate> callback_gate_;
 
   mutable std::mutex mu_;
@@ -168,6 +169,8 @@ class UnifiedEngine {
   // FIFO of active unified ids, bounded by config_.max_in_flight.
   std::deque<std::string> admission_;
   std::map<std::string, Record> records_;
+  std::deque<UnifiedEvent> event_queue_;
+  bool dispatching_ = false;  // guarded by mu_; reentrant callbacks only queue
   std::atomic<uint64_t> session_counter_{0};
 };
 

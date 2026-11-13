@@ -17,6 +17,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "umminfer/comm/comm.hpp"
@@ -152,10 +153,16 @@ class Coordinator {
   size_t in_flight() const;
   void abort(const std::string& request_id);
 
+  using StreamSink = std::function<void(const StreamMessage&)>;
+  using CompleteSink = std::function<void(const RequestInfo&)>;
+  // Atomically installs sinks only before the first run() call. Direct sink
+  // access has the same before-run/quiescent-caller contract.
+  std::pair<StreamSink, CompleteSink> exchange_sinks_before_run(
+      StreamSink stream, CompleteSink complete);
   // Called on the coordinator thread for every stream chunk of a request.
-  std::function<void(const StreamMessage&)> on_stream;
+  StreamSink on_stream;
   // Called when a request reaches a terminal state.
-  std::function<void(const RequestInfo&)> on_complete;
+  CompleteSink on_complete;
 
  private:
   std::string next_request_id();
@@ -174,6 +181,7 @@ class Coordinator {
   std::map<std::string, RequestInfo> requests_;
   std::atomic<uint64_t> counter_{0};
   std::atomic<bool> running_{false};
+  bool pump_started_ = false;  // guarded by mu_
 };
 
 }  // namespace umminfer

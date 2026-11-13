@@ -210,7 +210,7 @@ struct Harness {
   std::mutex abort_mu;
   std::vector<std::string> aborted_legs;
 
-  explicit Harness(const char* tag, bool start_pump_thread = true)
+  explicit Harness(const char* tag, bool start_pump_thread = false)
       : dir(IpcDir::create(tag)),
         asr_recv(dir.endpoint("asr"), true),
         vlm_recv(dir.endpoint("vlm"), true),
@@ -323,6 +323,7 @@ struct Harness {
 void test_streaming_asr_to_vlm() {
   Harness h("stream");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
   EventLog log;
   engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
 
@@ -397,6 +398,7 @@ void test_streaming_asr_to_vlm() {
 void test_nonstream_asr_synthesizes_final() {
   Harness h("nonstream");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
   EventLog log;
   engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
 
@@ -424,6 +426,7 @@ void test_nonstream_asr_synthesizes_final() {
 void test_asr_plain_string_result() {
   Harness h("plainstring");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
   EventLog log;
   engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
 
@@ -462,6 +465,7 @@ void test_asr_malformed_result_fails() {
   for (const Value& bad : bad_results) {
     Harness h("malformed");
     UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+    h.start_pump();
     EventLog log;
     engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
 
@@ -497,6 +501,7 @@ void test_streaming_asr_malformed_final_fails() {
   for (const Value& bad : bad_finals) {
     Harness h("streammalformed");
     UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+    h.start_pump();
     EventLog log;
     engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
     engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
@@ -526,6 +531,7 @@ void test_streaming_asr_malformed_final_fails() {
 void test_unknown_id_wait_fails() {
   Harness h("unknownwait");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
   check(!engine.wait("unknown", 0.0), "wait() reported success for an unknown id");
   check(!engine.info("unknown"), "info() returned state for an unknown id");
 }
@@ -534,6 +540,7 @@ void test_unknown_id_wait_fails() {
 void test_cancel_propagates_to_both_stages() {
   Harness h("cancel");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
   EventLog log;
   engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
 
@@ -564,6 +571,7 @@ void test_cancel_propagates_to_both_stages() {
 void test_asr_failure() {
   Harness h("asrfail");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
   EventLog log;
   engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
 
@@ -584,6 +592,7 @@ void test_asr_failure() {
 void test_vlm_failure() {
   Harness h("vlmfail");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
   EventLog log;
   engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
 
@@ -612,6 +621,7 @@ void test_vlm_result_text_contract() {
   for (const auto& [result, expected] : valid_results) {
     Harness h("vlmresult");
     UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+    h.start_pump();
     EventLog log;
     engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
 
@@ -640,6 +650,7 @@ void test_vlm_result_text_contract() {
   for (const Value& bad : bad_results) {
     Harness h("vlmmalformed");
     UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+    h.start_pump();
     EventLog log;
     engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
 
@@ -667,6 +678,7 @@ void test_queue_cap_backpressure() {
   UnifiedConfig config;
   config.max_in_flight = 2;
   UnifiedEngine engine(h.coordinator, config);
+  h.start_pump();
 
   const std::string a = engine.submit(audio_request());
   const std::string b = engine.submit(audio_request());
@@ -699,6 +711,7 @@ void test_queue_cap_backpressure() {
 void test_duplicate_final_and_out_of_order() {
   Harness h("dup");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
   EventLog log;
   engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
 
@@ -735,6 +748,7 @@ void test_duplicate_final_and_out_of_order() {
 void test_image_video_rejected() {
   Harness h("media");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
 
   bool image_modality_rejected = false;
   try {
@@ -822,6 +836,7 @@ void test_cancel_before_pumped_completion() {
 void test_cancel_handoff_race_stress() {
   Harness h("racestress");
   UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
   EventLog log;
   engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
 
@@ -923,6 +938,141 @@ void test_cancel_after_asr_completed_swallows_vlm() {
   engine.release(id);
 }
 
+// An out-of-order VLM chunk takes the forwarding path. The previous sink
+// reenters info() on the pump thread, which deadlocks if forwarding holds mu_.
+void test_previous_sink_reentry_does_not_deadlock() {
+  Harness h("sinkreentry");
+  UnifiedEngine* engine_ptr = nullptr;
+  std::promise<std::optional<RequestInfo>> reentered;
+  auto reentered_future = reentered.get_future();
+  h.coordinator.on_stream = [&](const StreamMessage& msg) {
+    reentered.set_value(engine_ptr->info(msg.request_id));
+  };
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  engine_ptr = &engine;
+  h.start_pump();
+
+  const std::string id = engine.submit(audio_request());
+  check(h.next_submit(h.asr_recv).has_value(), "ASR stage received no submit");
+  h.stream(id, "vlm", text_chunk("early", false));
+  const auto status = reentered_future.wait_for(std::chrono::seconds(1));
+  check(status == std::future_status::ready,
+        "previous sink reentry deadlocked against engine mu_");
+  if (status != std::future_status::ready) std::abort();
+  const auto info = reentered_future.get();
+  check(info && info->request_id == id && info->state == "running" &&
+            info->current_stage == kAsrStageId,
+        "previous sink reentry returned the wrong unified state");
+  engine.release(id);
+}
+
+// Hold the partial callback while cancel() runs on another thread. The terminal
+// must queue behind the already-sequenced partial, including callback reentry.
+void test_cancel_cannot_overtake_partial_dispatch() {
+  Harness h("partialcancel");
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
+  EventLog log;
+  std::promise<void> partial_entered;
+  auto partial_entered_future = partial_entered.get_future();
+  std::promise<void> release_partial;
+  auto release_partial_future = release_partial.get_future().share();
+  std::promise<void> partial_done;
+  auto partial_done_future = partial_done.get_future();
+
+  const std::string id = engine.submit(audio_request());
+  engine.on_event = [&](const UnifiedEvent& event) {
+    if (event.kind == UnifiedEvent::Kind::kAsrPartial) {
+      partial_entered.set_value();
+      release_partial_future.wait();
+    }
+    log.add(event);
+    if (event.kind == UnifiedEvent::Kind::kAsrPartial) partial_done.set_value();
+  };
+  engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
+
+  check(h.next_submit(h.asr_recv).has_value(), "ASR stage received no submit");
+  h.stream(id, "asr", text_chunk("partial", false));
+  partial_entered_future.wait();
+  check(engine.cancel(id), "cancel rejected the partial-dispatch request");
+  check(log.size() == 0, "cancel terminal overtook the blocked partial callback");
+  release_partial.set_value();
+  partial_done_future.wait();
+  check(engine.wait(id, 5.0), "cancel during partial dispatch did not settle");
+
+  const auto events = log.snapshot();
+  check(events.size() == 2 &&
+            events[0].kind == UnifiedEvent::Kind::kAsrPartial &&
+            events[0].seq == 0 &&
+            events[1].kind == UnifiedEvent::Kind::kCancelled &&
+            events[1].seq == 1,
+        "single-drainer dispatch did not preserve partial then cancelled order");
+  engine.release(id);
+
+  // Same-thread reentry: cancel from inside on_event must only enqueue the
+  // terminal. The outer drainer emits it after the partial callback returns.
+  EventLog reentrant_log;
+  std::string reentrant_id;
+  std::promise<void> reentrant_partial_done;
+  auto reentrant_partial_future = reentrant_partial_done.get_future();
+  engine.on_event = [&](const UnifiedEvent& event) {
+    if (event.kind == UnifiedEvent::Kind::kAsrPartial) {
+      check(engine.cancel(reentrant_id), "reentrant cancel rejected the request");
+    }
+    reentrant_log.add(event);
+    if (event.kind == UnifiedEvent::Kind::kAsrPartial) {
+      reentrant_partial_done.set_value();
+    }
+  };
+  engine.on_terminal = [&](const UnifiedEvent& event) { reentrant_log.finish(event); };
+  reentrant_id = engine.submit(audio_request());
+  check(h.next_submit(h.asr_recv).has_value(), "ASR stage received no reentrant submit");
+  h.stream(reentrant_id, "asr", text_chunk("reentrant", false));
+  reentrant_partial_future.wait();
+  check(engine.wait(reentrant_id, 5.0), "reentrant cancel did not settle");
+  const auto reentrant_events = reentrant_log.snapshot();
+  check(reentrant_events.size() == 2 &&
+            reentrant_events[0].kind == UnifiedEvent::Kind::kAsrPartial &&
+            reentrant_events[1].kind == UnifiedEvent::Kind::kCancelled,
+        "reentrant cancel recursively overtook the partial callback");
+  engine.release(reentrant_id);
+}
+
+// A previous sink blocked on the pump proves run() is active. Construction must
+// reject the exchange without modifying that sink instead of racing it.
+void test_construction_after_pump_start_rejected() {
+  Harness h("lateconstruct");
+  std::promise<void> entered;
+  auto entered_future = entered.get_future();
+  std::promise<void> release;
+  auto release_future = release.get_future().share();
+  std::promise<void> previous_done;
+  auto previous_done_future = previous_done.get_future();
+  h.coordinator.on_stream = [&](const StreamMessage&) {
+    entered.set_value();
+    release_future.wait();
+    previous_done.set_value();
+  };
+  h.start_pump();
+
+  const std::string id = h.coordinator.submit(audio_request(), "asr");
+  check(h.next_submit(h.asr_recv).has_value(), "ASR stage received no submit");
+  h.stream(id, "asr", text_chunk("partial", false));
+  entered_future.wait();
+
+  bool rejected = false;
+  try {
+    UnifiedEngine late(h.coordinator, UnifiedConfig{});
+  } catch (const ProtocolError&) {
+    rejected = true;
+  }
+  check(rejected, "construction exchanged sinks after the pump had started");
+  release.set_value();
+  previous_done_future.wait();
+}
+
+// Promises, not sleeps, fix the interleaving. A sink copied before destruction
+// must also remain safe when invoked after destruction.
 // The destructor cannot return while a pump callback still uses the engine.
 // Promises, not sleeps, fix the interleaving. A sink copied before destruction
 // must also remain safe when invoked after destruction.
@@ -941,6 +1091,7 @@ void test_destructor_synchronizes_inflight_callback() {
   };
 
   auto engine = std::make_unique<UnifiedEngine>(h.coordinator, UnifiedConfig{});
+  h.start_pump();
   EventLog log;
   engine->on_event = [&](const UnifiedEvent& event) { log.add(event); };
   const std::string id = engine->submit(audio_request());
@@ -996,6 +1147,9 @@ int main() {
   test_cancel_before_pumped_completion();
   test_cancel_after_asr_completed_swallows_vlm();
   test_cancel_handoff_race_stress();
+  test_previous_sink_reentry_does_not_deadlock();
+  test_cancel_cannot_overtake_partial_dispatch();
+  test_construction_after_pump_start_rejected();
   test_destructor_synchronizes_inflight_callback();
   return g_failures == 0 ? 0 : 1;
 }
