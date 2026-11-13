@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Protocol unit tests with a fake SGLang; this is not a model E2E test."""
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from pathlib import Path
+import sys
+import threading
+import time
+import unittest
+
+import zmq
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+from umminfer_mlx_stage import pack_message, unpack_message
+from umminfer_qwen_omni_worker import QwenOmniWorker
+
+
+class FakeSGLang(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def reply_json(self, payload):
+        data = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def event(self, payload):
+        self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
+        self.wfile.flush()
+
+    def chunk(self, content=None, finish=None):
+        delta = {} if content is None else {"content": content}
+        self.event({"choices": [{"index": 0, "delta": delta,
+                                 "finish_reason": finish}]})
+
+    def do_GET(self):
+        if self.path != "/v1/models":
+            self.send_error(404)
+            return
+        self.reply_json({"data": [{"id": "qwen3-omni"}]})
+
+    def do_POST(self):
+        if self.path != "/v1/chat/completions":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        self.server.requests.append(payload)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        cancel = "CANCEL" in json.dumps(payload["messages"])
+        try:
+            self.chunk()
+            if cancel:
+                self.chunk("first")
+                for index in range(200):
+                    time.sleep(0.02)
+                    self.chunk("x")
+                return
+            for text in ("a", "", "b"):
+                self.chunk(text)
+            self.chunk(finish="stop")
+            self.event({"choices": [], "usage": {"completion_tokens": 3}})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            if cancel:
+                self.server.cancelled.set()
+
+
+class WorkerProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeSGLang)
+        self.upstream.requests = []
+        self.upstream.cancelled = threading.Event()
+        self.upstream_thread = threading.Thread(
+            target=self.upstream.serve_forever, daemon=True)
+        self.upstream_thread.start()
+
+    def tearDown(self):
+        self.upstream.shutdown()
+        self.upstream.server_close()
+        self.upstream_thread.join(3)
+
+    @staticmethod
+    def submit(request_id="r", stream=False, messages=None, **params):
+        params["stream"] = stream
+        return {
+            "type": "submit", "request_id": request_id,
+            "data": {"request": {
+                "inputs": {"messages": messages or [
+                    {"role": "user", "content": "hello"}]},
+                "params": params,
+            }},
+        }
+
+    def test_ready_stream_cancel_and_followup(self):
+        context = zmq.Context()
+        coordinator = context.socket(zmq.PULL)
+        coordinator.RCVTIMEO = 5000
+        coordinator.bind("tcp://127.0.0.1:*")
+        abort = context.socket(zmq.PUB)
+        abort.bind("tcp://127.0.0.1:*")
+        base_url = f"http://127.0.0.1:{self.upstream.server_port}/v1"
+        stage = QwenOmniWorker(
+            "qwen", "tcp://127.0.0.1:*", coordinator.last_endpoint.decode(),
+            abort.last_endpoint.decode(), base_url, "qwen3-omni")
+        sender = None
+        thread = None
+        try:
+            stage.start()
+            self.assertEqual(unpack_message(coordinator.recv()), {
+                "type": "stage_ready", "from_stage": "qwen"})
+            sender = context.socket(zmq.PUSH)
+            sender.connect(stage.recv_socket.last_endpoint.decode())
+            thread = threading.Thread(target=stage.run)
+            thread.start()
+
+            messages = [{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA"}},
+            ]}]
+            sender.send(pack_message(self.submit(stream=True, messages=messages,
+                                                 max_new_tokens=7, temperature=0.25)))
+            received = [unpack_message(coordinator.recv()) for _ in range(3)]
+            self.assertEqual([item["type"] for item in received],
+                             ["stream", "stream", "complete"])
+            self.assertEqual([item["chunk"]["text"] for item in received[:-1]],
+                             ["a", "b"])
+            self.assertEqual(received[-1]["result"], {
+                "text": "ab", "generated_token_count": 3, "finish_reason": "stop"})
+            forwarded = self.upstream.requests[0]
+            self.assertEqual(forwarded["messages"], messages)
+            self.assertEqual(forwarded["model"], "qwen3-omni")
+            self.assertEqual(forwarded["max_tokens"], 7)
+            self.assertEqual(forwarded["temperature"], 0.25)
+            self.assertTrue(forwarded["stream"])
+            self.assertEqual(forwarded["stream_options"], {"include_usage": True})
+
+            sender.send(pack_message(self.submit(request_id="plain")))
+            plain = unpack_message(coordinator.recv())
+            self.assertEqual(plain["type"], "complete")
+            self.assertEqual(plain["request_id"], "plain")
+            self.assertEqual(plain["result"]["text"], "ab")
+
+            sender.send(pack_message(self.submit(request_id="cancel", stream=True,
+                                                 messages=[{"role": "user",
+                                                            "content": "CANCEL"}])))
+            first = unpack_message(coordinator.recv())
+            self.assertEqual(first["request_id"], "cancel")
+            self.assertEqual(first["chunk"]["text"], "first")
+            sender.send(pack_message({"type": "abort", "request_id": "cancel"}))
+            self.assertTrue(self.upstream.cancelled.wait(5),
+                            "abort did not close the upstream HTTP response")
+
+            sender.send(pack_message(self.submit(request_id="after")))
+            while True:
+                result = unpack_message(coordinator.recv())
+                if result["type"] == "complete":
+                    break
+            self.assertEqual(result["request_id"], "after")
+            self.assertTrue(result["success"])
+            self.assertEqual(result["result"]["text"], "ab")
+
+            sender.send(pack_message({"type": "shutdown"}))
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+        finally:
+            stage.running = False
+            if thread is not None:
+                thread.join(3)
+            stage.close()
+            if thread is not None:
+                thread.join(1)
+            if sender is not None:
+                sender.close(linger=0)
+            coordinator.close(linger=0)
+            abort.close(linger=0)
+            context.term()
+
+    def test_bad_content_fails_without_upstream_request(self):
+        stage = QwenOmniWorker("qwen", "in", "out", "abort",
+                               "http://127.0.0.1:1/v1", "qwen3-omni")
+        sent = []
+        stage.coordinator_socket = type("Sink", (), {
+            "send": lambda self, data: sent.append(unpack_message(data))})()
+        stage.generate = lambda *args: self.fail("bad request reached upstream")
+        stage.process(self.submit(messages=[{"role": "user", "content": [None]}]))
+        self.assertFalse(sent[-1]["success"])
+        self.assertIn("content part", sent[-1]["error"])
+        self.assertEqual(self.upstream.requests, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

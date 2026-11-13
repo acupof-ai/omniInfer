@@ -169,6 +169,12 @@ pub fn build(b: *std.Build) void {
     const mlx_test_step = b.step("mlx-test", "Run MLX stage unit tests");
     mlx_test_step.dependOn(&mlx_test.step);
 
+    const qwen_omni_test = b.addSystemCommand(&.{ "python3", "-I" });
+    qwen_omni_test.addFileArg(b.path("tests/qwen_omni_worker_test.py"));
+    const qwen_omni_test_step = b.step(
+        "qwen-omni-test", "Run Qwen3-Omni worker protocol tests");
+    qwen_omni_test_step.dependOn(&qwen_omni_test.step);
+
     // Harness regression: an ambient non-API probe must not shift a proxy
     // plan or bind a WebSocket session. Needs only the CLI binary, no model.
     const proxy_isolation = b.addSystemCommand(&.{ "python3", "-I" });

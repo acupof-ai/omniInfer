@@ -830,10 +830,10 @@ class OpenAIApi::Impl {
         reject("each message requires a string role and content");
         return;
       }
-      // Only plain text content is forwarded to the stage. Null and multimodal
-      // content arrays are rejected instead of being dropped or rewritten.
-      if (!message["content"].is_string()) {
-        reject("message content must be a text string");
+      // Forward text and structured content parts unchanged. The external
+      // worker validates the parts required by its upstream model.
+      if (!message["content"].is_string() && !message["content"].is_array()) {
+        reject("message content must be a text string or content part array");
         return;
       }
     }
