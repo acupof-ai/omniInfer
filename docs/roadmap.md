@@ -230,6 +230,13 @@ The existing text-chat optimization record keeps its own convention; it is not a
 unified-engine baseline. [README](../README.md#measured-stage-result) gives the
 number and its conditions.
 
+The first real H20B unified baseline is recorded in
+[performance-baseline.md](performance-baseline.md): 10 scenario blocks, 200
+successful requests, and unified concurrency 1/2/4. It shows that one Omni
+worker limits the current deployment to about 20 output tokens/s; concurrency
+2/4 adds queueing rather than throughput. Mac unified performance, per-worker
+model-time attribution, and cancellation latency remain unmeasured.
+
 ### Phase 6 — RL rollout, trajectory, reward, and training
 
 **Goal.** Expose the unified engine as a rollout target for reinforcement

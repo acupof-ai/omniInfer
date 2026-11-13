@@ -368,6 +368,11 @@ Conditions that limit the claim:
   `tests/mlx_prompt_cache_perf.py` (direct MLX-LM A/B) and `tests/mlx_perf.py`
   (general comparison). Their gates are in [MLX backend](docs/mlx.md).
 
+The real H20B unified performance baseline is in
+[Unified performance baseline](docs/performance-baseline.md): 10 scenario
+blocks, 200 successful requests, and unified concurrency 1/2/4. One Omni worker
+delivers about 20 output tokens/s; higher concurrency queues behind it.
+
 ## Run real Qwen ASR -> VLM
 
 `serve --vlm-entry-endpoint` connects the existing public chat route to
