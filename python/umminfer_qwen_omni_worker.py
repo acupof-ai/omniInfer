@@ -24,11 +24,13 @@ MLXStage = load_pipeline_stage()
 
 class QwenOmniWorker(MLXStage):
     def __init__(self, name, recv_endpoint, coordinator_endpoint, abort_endpoint,
-                 upstream_base_url, upstream_model, request_timeout=300.0):
+                 upstream_base_url, upstream_model, request_timeout=300.0,
+                 log_requests=False):
         super().__init__(name, recv_endpoint, coordinator_endpoint, abort_endpoint,
                          upstream_base_url.rstrip("/"))
         self.upstream_model = upstream_model
         self.request_timeout = request_timeout
+        self.log_requests = log_requests
 
     def open_upstream(self, path, payload=None):
         data = None if payload is None else json.dumps(payload).encode()
@@ -82,6 +84,9 @@ class QwenOmniWorker(MLXStage):
         stream = params.get("stream", False)
         if not isinstance(stream, bool):
             raise ValueError("stream must be a boolean")
+        if self.log_requests:
+            print(f"Qwen Omni request {message['request_id']} received "
+                  f"messages={json.dumps(messages, ensure_ascii=False)}", flush=True)
         payload = {
             "model": self.upstream_model,
             "messages": messages,
@@ -93,6 +98,15 @@ class QwenOmniWorker(MLXStage):
             "stream_options": {"include_usage": True},
         }
         return payload, max_tokens, float(temperature), stream
+
+    def complete(self, request_id, success, text="", error=None,
+                 generated_tokens=None, finish_reason=None):
+        if self.log_requests:
+            print(f"Qwen Omni request {request_id} finished success={success} "
+                  f"finish={finish_reason}", flush=True)
+        super().complete(request_id, success, text=text, error=error,
+                         generated_tokens=generated_tokens,
+                         finish_reason=finish_reason)
 
     def generate_upstream(self, payload, max_tokens, temperature):
         del max_tokens, temperature  # Already validated and encoded in payload.
@@ -154,12 +168,14 @@ def main():
     parser.add_argument("--upstream-base-url", required=True)
     parser.add_argument("--upstream-model", required=True)
     parser.add_argument("--request-timeout", type=float, default=300.0)
+    parser.add_argument("--log-requests", action="store_true")
     args = parser.parse_args()
     if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
         parser.error("--request-timeout must be positive and finite")
     stage = QwenOmniWorker(
         args.name, args.recv, args.coordinator, args.abort,
-        args.upstream_base_url, args.upstream_model, args.request_timeout)
+        args.upstream_base_url, args.upstream_model, args.request_timeout,
+        args.log_requests)
 
     def stop(signum, frame):
         stage.running = False

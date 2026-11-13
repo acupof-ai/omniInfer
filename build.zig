@@ -119,6 +119,10 @@ pub fn build(b: *std.Build) void {
         }
         const run = b.addRunArtifact(test_exe);
         test_step.dependOn(&run.step);
+        if (std.mem.eql(u8, item.name, "unified_contract_test")) {
+            const unified_test = b.step("unified-test", "Run unified orchestration contract tests");
+            unified_test.dependOn(&run.step);
+        }
         if (std.mem.eql(u8, item.name, "runtime_compat")) {
             if (b.args) |args| run.addArgs(args);
             const runtime_test = b.step("runtime-test", "Run coordinator and stage runtime tests");

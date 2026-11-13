@@ -100,12 +100,17 @@ class QueueFullError : public std::runtime_error {
 class UnifiedEngine {
  public:
   UnifiedEngine(Coordinator& coordinator, UnifiedConfig config);
-  ~UnifiedEngine();
+  // Destructor retirement drains forwarded callbacks but does not propagate a
+  // foreign sink exception. Non-destructor copied sinks drain then rethrow.
+  ~UnifiedEngine() noexcept;
   UnifiedEngine(const UnifiedEngine&) = delete;
   UnifiedEngine& operator=(const UnifiedEngine&) = delete;
 
   // Submits one unified request. Reuses StagePayload:
   //   payload.request.inputs = {"messages": [...], "modalities": [...]}
+  // An additional binary "audio" value selects the real ASR worker contract.
+  // The ASR leg then receives only that audio with stream=false/temperature=0;
+  // the VLM leg keeps the original sampling parameters and receives the text.
   // Returns the Coordinator-allocated request id. Throws ProtocolError on a
   // bad contract (including image/video) and QueueFullError on backpressure.
   std::string submit(StagePayload payload);
@@ -146,6 +151,8 @@ class UnifiedEngine {
     std::string vlm_text;
     std::string vlm_id;
     Value original_inputs;
+    Value::Map vlm_params;
+    Value::Map vlm_metadata;
   };
 
   void handle_stream(const StreamMessage& msg);

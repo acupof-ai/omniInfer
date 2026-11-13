@@ -17,6 +17,8 @@
 
 namespace umminfer {
 
+class UnifiedEngine;
+
 struct ApiConfig {
   std::string host = "0.0.0.0";
   int port = 30000;
@@ -53,6 +55,10 @@ class OpenAIApi {
  public:
   OpenAIApi(Coordinator& coordinator, ApiConfig config);
   ~OpenAIApi();
+
+  // Call after construction and before Coordinator::run. Chat then uses the
+  // unified ASR -> VLM engine; transcription and realtime stay on the ASR stage.
+  void set_unified_engine(UnifiedEngine& engine, std::string vlm_stage);
 
   bool bind();     // reserves the configured port without accepting requests
   bool listen();   // binds if needed, then blocks

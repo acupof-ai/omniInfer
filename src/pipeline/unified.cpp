@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "umminfer/pipeline/unified.hpp"
 
+#include <exception>
 #include <string_view>
 
 namespace umminfer {
@@ -91,38 +92,40 @@ struct UnifiedEngine::CallbackGate {
   void complete(const RequestInfo& info) {
     dispatch(info, &UnifiedEngine::handle_complete);
   }
-  void retire() {
+  void retire() noexcept {
     {
       std::unique_lock<std::mutex> lock(mu);
       engine = nullptr;
       cv.wait(lock, [&] { return active == 0; });
     }
-    drain_fallback();
+    drain_fallback(true);
   }
 
-  void drain_fallback() {
+  void drain_fallback(bool suppress_exceptions = false) {
     std::unique_lock<std::mutex> lock(mu);
     if (active != 0 || fallback_dispatching) return;
     fallback_dispatching = true;
-    try {
-      while (!fallback_queue.empty()) {
-        FallbackItem item = std::move(fallback_queue.front());
-        fallback_queue.pop_front();
-        lock.unlock();
+    std::exception_ptr first_error;
+    while (!fallback_queue.empty()) {
+      FallbackItem item = std::move(fallback_queue.front());
+      fallback_queue.pop_front();
+      lock.unlock();
+      try {
         if (const auto* msg = std::get_if<StreamMessage>(&item)) {
           if (previous_stream) previous_stream(*msg);
         } else {
           const auto& info = std::get<RequestInfo>(item);
           if (previous_complete) previous_complete(info);
         }
-        lock.lock();
+      } catch (...) {
+        // Drain later callbacks before reporting the first error. Otherwise a
+        // reentrant completion would remain stranded behind a throwing stream.
+        if (!first_error) first_error = std::current_exception();
       }
-    } catch (...) {
-      if (!lock.owns_lock()) lock.lock();
-      fallback_dispatching = false;
-      throw;
+      lock.lock();
     }
     fallback_dispatching = false;
+    if (first_error && !suppress_exceptions) std::rethrow_exception(first_error);
   }
 
   using FallbackItem = std::variant<StreamMessage, RequestInfo>;
@@ -188,7 +191,7 @@ UnifiedEngine::UnifiedEngine(Coordinator& coordinator, UnifiedConfig config)
   callback_gate_->previous_complete = std::move(previous.second);
 }
 
-UnifiedEngine::~UnifiedEngine() {
+UnifiedEngine::~UnifiedEngine() noexcept {
   // ponytail: leave a retired forwarding shell in the Coordinator instead of
   // racing its unsynchronized std::function reads. Repeated engine recreation
   // chains shells; add synchronized sink exchange if that becomes a workload.
@@ -237,6 +240,22 @@ std::string UnifiedEngine::submit(StagePayload payload) {
     }
   }
 
+  Value original_inputs = inputs;
+  auto vlm_params = payload.request.params;
+  auto vlm_metadata = payload.request.metadata;
+  if (const Value* audio = inputs.find("audio"); audio != nullptr) {
+    if (!audio->is_bin() || audio->as_bin().empty() || audio->as_bin().size() % 2 != 0) {
+      throw ProtocolError("unified audio must be nonempty PCM16 with complete samples");
+    }
+    Value::Map asr_inputs;
+    asr_inputs["audio"] = *audio;
+    payload.request.inputs = Value(std::move(asr_inputs));
+    // Qwen ASR is one aggregated response. Public streaming applies to the
+    // unified event stream and the VLM leg, not to the ASR backend request.
+    payload.request.params["stream"] = Value(false);
+    payload.request.params["temperature"] = Value(0.0);
+  }
+
   std::string session_id;
   if (const Value* session = inputs.find("session_id");
       session != nullptr && session->is_str() && !session->as_str().empty()) {
@@ -253,7 +272,9 @@ std::string UnifiedEngine::submit(StagePayload payload) {
   admission_.push_back(request_id);
   Record record;
   record.session_id = std::move(session_id);
-  record.original_inputs = inputs;
+  record.original_inputs = std::move(original_inputs);
+  record.vlm_params = std::move(vlm_params);
+  record.vlm_metadata = std::move(vlm_metadata);
   record.public_info.request_id = request_id;
   record.public_info.state = "running";
   record.public_info.current_stage = kAsrStageId;
@@ -408,38 +429,50 @@ void UnifiedEngine::drain_dispatch() {
   std::unique_lock<std::mutex> lock(mu_);
   if (dispatching_) return;
   dispatching_ = true;
-  try {
-    while (!dispatch_queue_.empty()) {
-      DispatchItem item = std::move(dispatch_queue_.front());
-      dispatch_queue_.pop_front();
-      lock.unlock();
-      if (const auto* event = std::get_if<UnifiedEvent>(&item)) {
-        const bool terminal = event->kind == UnifiedEvent::Kind::kComplete ||
-                              event->kind == UnifiedEvent::Kind::kError ||
-                              event->kind == UnifiedEvent::Kind::kCancelled;
+  std::exception_ptr first_error;
+  while (!dispatch_queue_.empty()) {
+    DispatchItem item = std::move(dispatch_queue_.front());
+    dispatch_queue_.pop_front();
+    lock.unlock();
+    if (const auto* event = std::get_if<UnifiedEvent>(&item)) {
+      const bool terminal = event->kind == UnifiedEvent::Kind::kComplete ||
+                            event->kind == UnifiedEvent::Kind::kError ||
+                            event->kind == UnifiedEvent::Kind::kCancelled;
+      try {
         if (on_event) on_event(*event);
+      } catch (...) {
+        if (!first_error) first_error = std::current_exception();
+      }
+      try {
         if (terminal && on_terminal) on_terminal(*event);
-        if (terminal) cv_.notify_all();
-      } else if (const auto* msg = std::get_if<StreamMessage>(&item)) {
-        // Never call a foreign sink under mu_: it may reenter info() or cancel().
+      } catch (...) {
+        if (!first_error) first_error = std::current_exception();
+      }
+      if (terminal) cv_.notify_all();
+    } else if (const auto* msg = std::get_if<StreamMessage>(&item)) {
+      // Never call a foreign sink under mu_: it may reenter info() or cancel().
+      try {
         if (callback_gate_->previous_stream) {
           callback_gate_->previous_stream(*msg);
         }
-      } else {
-        const auto& info = std::get<RequestInfo>(item);
+      } catch (...) {
+        if (!first_error) first_error = std::current_exception();
+      }
+    } else {
+      const auto& info = std::get<RequestInfo>(item);
+      try {
         if (callback_gate_->previous_complete) {
           callback_gate_->previous_complete(info);
         }
+      } catch (...) {
+        if (!first_error) first_error = std::current_exception();
       }
-      lock.lock();
     }
-  } catch (...) {
-    if (!lock.owns_lock()) lock.lock();
-    dispatching_ = false;
-    throw;
+    lock.lock();
   }
   // The queue is empty and mu_ is held, so no producer can race this reset.
   dispatching_ = false;
+  if (first_error) std::rethrow_exception(first_error);
 }
 
 Value UnifiedEngine::build_vlm_inputs(const std::string& transcript,
@@ -447,7 +480,8 @@ Value UnifiedEngine::build_vlm_inputs(const std::string& transcript,
   Value::Map out;
   if (original_inputs.is_map()) {
     for (const auto& [key, value] : original_inputs.as_map()) {
-      if (key != "messages" && key != "modalities" && key != "session_id") {
+      if (key != "messages" && key != "modalities" && key != "session_id" &&
+          key != "audio") {
         out[key] = value;
       }
     }
@@ -474,6 +508,8 @@ void UnifiedEngine::start_vlm_locked(const std::string& request_id,
   vlm_payload.request_id = record.vlm_id;
   vlm_payload.request.inputs =
       build_vlm_inputs(record.transcript, record.original_inputs);
+  vlm_payload.request.params = record.vlm_params;
+  vlm_payload.request.metadata = record.vlm_metadata;
   record.phase = Phase::kVlm;
   record.public_info.current_stage = kVlmStageId;
   coordinator_.submit(vlm_payload, config_.vlm_stage);

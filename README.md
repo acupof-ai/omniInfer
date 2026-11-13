@@ -5,11 +5,10 @@ engine is a C++20 control plane with an OpenAI-compatible HTTP/SSE/WebSocket
 surface. Models run in separate worker processes behind ZeroMQ/MessagePack
 control messages.
 
-The engine foundation is implemented for text chat and for a deterministic
-audio test pipeline. The in-process unified ASR -> VLM orchestration contract
-is implemented (`umminfer::UnifiedEngine`) and covered by unit/contract tests;
-real-model end-to-end VLM+ASR is **not implemented**. The figure below marks
-which parts exist.
+The engine foundation is implemented for text chat, a deterministic audio test
+pipeline, and public ASR -> VLM orchestration. `umminfer::UnifiedEngine` reuses
+the same `Coordinator`, external workers, and HTTP/SSE chat contract. The
+[status table](#status) separates the real H20B audio-only run from unrun gates.
 
 See [roadmap](docs/roadmap.md) for phases and acceptance gates, and
 [validation](docs/validation.md) for the user journeys that exist today.
@@ -104,8 +103,8 @@ flowchart TB
   classDef plan fill:#fff8e1,stroke:#f9a825,color:#5d4037
   classDef future fill:#eceff1,stroke:#78909c,color:#37474f
 
-  class CLI,CPP,SWIFT,HTTP,WS,COORD,ZMQ,SHM,CUDA,UP,MLXW,TCTCW done
-  class SESSION,ASRW,VLMW,IMGW,VIDW plan
+  class CLI,CPP,SWIFT,HTTP,WS,COORD,ZMQ,SHM,CUDA,UP,MLXW,TCTCW,SESSION,ASRW,VLMW done
+  class IMGW,VIDW plan
   class EXPORT,REWARD,TRAIN future
 ```
 
@@ -118,6 +117,10 @@ and their only routes are the proxy.
 Local text or audio:
 CLI/public API/Swift -> HTTP or WS -> Coordinator -> ZeroMQ
   -> external Python stage (MLX-LM or TinyCTC) -> model -> ZeroMQ -> client
+
+Unified audio:
+CLI/public HTTP -> OpenAIApi -> UnifiedEngine -> Coordinator -> ZeroMQ
+  -> Qwen ASR -> final transcript -> Qwen Omni -> HTTP/SSE
 
 Fixed upstream (no Coordinator use):
 CLI/public API -> HTTP -> one configured upstream -> client
@@ -144,12 +147,12 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | Native macOS client | `clients/ummmlx` | Implemented; text chat only |
 | Bearer authentication | `serve --api-key` | Implemented |
 | Image generation and edit, video jobs | `image`, `video`, `/v1/images/*`, `/v1/videos*` | Fixed upstream proxy only |
-| Trained ASR worker | — | Not implemented |
-| Real VLM worker | — | Not implemented |
-| Cross-model orchestration (for example ASR to VLM) | `UnifiedEngine` | Contract implemented; unit/contract tested, no real-model E2E |
-| Shared session across modalities | — | Not implemented |
-| Unified multimodal end-to-end acceptance | — | Not run |
-| H20B verification | — | BLOCKED; jump host authentication fails |
+| Trained ASR worker | `umminfer_qwen_asr_stage.py` | Real `qwen3-asr` transcription verified on H20B |
+| Real VLM worker | `umminfer_qwen_omni_worker.py` | Real `qwen3-omni` streamed text verified on H20B; image input `NOT_COVERED` |
+| Cross-model orchestration | `UnifiedEngine`, `serve --vlm-entry-endpoint` | Public HTTP/SSE and real CLI ASR -> VLM verified on H20B |
+| Shared session across modalities | — | `NOT_COVERED` |
+| Unified multimodal end-to-end acceptance | `chat --audio`, `/v1/chat/completions` | Partial: real H20B audio-only success, cancel, failure, and recovery; full Phase 2/3 gates `NOT_COVERED` |
+| H20B verification | Two SGLang workers | Accessible; Qwen ASR GPU 1 and Qwen Omni GPU 0 verified; CUDA build/IPC/sanitizer/stress `NOT_COVERED` |
 
 TinyCTC has deterministic initialized weights; it is not a speech recognizer.
 The MLX-LM chat path is text-only inference, not a VLM. The Mac and H20B
@@ -358,6 +361,91 @@ Conditions that limit the claim:
   `tests/mlx_prompt_cache_perf.py` (direct MLX-LM A/B) and `tests/mlx_perf.py`
   (general comparison). Their gates are in [MLX backend](docs/mlx.md).
 
+## Run real Qwen ASR -> VLM
+
+`serve --vlm-entry-endpoint` connects the existing public chat route to
+`UnifiedEngine`. The same `Coordinator` submits the ASR leg and then the VLM
+leg. There is no second engine or transport protocol. The two SGLang backends
+must already serve `qwen3-asr` and `qwen3-omni` on the configured loopback URLs.
+
+```sh
+IPC=$(mktemp -d /tmp/umminfer-qwen-unified.XXXXXX)
+
+python3 -I python/umminfer_qwen_asr_stage.py serve \
+  --name asr --recv "ipc://$IPC/asr" \
+  --coordinator "ipc://$IPC/done" --abort "ipc://$IPC/abort" \
+  --model qwen3-asr --backend-url http://127.0.0.1:43100
+
+python3 -I python/umminfer_qwen_omni_worker.py \
+  --name vlm --recv "ipc://$IPC/vlm" \
+  --coordinator "ipc://$IPC/done" --abort "ipc://$IPC/abort" \
+  --upstream-base-url http://127.0.0.1:43101/v1 \
+  --upstream-model qwen3-omni
+
+./zig-out/bin/umm-infer serve --host 127.0.0.1 --port 43200 \
+  --model qwen3-unified --entry asr --entry-endpoint "ipc://$IPC/asr" \
+  --vlm-entry vlm --vlm-entry-endpoint "ipc://$IPC/vlm" \
+  --completion "ipc://$IPC/done" --abort "ipc://$IPC/abort"
+
+./zig-out/bin/umm-infer chat --url http://127.0.0.1:43200/v1 \
+  --model qwen3-unified --audio speech.wav --prompt '' \
+  --stream --max-tokens 128 --temperature 0
+```
+
+The public request accepts exactly one WAV `input_audio` part and no additional
+text, image, or video part in this mode. WAV must be PCM16, mono, 16 kHz. ASR
+runs as one non-streaming request. Its final transcript becomes the VLM user
+message. The VLM keeps the public sampling and streaming parameters.
+
+SSE remains `chat.completion.chunk`. A chunk can carry a `unified` object with
+`kind`, `stage`, `seq`, `session_id`, `is_final`, and `text`. Assistant `content`
+contains VLM output only; the ASR transcript is in the `asr_final` metadata.
+`/ready` requires both workers. `/abort` cancels the unified request, and
+`/health.in_flight` reports unified requests in this mode.
+
+The Qwen Omni worker's optional `--log-requests` records the messages it actually
+received. It is intended for validation and is off by default.
+
+### H20B run recorded on 2026-11-13
+
+The verified path was real CLI/public HTTP on `127.0.0.1:43200` ->
+`umm-infer` -> `UnifiedEngine` -> local Qwen workers -> SSH forwards
+`43100`/`43101` -> SGLang in container `linyu-dev`. ASR used served model
+`qwen3-asr` on H20 GPU 1, port 31000. Omni used served model `qwen3-omni` on H20
+GPU 0, port 31001. Their architectures were
+`Qwen3ASRForConditionalGeneration` and `Qwen3OmniMoeForConditionalGeneration`.
+Omni config declared `bfloat16`. Both source revisions are `UNKNOWN`: the local
+model configs contain no commit hash.
+
+The real run produced these results:
+
+| Case | Result | Total time |
+| --- | --- | ---: |
+| English public SSE | Exact reference transcript; `asr_final` before VLM deltas; one `complete`; non-empty answer about solo versus songwriting work | 7.836791 s |
+| Cancel after Chinese ASR final while VLM was busy | `cancelled` only; no `http-3:vlm` execution; `in_flight=0` | 0.640713 s |
+| ASR rejects `max_new_tokens=4097` | One ASR `error`; no `http-4:vlm` execution; `in_flight=0` | 0.044947 s |
+| Chinese public SSE after the failure | Exact reference transcript; one `complete`; non-empty answer explaining near-stagnant trading | 7.797376 s |
+| Real CLI with the same Chinese WAV | Exit 0 and non-empty answer through `req-1:vlm` | 7.73 s |
+
+The English answer's named artists are speculative and are not verified facts;
+the recorded topic is consistent with the transcript. The Chinese answer directly
+explains the transcript. Full texts are retained for review rather than reduced
+to a keyword assertion. Final GPU memory was 88581 MiB on GPU 0 and 86167 MiB on
+GPU 1.
+
+Input SHA256 values were
+`46dbc998c9d1d48111267c40741dd3200f2e5bcf4075f8c4c97f4451160dce50`
+for `asr_zh.wav`, and
+`64fbd9f7ecafc160ba457595570f4a8b338f10e16acc0933be30aedc7eedf86d`
+for the English PCM16/16 kHz transcode of the supplied real recording. Local
+run evidence is under `/tmp/umminfer-integration-logs/h20b-final/`; it is not a
+committed artifact. `SHA256SUMS` records the evidence hashes.
+
+These cases remain `NOT_COVERED`: incremental ASR partials, realtime partials,
+GPU-side abort confirmation, session reuse, joint image+audio input, and natural
+`real_control_frame_interleaving`. Audio-only evidence does not complete every
+Phase 2 or Phase 3 gate.
+
 ## Run the audio test pipeline
 
 Generate a new TinyCTC model directory, then use separate terminals:
@@ -499,10 +587,11 @@ Rules of this mode:
   The process still constructs a Coordinator, but no proxy request uses it.
 - `/ready` answers 200 immediately when no entry stage is configured.
 
-The CLI multimodal flags need this mode. `chat --image-url`, `--video-url`,
-`--audio`, and `--audio-out` send content parts that the local MLX path rejects;
-they work only against an `omni` upstream. `image generate`, `image edit`, and
-the `video` subcommands need an `image` or `video` upstream.
+The CLI multimodal flags need a capable backend. `chat --audio` works in the
+unified local mode above or against an `omni` upstream. `--audio-out` needs an
+`omni` upstream. Image and video input need an `omni` upstream; local unified
+image input is `NOT_COVERED`. `image generate`, `image edit`, and the `video`
+subcommands need an `image` or `video` upstream.
 
 The default test suite checks configuration validation, route gating, error
 mapping, and credential scrubbing against a real local server with an
@@ -558,11 +647,13 @@ include/umminfer/{audio,client,proto,relay,comm,scheduling,pipeline,serve}
 src/{audio,client,proto,relay,comm,scheduling,pipeline,serve}
 src/main.cpp
 python/{umminfer_mlx_stage.py,umminfer_tiny_asr_stage.py}
+python/{umminfer_qwen_asr_stage.py,umminfer_qwen_omni_worker.py}
 clients/ummmlx/
 tests/self_check.cpp
 tests/compat/{wire_compat.cpp,runtime_compat.cpp}
 tests/{cuda_ipc_test.cpp,cuda_pipeline_test.cpp,cuda_bench.cpp}
 tests/{omni_client_test.cpp,omni_serve_test.cpp,omni_transport_test.cpp}
+tests/{unified_contract_test.cpp,qwen_asr_stage_test.py,qwen_omni_worker_test.py}
 tests/{cuda_stress.py,cuda_sanitize.py,http_smoke.py,tla_test.py}
 tests/{client_smoke.py,client_retry_e2e.py,client_boundary_e2e.py}
 tests/{realtime_contract_e2e.py,realtime_client_contract_e2e.py}

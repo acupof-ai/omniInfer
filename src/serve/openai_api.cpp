@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include "umminfer/client/client.hpp"
+#include "umminfer/pipeline/unified.hpp"
 #include "asr_common.hpp"
 #include "client/http.hpp"
 
@@ -22,6 +23,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <variant>
 #include <vector>
 
 namespace umminfer {
@@ -146,20 +148,30 @@ std::string result_finish_reason(const Value& result) {
   return reason->as_str();
 }
 
+using SseItem = std::variant<Value, UnifiedEvent>;
+
 struct SseSink {
   std::mutex mu;
   std::condition_variable cv;
-  std::deque<Value> chunks;
+  std::deque<SseItem> chunks;
   bool done = false;
   bool has_deltas = false;
   std::string error;
   std::string finish_reason;
+  std::optional<UnifiedEvent> terminal;
 
   void push(Value v, bool delta = false) {
     {
       std::lock_guard<std::mutex> lock(mu);
       has_deltas = has_deltas || delta;
-      chunks.push_back(std::move(v));
+      chunks.emplace_back(std::move(v));
+    }
+    cv.notify_all();
+  }
+  void push(UnifiedEvent event) {
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      chunks.emplace_back(std::move(event));
     }
     cv.notify_all();
   }
@@ -171,7 +183,7 @@ struct SseSink {
     }
     cv.notify_all();
   }
-  bool pop(Value& out, double timeout_s) {
+  bool pop(SseItem& out, double timeout_s) {
     std::unique_lock<std::mutex> lock(mu);
     if (!cv.wait_for(lock, std::chrono::duration<double>(timeout_s),
                      [this] { return !chunks.empty() || done; })) {
@@ -183,6 +195,61 @@ struct SseSink {
     return true;
   }
 };
+
+json unified_event_json(const UnifiedEvent& event) {
+  return {{"kind", to_string(event.kind)},
+          {"stage", event.stage_id},
+          {"seq", event.seq},
+          {"session_id", event.session_id},
+          {"is_final", event.is_final},
+          {"text", event.text}};
+}
+
+// The public chat schema carries WAV base64; the real ASR worker carries PCM16
+// binary in MessagePack. Convert only at the existing HTTP boundary.
+bool unified_audio_pcm(const json& body, std::string& pcm, std::string& error) {
+  size_t audio_count = 0;
+  try {
+    for (const auto& message : body["messages"]) {
+      const json& content = message["content"];
+      if (!content.is_array()) {
+        error = "unified chat requires one input_audio content part and no text content";
+        return false;
+      }
+      for (const auto& part : content) {
+        if (!part.is_object() || !part.contains("type") || !part["type"].is_string() ||
+            part["type"] != "input_audio") {
+          error = "unified chat supports input_audio parts only";
+          return false;
+        }
+        ++audio_count;
+        if (!part.contains("input_audio") || !part["input_audio"].is_object() ||
+            !part["input_audio"].contains("data") ||
+            !part["input_audio"]["data"].is_string() ||
+            !part["input_audio"].contains("format") ||
+            !part["input_audio"]["format"].is_string()) {
+          error = "input_audio part requires input_audio.data and format";
+          return false;
+        }
+        if (part["input_audio"]["format"] != "wav") {
+          error = "unified ASR accepts WAV input_audio only";
+          return false;
+        }
+        const std::string wav = client::detail::base64_decode(
+            part["input_audio"]["data"].get<std::string>(), 32u << 20);
+        pcm = client::pcm16_from_wav(wav);
+      }
+    }
+  } catch (const std::exception& exc) {
+    error = exc.what();
+    return false;
+  }
+  if (audio_count != 1 || pcm.empty()) {
+    error = "unified chat requires exactly one nonempty input_audio part";
+    return false;
+  }
+  return true;
+}
 
 // ---- Fixed-upstream proxy -------------------------------------------------
 
@@ -461,15 +528,20 @@ class OpenAIApi::Impl {
         });
 
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
-      json body = {{"status", "ok"}, {"in_flight", coordinator_.in_flight()}};
+      const size_t in_flight = unified_engine_ ? unified_engine_->in_flight()
+                                               : coordinator_.in_flight();
+      json body = {{"status", "ok"}, {"in_flight", in_flight}};
       res.set_content(body.dump(), "application/json");
     });
 
     // Admission only: 503 until the configured external entry stage has sent
     // stage_ready. This is not a heartbeat and not a liveness probe.
     server_.Get("/ready", [this](const httplib::Request&, httplib::Response& res) {
-      const bool ready = !config_.external_entry_stage ||
-                         coordinator_.stage_ready(config_.entry_stage);
+      const bool entry_ready = !config_.external_entry_stage ||
+                               coordinator_.stage_ready(config_.entry_stage);
+      const bool ready = entry_ready &&
+                         (!unified_engine_ ||
+                          coordinator_.stage_ready(unified_vlm_stage_));
       res.status = ready ? 200 : 503;
       res.set_content(ready ? R"({"status":"ready"})" : R"({"status":"starting"})",
                       "application/json");
@@ -584,7 +656,10 @@ class OpenAIApi::Impl {
                         "application/json");
         return;
       }
-      coordinator_.abort(body["request_id"].get<std::string>());
+      const std::string request_id = body["request_id"].get<std::string>();
+      if (!unified_engine_ || !unified_engine_->cancel(request_id)) {
+        coordinator_.abort(request_id);
+      }
       res.set_content(R"({"success":true})", "application/json");
     });
 
@@ -627,7 +702,34 @@ class OpenAIApi::Impl {
 
   int bound_port() const { return bound_port_; }
 
+  void set_unified_engine(UnifiedEngine& engine, std::string vlm_stage) {
+    unified_engine_ = &engine;
+    unified_vlm_stage_ = std::move(vlm_stage);
+    engine.on_event = [this](const UnifiedEvent& event) { on_unified_event(event); };
+  }
+
  private:
+  std::string submit_chat(StagePayload payload) {
+    if (unified_engine_) return unified_engine_->submit(std::move(payload));
+    return coordinator_.submit(std::move(payload), config_.entry_stage);
+  }
+  bool wait_chat(const std::string& request_id, double timeout_s) {
+    return unified_engine_ ? unified_engine_->wait(request_id, timeout_s)
+                           : coordinator_.wait(request_id, timeout_s);
+  }
+  std::optional<RequestInfo> info_chat(const std::string& request_id) {
+    return unified_engine_ ? unified_engine_->info(request_id)
+                           : coordinator_.info(request_id);
+  }
+  void cancel_chat(const std::string& request_id) {
+    if (unified_engine_) unified_engine_->cancel(request_id);
+    else coordinator_.abort(request_id);
+  }
+  void release_chat(const std::string& request_id) {
+    if (unified_engine_) unified_engine_->release(request_id);
+    else coordinator_.release(request_id);
+  }
+
   void handle_transcription(const httplib::Request& req, httplib::Response& res) {
     auto reject = [&res](int status, const std::string& message) {
       res.status = status;
@@ -948,6 +1050,15 @@ class OpenAIApi::Impl {
     Value::Map inputs;
     try {
       inputs["messages"] = json_to_value(body["messages"]);
+      if (unified_engine_) {
+        std::string pcm;
+        std::string error;
+        if (!unified_audio_pcm(body, pcm, error)) {
+          reject(error);
+          return;
+        }
+        inputs["audio"] = Value::bin(std::move(pcm));
+      }
     } catch (const std::exception& exc) {
       reject(exc.what());
       return;
@@ -964,7 +1075,7 @@ class OpenAIApi::Impl {
     if (!stream) {
       std::string request_id;
       try {
-        request_id = coordinator_.submit(std::move(payload), config_.entry_stage);
+        request_id = submit_chat(std::move(payload));
       } catch (const std::exception& exc) {
         res.status = 503;
         res.set_content(
@@ -981,23 +1092,23 @@ class OpenAIApi::Impl {
         if (remaining <= std::chrono::steady_clock::duration::zero()) break;
         const double wait_s = std::min(
             0.1, std::chrono::duration<double>(remaining).count());
-        settled = coordinator_.wait(request_id, wait_s);
+        settled = wait_chat(request_id, wait_s);
       }
       if (req.is_connection_closed()) {
-        coordinator_.abort(request_id);
-        coordinator_.release(request_id);
+        cancel_chat(request_id);
+        release_chat(request_id);
         return;
       }
-      auto info = coordinator_.info(request_id);
+      auto info = info_chat(request_id);
       if (!settled || !info) {
-        coordinator_.abort(request_id);
-        coordinator_.release(request_id);
+        cancel_chat(request_id);
+        release_chat(request_id);
         res.status = 504;
         res.set_content(json{{"error", {{"message", "request timed out"}}}}.dump(),
                         "application/json");
         return;
       }
-      coordinator_.release(request_id);
+      release_chat(request_id);
       if (info->state != "completed") {
         res.status = 500;
         res.set_content(
@@ -1030,7 +1141,7 @@ class OpenAIApi::Impl {
       streams_[request_id] = sink;
     }
     try {
-      coordinator_.submit(std::move(payload), config_.entry_stage);
+      submit_chat(std::move(payload));
     } catch (const std::exception& exc) {
       {
         std::lock_guard<std::mutex> lock(streams_mu_);
@@ -1046,12 +1157,12 @@ class OpenAIApi::Impl {
     // httplib may destroy a response without invoking its content provider.
     // The last provider copy therefore owns request cleanup as well.
     auto cleanup = std::shared_ptr<void>(nullptr, [this, request_id](void*) {
-      coordinator_.abort(request_id);
+      cancel_chat(request_id);
       {
         std::lock_guard<std::mutex> lock(streams_mu_);
         streams_.erase(request_id);
       }
-      coordinator_.release(request_id);
+      release_chat(request_id);
     });
     const std::string model = config_.served_model_name;
     res.set_chunked_content_provider(
@@ -1069,11 +1180,12 @@ class OpenAIApi::Impl {
                            {"choices", {{{"index", 0},
                                         {"delta", {{"role", "assistant"}}},
                                         {"finish_reason", nullptr}}}}})) {
-            coordinator_.abort(request_id);
+            cancel_chat(request_id);
             return false;
           }
           std::string stream_error;
           std::string finish;
+          std::optional<UnifiedEvent> terminal;
           bool settled = false;
           bool disconnected = false;
           const auto timeout = std::chrono::duration<double>(config_.request_timeout_s);
@@ -1090,15 +1202,28 @@ class OpenAIApi::Impl {
               stream_error = "stream timed out";
               break;
             }
-            Value chunk;
-            if (sink->pop(chunk, std::min(0.2, remaining))) {
-              if (!send_chunk({{"id", request_id},
-                               {"object", "chat.completion.chunk"},
-                               {"created", created},
-                               {"model", model},
-                               {"choices", {{{"index", 0},
-                                             {"delta", {{"content", result_text(chunk)}}},
-                                             {"finish_reason", nullptr}}}}})) {
+            SseItem item;
+            if (sink->pop(item, std::min(0.2, remaining))) {
+              json chunk_body = {{"id", request_id},
+                                 {"object", "chat.completion.chunk"},
+                                 {"created", created},
+                                 {"model", model}};
+              if (const auto* chunk = std::get_if<Value>(&item)) {
+                chunk_body["choices"] = {{{"index", 0},
+                                          {"delta", {{"content", result_text(*chunk)}}},
+                                          {"finish_reason", nullptr}}};
+              } else {
+                const auto& event = std::get<UnifiedEvent>(item);
+                json delta = json::object();
+                if (event.kind == UnifiedEvent::Kind::kVlmDelta) {
+                  delta["content"] = event.text;
+                }
+                chunk_body["choices"] = {{{"index", 0},
+                                          {"delta", std::move(delta)},
+                                          {"finish_reason", nullptr}}};
+                chunk_body["unified"] = unified_event_json(event);
+              }
+              if (!send_chunk(chunk_body)) {
                 disconnected = true;
                 break;
               }
@@ -1111,26 +1236,31 @@ class OpenAIApi::Impl {
               if (settled) {
                 stream_error = sink->error;
                 finish = sink->finish_reason;
+                terminal = sink->terminal;
               }
             }
             if (settled) break;
           }
-          if (!settled) coordinator_.abort(request_id);
+          if (!settled) cancel_chat(request_id);
           if (!disconnected) {
             if (stream_error.empty()) {
-              send_chunk({{"id", request_id},
-                          {"object", "chat.completion.chunk"},
-                          {"created", created},
-                          {"model", model},
-                          {"choices", {{{"index", 0},
-                                        {"delta", json::object()},
-                                        {"finish_reason", finish.empty()
-                                                              ? json(nullptr)
-                                                              : json(finish)}}}}});
+              json final_chunk = {{"id", request_id},
+                                  {"object", "chat.completion.chunk"},
+                                  {"created", created},
+                                  {"model", model},
+                                  {"choices", {{{"index", 0},
+                                                {"delta", json::object()},
+                                                {"finish_reason", finish.empty()
+                                                                      ? json(nullptr)
+                                                                      : json(finish)}}}}};
+              if (terminal) final_chunk["unified"] = unified_event_json(*terminal);
+              send_chunk(final_chunk);
             } else {
-              send_chunk({{"error", {{"message", stream_error},
-                                      {"type", "generation_error"},
-                                      {"code", 500}}}});
+              json error_chunk = {{"error", {{"message", stream_error},
+                                             {"type", "generation_error"},
+                                             {"code", 500}}}};
+              if (terminal) error_chunk["unified"] = unified_event_json(*terminal);
+              send_chunk(error_chunk);
             }
             static const std::string kDone = "data: [DONE]\n\n";
             out_sink.write(kDone.data(), kDone.size());
@@ -1838,8 +1968,52 @@ class OpenAIApi::Impl {
   }
 
  public:
+  void on_unified_event(const UnifiedEvent& event) {
+    std::shared_ptr<SseSink> sink;
+    {
+      std::lock_guard<std::mutex> lock(streams_mu_);
+      auto it = streams_.find(event.request_id);
+      if (it != streams_.end()) sink = it->second;
+      const bool terminal = event.kind == UnifiedEvent::Kind::kComplete ||
+                            event.kind == UnifiedEvent::Kind::kError ||
+                            event.kind == UnifiedEvent::Kind::kCancelled;
+      if (terminal && it != streams_.end()) streams_.erase(it);
+    }
+    if (!sink) return;
+    if (event.kind == UnifiedEvent::Kind::kAsrPartial ||
+        event.kind == UnifiedEvent::Kind::kAsrFinal ||
+        event.kind == UnifiedEvent::Kind::kVlmDelta) {
+      if (event.kind == UnifiedEvent::Kind::kVlmDelta) {
+        std::lock_guard<std::mutex> lock(sink->mu);
+        sink->has_deltas = true;
+      }
+      sink->push(event);
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(sink->mu);
+      sink->terminal = event;
+    }
+    if (event.kind == UnifiedEvent::Kind::kComplete) {
+      bool has_deltas;
+      {
+        std::lock_guard<std::mutex> lock(sink->mu);
+        has_deltas = sink->has_deltas;
+        sink->finish_reason = result_finish_reason(event.result);
+      }
+      if (!has_deltas) sink->push(event.result);
+      sink->finish();
+      return;
+    }
+    sink->finish(event.error.empty() ? std::string("request ") + to_string(event.kind)
+                                     : event.error);
+  }
+
   // The coordinator calls this for each stream chunk of a request.
   void on_stream(const StreamMessage& msg) {
+    // Unified events already passed through on_unified_event. The parent ASR
+    // completion is not the public terminal and must not close the SSE stream.
+    if (unified_engine_ && unified_engine_->info(msg.request_id)) return;
     std::shared_ptr<SseSink> sink;
     {
       std::lock_guard<std::mutex> lock(streams_mu_);
@@ -1850,6 +2024,7 @@ class OpenAIApi::Impl {
   }
 
   void on_complete(const RequestInfo& info) {
+    if (unified_engine_ && unified_engine_->info(info.request_id)) return;
     std::shared_ptr<SseSink> sink;
     {
       std::lock_guard<std::mutex> lock(streams_mu_);
@@ -1879,6 +2054,8 @@ class OpenAIApi::Impl {
 
  private:
   Coordinator& coordinator_;
+  UnifiedEngine* unified_engine_ = nullptr;
+  std::string unified_vlm_stage_;
   ApiConfig config_;
   std::string upstream_base_url_;
   httplib::Server server_;
@@ -1897,6 +2074,10 @@ OpenAIApi::OpenAIApi(Coordinator& coordinator, ApiConfig config)
 }
 
 OpenAIApi::~OpenAIApi() = default;
+
+void OpenAIApi::set_unified_engine(UnifiedEngine& engine, std::string vlm_stage) {
+  impl_->set_unified_engine(engine, std::move(vlm_stage));
+}
 
 bool OpenAIApi::bind() { return impl_->bind(); }
 bool OpenAIApi::listen() { return impl_->listen(); }

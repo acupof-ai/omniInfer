@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "umminfer/pipeline/pipeline.hpp"
+#include "umminfer/pipeline/unified.hpp"
 #include "umminfer/serve/openai_api.hpp"
 #include "umminfer/serve/realtime_api.hpp"
 #include "client/cli.hpp"
@@ -53,7 +54,8 @@ CommandOptions command_options(const std::string& command) {
   if (command == "serve") {
     return {{"port", "host", "model", "api-key", "entry", "entry-endpoint", "completion",
              "abort", "realtime-port", "ipc-dir", "upstream-kind", "upstream-base-url",
-             "upstream-model", "upstream-api-key", "upstream-variant"},
+             "upstream-model", "upstream-api-key", "upstream-variant", "vlm-entry",
+             "vlm-entry-endpoint"},
             {"demo"},
             {}};
   }
@@ -183,6 +185,7 @@ void print_usage(std::ostream& out) {
          "[--api-key K]\n"
       << "      [--entry name --entry-endpoint ipc:///tmp/x/in] "
          "[--completion ipc:///tmp/x/done] [--abort ipc:///tmp/x/abort]\n"
+         "      [--vlm-entry name --vlm-entry-endpoint ipc:///tmp/x/vlm]  ASR -> VLM chat\n"
          "      [--realtime-port 30001]  enable the ASR WebSocket listener\n"
       << "      [--demo]  run one in-process echo stage (development only)\n"
       << "  umm-infer stage --name N --recv EP --coordinator EP --abort EP "
@@ -299,6 +302,21 @@ int run_serve(const Flags& flags) {
 
   const std::string entry_name = flag(flags, "entry", "entry");
   const std::string entry_ep = flag(flags, "entry-endpoint");
+  const std::string vlm_name = flag(flags, "vlm-entry", "vlm");
+  const std::string vlm_ep = flag(flags, "vlm-entry-endpoint");
+  const bool unified = !vlm_ep.empty();
+  if (flags.count("vlm-entry") && !unified) {
+    std::cerr << "--vlm-entry requires --vlm-entry-endpoint\n";
+    return usage();
+  }
+  if (unified && fixed_upstream) {
+    std::cerr << "--vlm-entry-endpoint cannot be combined with a fixed upstream\n";
+    return usage();
+  }
+  if (unified && (vlm_name == entry_name || vlm_ep == entry_ep)) {
+    std::cerr << "unified ASR and VLM stages must have distinct names and endpoints\n";
+    return usage();
+  }
   // A fixed-upstream process serves only the upstream. Without an entry
   // endpoint it runs no local stage, so nothing is registered and /ready can
   // answer at once.
@@ -339,6 +357,18 @@ int run_serve(const Flags& flags) {
   if (!entry_ep.empty()) {
     ensure_ipc_parent(entry_ep);
     coordinator.register_stage(entry_name, entry_ep, true);
+  }
+  if (unified) {
+    ensure_ipc_parent(vlm_ep);
+    coordinator.register_stage(vlm_name, vlm_ep, true);
+  }
+  std::unique_ptr<UnifiedEngine> unified_engine;
+  if (unified) {
+    UnifiedConfig unified_config;
+    unified_config.asr_stage = entry_name;
+    unified_config.vlm_stage = vlm_name;
+    unified_engine = std::make_unique<UnifiedEngine>(coordinator, unified_config);
+    api.set_unified_engine(*unified_engine, vlm_name);
   }
   coordinator.start();
   std::thread coordinator_thread([&] { coordinator.run(); });

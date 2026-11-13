@@ -33,6 +33,24 @@ external dependency, such as hardware access or credentials, is missing.
 [Validation](validation.md) uses `BLOCKED` and `NOT_COVERED` for the same
 purpose.
 
+### Current integration status — 2026-11-13
+
+Phases 0–3 are **partial**, not complete. The integrated branch exposes the
+existing public chat route through `UnifiedEngine` to real Qwen ASR and Qwen
+Omni workers. On H20B, public HTTP/SSE and the real CLI completed ASR -> VLM with
+real Chinese and English recordings. The recorded run also passed a cancel after
+ASR final with no VLM execution, an ASR failure with no VLM execution, and a
+successful later request. Event order, parent/child request ids, one terminal,
+and `in_flight=0` are in `/tmp/umminfer-integration-logs/h20b-final/`.
+
+The remaining gates are explicit: incremental ASR partials, realtime partials,
+GPU abort confirmation, natural `real_control_frame_interleaving`, session reuse,
+joint image+audio input, and the Mac unified profile are `NOT_COVERED`. Model
+revisions are `UNKNOWN`; weights hashes, full resource attribution, and output
+reproducibility are not a complete Phase 3 record. CUDA build, IPC, sanitizer,
+and stress are separate `NOT_COVERED` rows. No full Phase 2 or Phase 3 claim is
+made.
+
 ### Phase 0 — Contract and orchestration
 
 **Goal.** Define the worker and session contract before adding model code.
@@ -144,7 +162,7 @@ models, on the named hardware, with the Phase 0 contract in force.
 | --- | --- |
 | Path | CLI or public API to ummInfer server to real workers to real models to decoded artifact. A direct backend run is supporting evidence only. |
 | Mac profile | Low-resource real-model run completes and its artifact decodes. |
-| H20B profile | High-precision run completes and its artifact decodes. The row stays `BLOCKED` until access exists; the phase is not complete with it unrun. |
+| H20B profile | High-precision run completes and its artifact decodes. The 2026-11-13 audio-only run is evidence for the public path, but it does not complete the full profile or its record requirements. |
 | Reproducibility | The recorded parameters reproduce the recorded artifact hash, or the difference is explained. |
 | Status honesty | Any unrun modality or model is recorded `BLOCKED` or `NOT_RUN`. |
 
@@ -270,50 +288,43 @@ model acceptance, and a simulator never replaces the real model.
 
 ### H20B status
 
-**BLOCKED / NOT_RUN.** Access fails at the jump host because Kerberos
-authentication is denied (GSSAPI) after the ticket expired. No H20B run for the
-unified engine exists: no CUDA execution, CUDA IPC run, sanitizer run, stress
-run, or BF16 baseline is recorded for this revision.
+**ACCESSIBLE; real Qwen worker and unified audio-only runs recorded.** The H20B
+container `linyu-dev` served `qwen3-asr` on GPU 1, port 31000, and `qwen3-omni`
+on GPU 0, port 31001. The final path used public CLI/HTTP -> `umm-infer` ->
+`UnifiedEngine` -> both external workers -> those SGLang backends. The final
+snapshot used 88581 MiB on GPU 0 and 86167 MiB on GPU 1. Model revisions are
+`UNKNOWN`; the Omni config declares `bfloat16`.
 
-Two earlier facts do not change this status:
-
-- An earlier round ran CUDA stress and IPC benchmarks on H20 hardware for the
-  relay work. That covers the relay, not a VLM, ASR, or unified-engine model run.
-- No live H3, H3-Image, or Qwen-Omni run exists on any host. Each attempt prints
-  `BLOCKED` because the live opt-in and credentials are absent.
-
-A BLOCKED status is not a pass. An H20B result counts only when a run produces a
-log with a real exit code, the recorded environment, and a decoded artifact.
-Restoring access needs a fresh Kerberos ticket from the account owner; naming
-another high-precision host is the project owner's decision. Mac rows of a gate
-can pass while H20B rows are `BLOCKED`, but a phase that needs both profiles is
-not complete in that state.
+The 2026-11-13 evidence directory is
+`/tmp/umminfer-integration-logs/h20b-final/`. It contains the topology, model
+metadata, real audio hashes, transcripts, answers, event timings, Worker receive
+logs, cancellation and failure checks, GPU snapshot, and `SHA256SUMS`. The run
+is local evidence, not a committed result artifact. It does not establish CUDA
+build/execution, CUDA IPC, sanitizer, stress, a full BF16 baseline, image input,
+session reuse, or the Mac profile. Those remain `NOT_COVERED`.
 
 ## Next priorities
 
-1. Phase 0: write the session and worker contract, and add the two-worker plan
-   test on the existing MessagePack messages.
-2. Phase 1: add a trained ASR worker with a declared audio format contract and
-   resampling, then a real VLM worker with image input.
-3. Phase 2: bind ASR output to VLM input through one plan and one event stream.
-4. Restore H20B access, then run the Phase 3 H20B profile and the CUDA build,
-   IPC, sanitizer, and stress runs.
-5. Phase 5: record one unified baseline per profile before any joint
-   optimization claim.
-6. Phase 4 and Phase 6 only after the VLM+ASR main path passes its gate.
-7. Keep the fixed-upstream proxy independent of the local engine; it is not an
-   orchestration path.
+1. Add real ASR partial output and realtime partial coverage before marking the
+   streaming gates complete.
+2. Add joint image+audio input and session reuse, then run their Phase 2 gates.
+3. Record model revisions, weights hashes, reproducibility, and complete resource
+   attribution for Phase 3; run the Mac profile separately.
+4. Run the H20B CUDA build, IPC, sanitizer, and stress windows under the existing
+   single-owner rule. These are not established by the Qwen worker run.
+5. Keep the fixed-upstream proxy independent of the local unified path.
 
 ## Explicitly unverified or unsupported
 
 These are not repeated from the README limits list.
 
 - CUDA build, execution, IPC, stress, and compute-sanitizer on any host.
-- H20B access and every H20B result.
+- Incremental ASR partials, realtime partials, GPU abort confirmation, session
+  reuse, joint image+audio input, and the Mac unified profile.
 - Natural WebSocket control-frame interleaving in the continuation regression.
   No stable real-client trigger exists without injecting frames.
 - A first-party HTTP 429 with `Retry-After` from this server.
 - A successful upstream forward through the proxy. The in-tree tests prove
   configuration, route gating, and a connect failure only.
 - Dynamic batching, model usage accounting, and per-worker queue statistics.
-- Unified final integration acceptance across all participants' changes.
+- Full Phase 2/3 acceptance across every modality and hardware profile.

@@ -27,8 +27,12 @@
 #include <vector>
 
 #include "umminfer/comm/comm.hpp"
+#include "umminfer/audio/audio.hpp"
 #include "umminfer/pipeline/pipeline.hpp"
 #include "umminfer/pipeline/unified.hpp"
+#include "umminfer/serve/openai_api.hpp"
+#include "client/http.hpp"
+#include <nlohmann/json.hpp>
 
 using namespace umminfer;
 
@@ -1230,6 +1234,9 @@ struct RetiredSinkProbe {
   bool overlapped = false;
   bool nested = false;
   std::thread::id stream_thread;
+  bool throw_after_stream = false;
+  bool throw_after_complete = false;
+  int stream_calls = 0;
   std::function<void()> stream_action;
   std::promise<void> stream_entered;
   std::future<void> stream_entered_future = stream_entered.get_future();
@@ -1237,26 +1244,34 @@ struct RetiredSinkProbe {
   std::shared_future<void> release_stream_future = release_stream.get_future().share();
 
   void stream(const StreamMessage&) {
+    bool first = false;
     {
       std::lock_guard<std::mutex> lock(mu);
       calls.push_back("stream");
       stream_active = true;
       stream_thread = std::this_thread::get_id();
+      first = ++stream_calls == 1;
     }
-    stream_entered.set_value();
+    if (first) stream_entered.set_value();
     if (stream_action) stream_action();
     release_stream_future.wait();
-    std::lock_guard<std::mutex> lock(mu);
-    stream_active = false;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      stream_active = false;
+    }
+    if (throw_after_stream) throw std::runtime_error("previous stream failed");
   }
 
   void complete(const RequestInfo&) {
-    std::lock_guard<std::mutex> lock(mu);
-    if (stream_active) {
-      overlapped = true;
-      if (std::this_thread::get_id() == stream_thread) nested = true;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      if (stream_active) {
+        overlapped = true;
+        if (std::this_thread::get_id() == stream_thread) nested = true;
+      }
+      calls.push_back("complete");
     }
-    calls.push_back("complete");
+    if (throw_after_complete) throw std::runtime_error("previous complete failed");
   }
 
   size_t call_count() {
@@ -1267,6 +1282,11 @@ struct RetiredSinkProbe {
   void release() { release_stream.set_value(); }
 
   void check_order(const char* tag) {
+    check_order_with_exceptions(tag, {"stream", "complete"});
+  }
+
+  void check_order_with_exceptions(
+      const char* tag, const std::vector<std::string>& expected) {
     std::vector<std::string> order;
     bool saw_overlap = false;
     bool saw_nested = false;
@@ -1279,10 +1299,9 @@ struct RetiredSinkProbe {
     std::cerr << tag << "=";
     for (const auto& call : order) std::cerr << call << ",";
     std::cerr << " OVERLAP=" << saw_overlap << " NESTED=" << saw_nested << "\n";
-    check(order == std::vector<std::string>{"stream", "complete"},
-          "retired forwarded completion overtook the stream callback");
-    check(!saw_overlap, "retired completion overlapped the active stream callback");
-    check(!saw_nested, "retired completion nested inside the stream callback");
+    check(order == expected, "forwarded callback order or drain is wrong");
+    check(!saw_overlap, "forwarded completion overlapped the active stream callback");
+    check(!saw_nested, "forwarded completion nested inside the stream callback");
   }
 };
 
@@ -1402,6 +1421,202 @@ void test_retired_same_thread_reentry() {
   probe.check_order("RETIRED_REENTRANT_ORDER");
 }
 
+// A copied sink reports an exception only after every callback queued ahead of
+// the error has drained. A later copied sink must still be usable.
+void test_retired_reentry_exception_drains() {
+  RetiredSinkProbe probe;
+  Harness h("retiredthrow");
+  h.coordinator.on_stream = [&](const StreamMessage& msg) { probe.stream(msg); };
+  h.coordinator.on_complete = [&](const RequestInfo& info) { probe.complete(info); };
+  auto engine = std::make_unique<UnifiedEngine>(h.coordinator, UnifiedConfig{});
+  const auto copied_stream = h.coordinator.on_stream;
+  const auto copied_complete = h.coordinator.on_complete;
+  engine.reset();
+
+  probe.release();
+  probe.throw_after_stream = true;
+  probe.stream_action = [&] { copied_complete(retired_complete_info()); };
+  bool caught = false;
+  try {
+    copied_stream(retired_stream_message());
+  } catch (const std::runtime_error&) {
+    caught = true;
+  }
+  check(caught, "retired copied sink did not report the previous sink exception");
+  probe.check_order_with_exceptions("RETIRED_EXCEPTION_FIRST_DRAIN",
+                                    {"stream", "complete"});
+
+  probe.stream_action = {};
+  probe.throw_after_stream = false;
+  copied_stream(retired_stream_message());
+  copied_complete(retired_complete_info());
+  probe.check_order_with_exceptions("RETIRED_EXCEPTION_NEXT_SINK",
+                                    {"stream", "complete", "stream", "complete"});
+}
+
+// The active engine drain has the same reentry contract before retirement.
+void test_active_reentry_exception_drains() {
+  RetiredSinkProbe probe;
+  Harness h("activethrow");
+  h.coordinator.on_stream = [&](const StreamMessage& msg) { probe.stream(msg); };
+  h.coordinator.on_complete = [&](const RequestInfo& info) { probe.complete(info); };
+  auto engine = std::make_unique<UnifiedEngine>(h.coordinator, UnifiedConfig{});
+  const auto copied_stream = h.coordinator.on_stream;
+  const auto copied_complete = h.coordinator.on_complete;
+
+  probe.release();
+  probe.throw_after_stream = true;
+  probe.stream_action = [&] { copied_complete(retired_complete_info()); };
+  bool caught = false;
+  try {
+    copied_stream(retired_stream_message());
+  } catch (const std::runtime_error&) {
+    caught = true;
+  }
+  check(caught, "active copied sink did not report the previous sink exception");
+  probe.check_order_with_exceptions("ACTIVE_EXCEPTION_FIRST_DRAIN",
+                                    {"stream", "complete"});
+
+  probe.stream_action = {};
+  probe.throw_after_stream = false;
+  copied_stream(retired_stream_message());
+  copied_complete(retired_complete_info());
+  probe.check_order_with_exceptions("ACTIVE_EXCEPTION_NEXT_SINK",
+                                    {"stream", "complete", "stream", "complete"});
+}
+
+// retire() is a destructor boundary: old sink exceptions are suppressed there,
+// but the queued completion still runs and later copied sinks remain callable.
+void test_destructor_suppresses_previous_sink_exception() {
+  RetiredSinkProbe probe;
+  Harness h("retirethrow");
+  h.coordinator.on_stream = [&](const StreamMessage& msg) { probe.stream(msg); };
+  h.coordinator.on_complete = [&](const RequestInfo& info) { probe.complete(info); };
+  auto engine = std::make_unique<UnifiedEngine>(h.coordinator, UnifiedConfig{});
+  const auto copied_stream = h.coordinator.on_stream;
+  const auto copied_complete = h.coordinator.on_complete;
+
+  std::thread stream_thread([&] { copied_stream(retired_stream_message()); });
+  probe.stream_entered_future.wait();
+  UnifiedEngine* engine_ptr = engine.get();
+  std::thread destroyer([&] { engine.reset(); });
+  wait_until([&] { return unified_retirement_waiting_for_test(*engine_ptr); },
+             "retire did not wait for the blocked previous stream");
+
+  std::promise<void> complete_returned;
+  auto complete_returned_future = complete_returned.get_future();
+  std::thread complete_thread([&] {
+    copied_complete(retired_complete_info());
+    complete_returned.set_value();
+  });
+  // The stream is still blocked, so this return proves the completion is in the
+  // fallback queue and cannot run until retire() drains it.
+  complete_returned_future.wait();
+  probe.throw_after_complete = true;
+  probe.release();
+  stream_thread.join();
+  complete_thread.join();
+  destroyer.join();
+  probe.check_order("DESTRUCTOR_EXCEPTION_DRAIN");
+
+  probe.throw_after_complete = false;
+  copied_stream(retired_stream_message());
+  copied_complete(retired_complete_info());
+  probe.check_order_with_exceptions("DESTRUCTOR_EXCEPTION_NEXT_SINK",
+                                    {"stream", "complete", "stream", "complete"});
+}
+
+// Real HTTP/SSE and Coordinator, with the same fake stage sockets as the other
+// contract tests. This checks public wiring only; it is not a model result.
+void test_public_http_unified_sse() {
+  Harness h("publichttp");
+  ApiConfig config;
+  config.host = "127.0.0.1";
+  config.port = 0;
+  config.model = "qwen3-unified";
+  config.request_timeout_s = 5.0;
+  OpenAIApi api(h.coordinator, config);
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  api.set_unified_engine(engine, "vlm");
+  check(api.bind(), "public unified server did not bind");
+  h.start_pump();
+  std::thread server_thread([&] { api.listen(); });
+
+  const std::string pcm(800, '\0');
+  const std::string wav = audio::wav_from_pcm16(pcm);
+  nlohmann::json audio_part = {
+      {"type", "input_audio"},
+      {"input_audio", {{"data", client::detail::base64_encode(wav)}, {"format", "wav"}}}};
+  nlohmann::json message = {{"role", "user"},
+                            {"content", nlohmann::json::array({audio_part})}};
+  nlohmann::json body = {{"model", "qwen3-unified"},
+                         {"messages", nlohmann::json::array({message})},
+                         {"stream", true},
+                         {"max_tokens", 37},
+                         {"temperature", 0.25}};
+  auto response_future = std::async(std::launch::async, [&] {
+    client::detail::HttpRequest request;
+    request.url = "http://127.0.0.1:" + std::to_string(api.bound_port()) +
+                  "/v1/chat/completions";
+    request.body = body.dump();
+    request.headers.emplace("Content-Type", "application/json");
+    request.timeout = client::Milliseconds{10000};
+    return client::detail::perform(request);
+  });
+
+  auto asr_submit = h.next_submit(h.asr_recv);
+  check(asr_submit.has_value(), "public HTTP did not submit the ASR leg");
+  if (asr_submit) {
+    StagePayload payload = StagePayload::from_value(asr_submit->data);
+    check(payload.request.inputs.as_map().size() == 1 &&
+              payload.request.inputs.find("audio")->as_bin() == pcm,
+          "public WAV was not converted to the ASR PCM-only contract");
+    check(!payload.request.params.at("stream").as_bool() &&
+              payload.request.params.at("temperature").as_double() == 0.0 &&
+              payload.request.params.at("max_new_tokens").as_int() == 37,
+          "ASR parameters were not fixed without losing max_new_tokens");
+    h.complete(asr_submit->request_id, "asr", true, text_result("real transcript"));
+  }
+
+  auto vlm_submit = h.next_submit(h.vlm_recv);
+  check(vlm_submit.has_value(), "public HTTP did not submit the VLM leg");
+  if (vlm_submit) {
+    StagePayload payload = StagePayload::from_value(vlm_submit->data);
+    const Value& messages = *payload.request.inputs.find("messages");
+    check(messages.as_array().at(0).find("content")->as_str() == "real transcript" &&
+              payload.request.inputs.find("audio") == nullptr,
+          "VLM did not receive exactly the ASR transcript");
+    check(payload.request.params.at("stream").as_bool() &&
+              payload.request.params.at("temperature").as_double() == 0.25 &&
+              payload.request.params.at("max_new_tokens").as_int() == 37,
+          "VLM did not preserve the public sampling parameters");
+    h.stream(vlm_submit->request_id, "vlm", text_chunk("answer", false));
+    auto result = text_result("answer");
+    result["finish_reason"] = Value("stop");
+    h.complete(vlm_submit->request_id, "vlm", true, Value(std::move(result)));
+  }
+
+  const auto response = response_future.get();
+  api.stop();
+  server_thread.join();
+  check(response.status == 200, "public unified SSE returned an HTTP error");
+  const size_t asr_pos = response.body.find("\"kind\":\"asr_final\"");
+  const size_t vlm_pos = response.body.find("\"kind\":\"vlm_delta\"");
+  const size_t complete_pos = response.body.find("\"kind\":\"complete\"");
+  check(asr_pos != std::string::npos && vlm_pos != std::string::npos &&
+            complete_pos != std::string::npos && asr_pos < vlm_pos &&
+            vlm_pos < complete_pos,
+        "public SSE order is not asr_final, vlm_delta, complete");
+  check(response.body.find("\"text\":\"real transcript\"") != std::string::npos &&
+            response.body.find("\"content\":\"answer\"") != std::string::npos,
+        "public SSE lost the transcript or answer");
+  check(response.body.find("\"kind\":\"complete\"", complete_pos + 1) ==
+            std::string::npos,
+        "public SSE emitted more than one successful terminal");
+  wait_until([&] { return engine.in_flight() == 0; },
+             "public unified request stayed in flight after completion");
+}
+
 }  // namespace
 
 int main() {
@@ -1431,5 +1646,9 @@ int main() {
   test_retire_wait_fallback_order();
   test_retired_cross_thread_order();
   test_retired_same_thread_reentry();
+  test_active_reentry_exception_drains();
+  test_retired_reentry_exception_drains();
+  test_destructor_suppresses_previous_sink_exception();
+  test_public_http_unified_sse();
   return g_failures == 0 ? 0 : 1;
 }
