@@ -811,6 +811,7 @@ src/{audio,client,proto,relay,comm,scheduling,pipeline,serve}
 src/main.cpp
 python/{umminfer_mlx_stage.py,umminfer_tiny_asr_stage.py}
 python/{umminfer_qwen_asr_stage.py,umminfer_qwen_omni_worker.py}
+python/{umminfer_rl_trajectory.py,umminfer_rl_reward.py,umminfer_rl_worker.py}
 clients/ummmlx/
 tests/self_check.cpp
 tests/compat/{wire_compat.cpp,runtime_compat.cpp}
@@ -822,6 +823,7 @@ tests/{client_smoke.py,client_retry_e2e.py,client_boundary_e2e.py}
 tests/{realtime_contract_e2e.py,realtime_client_contract_e2e.py,realtime_streaming_live.py}
 tests/{mlx_smoke.py,mlx_stage_test.py,mlx_*_perf.py,client_benchmark.py}
 tests/{qwen_omni_live.py,h3_live.py,h3_image_live.py,live_common.py}
+tests/rl_architecture_test.py
 tests/tla/{RequestLifecycle.tla,RequestLifecycle.cfg}
-docs/{cuda-ipc.md,external_stage.md,mlx.md,client.md,roadmap.md,validation.md}
+docs/{cuda-ipc.md,external_stage.md,mlx.md,client.md,roadmap.md,validation.md,rl.md}
 ```
