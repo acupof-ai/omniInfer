@@ -1617,6 +1617,257 @@ void test_public_http_unified_sse() {
              "public unified request stayed in flight after completion");
 }
 
+size_t occurrences(const std::string& text, const std::string& needle) {
+  size_t count = 0;
+  for (size_t pos = text.find(needle); pos != std::string::npos;
+       pos = text.find(needle, pos + needle.size())) {
+    ++count;
+  }
+  return count;
+}
+
+// Public chat body with one WAV input_audio part. The fake ASR stage receives
+// the decoded PCM; no model runs in this file.
+nlohmann::json public_audio_body(int max_tokens = 37) {
+  const std::string pcm(800, '\0');
+  const std::string wav = audio::wav_from_pcm16(pcm);
+  nlohmann::json audio_part = {
+      {"type", "input_audio"},
+      {"input_audio", {{"data", client::detail::base64_encode(wav)}, {"format", "wav"}}}};
+  nlohmann::json message = {{"role", "user"},
+                            {"content", nlohmann::json::array({audio_part})}};
+  return {{"model", "qwen3-unified"},
+          {"messages", nlohmann::json::array({message})},
+          {"stream", true},
+          {"max_tokens", max_tokens},
+          {"temperature", 0.0}};
+}
+
+// Public HTTP abort while the VLM leg is already streaming. The deltas that
+// were sequenced before the abort arrive, then exactly one cancelled terminal.
+// A late delta and a late success completion are dropped, the VLM stage sees the
+// abort, in_flight returns to zero, and the next request completes. A
+// cancellation is not a generation failure, so the stream carries no error
+// frame.
+void test_public_http_cancel_during_vlm() {
+  Harness h("httpcancelvlm");
+  ApiConfig config;
+  config.host = "127.0.0.1";
+  config.port = 0;
+  config.model = "qwen3-unified";
+  config.request_timeout_s = 5.0;
+  OpenAIApi api(h.coordinator, config);
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  api.set_unified_engine(engine, "vlm");
+  check(api.bind(), "cancel server did not bind");
+  h.start_pump();
+  std::thread server_thread([&] { api.listen(); });
+  const std::string base =
+      "http://127.0.0.1:" + std::to_string(api.bound_port());
+
+  EventLog log;
+  engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
+
+  std::mutex body_mu;
+  std::string body;
+  std::string stream_request_id;
+  std::promise<void> saw_two_deltas;
+  auto saw_two_deltas_future = saw_two_deltas.get_future();
+  bool signaled = false;
+  auto stream_future = std::async(std::launch::async, [&] {
+    client::detail::HttpRequest request;
+    request.url = base + "/v1/chat/completions";
+    request.body = public_audio_body().dump();
+    request.headers.emplace("Content-Type", "application/json");
+    request.timeout = client::Milliseconds{10000};
+    request.on_body = [&](std::string_view bytes) {
+      std::lock_guard<std::mutex> lock(body_mu);
+      body.append(bytes);
+      if (stream_request_id.empty()) {
+        const size_t id_pos = body.find("\"id\":\"");
+        if (id_pos != std::string::npos) {
+          const size_t begin = id_pos + 6;
+          const size_t end = body.find('"', begin);
+          if (end != std::string::npos) {
+            stream_request_id = body.substr(begin, end - begin);
+          }
+        }
+      }
+      if (!signaled && occurrences(body, "\"kind\":\"vlm_delta\"") >= 2) {
+        signaled = true;
+        saw_two_deltas.set_value();
+      }
+      return true;
+    };
+    return client::detail::perform(request);
+  });
+
+  auto asr_submit = h.next_submit(h.asr_recv);
+  check(asr_submit.has_value(), "cancel request did not reach the ASR stage");
+  const std::string id = asr_submit ? asr_submit->request_id : std::string();
+  h.complete(id, "asr", true, text_result("transcript"));
+  auto vlm_submit = h.next_submit(h.vlm_recv);
+  check(vlm_submit.has_value(), "cancel request did not reach the VLM stage");
+  const std::string child = vlm_submit ? vlm_submit->request_id : id + ":vlm";
+  h.stream(child, "vlm", text_chunk("first ", false));
+  h.stream(child, "vlm", text_chunk("second", false));
+
+  check(saw_two_deltas_future.wait_for(std::chrono::seconds(5)) ==
+            std::future_status::ready,
+        "two VLM deltas never reached the public stream");
+  check(!stream_request_id.empty() && stream_request_id == id,
+        "the public stream id did not match the submitted request");
+
+  client::detail::HttpRequest abort_request;
+  abort_request.url = base + "/abort";
+  abort_request.body =
+      nlohmann::json{{"request_id", stream_request_id.empty() ? id
+                                                              : stream_request_id}}
+          .dump();
+  abort_request.headers.emplace("Content-Type", "application/json");
+  abort_request.timeout = client::Milliseconds{5000};
+  const auto abort_response = client::detail::perform(abort_request);
+  check(abort_response.status == 200,
+        "public abort did not accept the active request");
+
+  // Tokens already in flight at the real worker can still arrive, and the
+  // worker can still report success. Both are stale after the abort.
+  h.stream(child, "vlm", text_chunk("late", false));
+  h.complete(child, "vlm", true, text_result("late answer"));
+
+  const auto response = stream_future.get();
+  api.stop();
+  server_thread.join();
+
+  check(response.status == 200, "cancelled SSE returned an HTTP error");
+  check(occurrences(body, "\"kind\":\"cancelled\"") == 1,
+        "cancel during VLM did not produce exactly one cancelled terminal");
+  check(occurrences(body, "\"kind\":\"complete\"") == 0 &&
+            occurrences(body, "\"kind\":\"error\"") == 0,
+        "cancel during VLM produced a second terminal");
+  check(occurrences(body, "\"kind\":\"vlm_delta\"") == 2,
+        "a VLM delta delivered after the abort reached the public stream");
+  check(body.find("late") == std::string::npos,
+        "late VLM text reached the public stream");
+  check(occurrences(body, "[DONE]") == 1,
+        "the cancelled stream did not end with exactly one [DONE]");
+  const size_t cancelled_pos = body.find("\"kind\":\"cancelled\"");
+  const size_t last_delta = body.rfind("\"kind\":\"vlm_delta\"");
+  check(cancelled_pos != std::string::npos &&
+            (last_delta == std::string::npos || last_delta < cancelled_pos),
+        "a vlm_delta was written after the cancelled terminal");
+  check(occurrences(body, "\"type\":\"generation_error\"") == 0,
+        "a client-requested cancel was reported as a generation error");
+  check(log.terminal_count(id) == 1,
+        "the engine reported more than one terminal for one cancellation");
+  wait_until([&] { return engine.in_flight() == 0; },
+             "in_flight stayed above zero after a VLM cancellation");
+  check(h.wait_abort(child), "the VLM stage never received the abort");
+
+  const std::string next = engine.submit(audio_request());
+  check(h.next_submit(h.asr_recv).has_value(),
+        "the request after a cancellation did not reach the ASR stage");
+  h.complete(next, "asr", true, text_result("second transcript"));
+  check(h.next_submit(h.vlm_recv).has_value(),
+        "the request after a cancellation did not reach the VLM stage");
+  h.complete(next + ":vlm", "vlm", true, text_result("second answer"));
+  check(engine.wait(next, 5.0),
+        "the request after a cancellation did not settle");
+  const auto follow_up = log.terminal_for(next);
+  check(follow_up && follow_up->kind == UnifiedEvent::Kind::kComplete,
+        "the request after a cancellation did not complete");
+  check(engine.in_flight() == 0,
+        "in_flight stayed above zero after the follow-up request");
+  engine.release(next);
+}
+
+// Public HTTP request whose ASR leg fails in the stage, not at request
+// validation. The stream carries one error attributed to the ASR stage, no ASR
+// final, no VLM delta, no VLM submit, in_flight returns to zero, and the next
+// request completes.
+void test_public_http_asr_model_failure() {
+  Harness h("httpasrfail");
+  ApiConfig config;
+  config.host = "127.0.0.1";
+  config.port = 0;
+  config.model = "qwen3-unified";
+  config.request_timeout_s = 5.0;
+  OpenAIApi api(h.coordinator, config);
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  api.set_unified_engine(engine, "vlm");
+  check(api.bind(), "ASR failure server did not bind");
+  h.start_pump();
+  std::thread server_thread([&] { api.listen(); });
+  const std::string base =
+      "http://127.0.0.1:" + std::to_string(api.bound_port());
+
+  EventLog log;
+  engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
+
+  auto response_future = std::async(std::launch::async, [&] {
+    client::detail::HttpRequest request;
+    request.url = base + "/v1/chat/completions";
+    request.body = public_audio_body().dump();
+    request.headers.emplace("Content-Type", "application/json");
+    request.timeout = client::Milliseconds{10000};
+    return client::detail::perform(request);
+  });
+
+  auto asr_submit = h.next_submit(h.asr_recv);
+  check(asr_submit.has_value(), "ASR failure request did not reach the stage");
+  const std::string id = asr_submit ? asr_submit->request_id : std::string();
+  h.complete(id, "asr", false, Value{},
+             std::string("ASR model backend unavailable"));
+
+  const auto response = response_future.get();
+  api.stop();
+  server_thread.join();
+
+  check(response.status == 200, "ASR failure SSE returned an HTTP error");
+  check(occurrences(response.body, "\"kind\":\"error\"") == 1,
+        "the ASR stage failure did not produce exactly one error terminal");
+  check(occurrences(response.body, "\"kind\":\"asr_final\"") == 0 &&
+            occurrences(response.body, "\"kind\":\"vlm_delta\"") == 0 &&
+            occurrences(response.body, "\"kind\":\"complete\"") == 0,
+        "the ASR stage failure emitted success or VLM events");
+  check(occurrences(response.body, "\"type\":\"generation_error\"") == 1,
+        "the ASR stage failure did not produce exactly one error frame");
+  check(response.body.find("\"stage\":\"asr\"") != std::string::npos,
+        "the error was not attributed to the ASR stage");
+  check(response.body.find("ASR model backend unavailable") !=
+            std::string::npos,
+        "the stage failure reason was not propagated");
+  check(occurrences(response.body, "[DONE]") == 1,
+        "the failed stream did not end with exactly one [DONE]");
+  check(log.terminal_count(id) == 1, "the ASR failure produced duplicate terminals");
+  const auto terminal = log.terminal_for(id);
+  check(terminal && terminal->kind == UnifiedEvent::Kind::kError &&
+            terminal->stage_id == kAsrStageId,
+        "the ASR failure terminal did not name the ASR stage");
+  check(h.no_submit(h.vlm_recv),
+        "the VLM leg started after an ASR stage failure");
+  wait_until([&] { return engine.in_flight() == 0; },
+             "in_flight stayed above zero after an ASR stage failure");
+  engine.release(id);
+
+  const std::string next = engine.submit(audio_request());
+  check(h.next_submit(h.asr_recv).has_value(),
+        "the request after an ASR failure did not reach the ASR stage");
+  h.complete(next, "asr", true, text_result("recovered transcript"));
+  check(h.next_submit(h.vlm_recv).has_value(),
+        "the request after an ASR failure did not reach the VLM stage");
+  h.stream(next + ":vlm", "vlm", text_chunk("recovered", false));
+  h.complete(next + ":vlm", "vlm", true, text_result("recovered answer"));
+  check(engine.wait(next, 5.0),
+        "the request after an ASR failure did not settle");
+  const auto follow_up = log.terminal_for(next);
+  check(follow_up && follow_up->kind == UnifiedEvent::Kind::kComplete,
+        "the request after an ASR failure did not complete");
+  check(engine.in_flight() == 0,
+        "in_flight stayed above zero after the follow-up request");
+  engine.release(next);
+}
+
 }  // namespace
 
 int main() {
@@ -1650,5 +1901,7 @@ int main() {
   test_retired_reentry_exception_drains();
   test_destructor_suppresses_previous_sink_exception();
   test_public_http_unified_sse();
+  test_public_http_cancel_during_vlm();
+  test_public_http_asr_model_failure();
   return g_failures == 0 ? 0 : 1;
 }

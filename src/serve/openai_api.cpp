@@ -2005,6 +2005,13 @@ class OpenAIApi::Impl {
       sink->finish();
       return;
     }
+    if (event.kind == UnifiedEvent::Kind::kCancelled) {
+      // A requested cancellation is not a generation failure. The unified
+      // terminal already carries kind=cancelled; an error frame here would
+      // present one cancellation as a terminal plus a separate error.
+      sink->finish();
+      return;
+    }
     sink->finish(event.error.empty() ? std::string("request ") + to_string(event.kind)
                                      : event.error);
   }

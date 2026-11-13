@@ -41,10 +41,14 @@ Omni workers. On H20B, public HTTP/SSE and the real CLI completed ASR -> VLM wit
 real Chinese and English recordings. The recorded run also passed a cancel after
 ASR final with no VLM execution, an ASR failure with no VLM execution, and a
 successful later request. Event order, parent/child request ids, one terminal,
-and `in_flight=0` are in `/tmp/umminfer-integration-logs/h20b-final/`.
+and `in_flight=0` are in `/tmp/umminfer-integration-logs/h20b-final/`. A later
+run cancelled while the VLM was streaming and failed the ASR leg by stopping its
+real backend; evidence is in
+`/tmp/umminfer-phase4-cancel-failure-evidence/`.
 
 The remaining gates are explicit: incremental ASR partials, realtime partials,
-GPU abort confirmation, natural `real_control_frame_interleaving`, session reuse,
+GPU abort confirmation, a model-compute failure distinct from backend loss,
+natural `real_control_frame_interleaving`, session reuse,
 joint image+audio input, and the Mac unified profile are `NOT_COVERED`. Model
 revisions are `UNKNOWN`; weights hashes, full resource attribution, and output
 reproducibility are not a complete Phase 3 record. CUDA build, IPC, sanitizer,

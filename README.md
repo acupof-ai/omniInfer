@@ -404,7 +404,8 @@ contains VLM output only; the ASR transcript is in the `asr_final` metadata.
 `/health.in_flight` reports unified requests in this mode.
 
 The Qwen Omni worker's optional `--log-requests` records the messages it actually
-received. It is intended for validation and is off by default.
+received. Its optional `--perf-log` writes JSON-lines queue, request-start, abort
+and completion records. Both are intended for validation and are off by default.
 
 ### H20B run recorded on 2026-11-13
 
@@ -445,6 +446,32 @@ These cases remain `NOT_COVERED`: incremental ASR partials, realtime partials,
 GPU-side abort confirmation, session reuse, joint image+audio input, and natural
 `real_control_frame_interleaving`. Audio-only evidence does not complete every
 Phase 2 or Phase 3 gate.
+
+### Cancel and failure closure run recorded on 2026-11-13
+
+Branch `phase4/cancel-failure` covers two cases on the same public path. The
+backends were dedicated instances on H20 GPUs 2 and 3: `qwen3-asr` on port 31200
+and `qwen3-omni` on port 31101. The existing backends on GPUs 0 and 1 were not
+touched. The ASR fault was real: the dedicated backend process was stopped
+while the server was idle, then restarted.
+
+| Case | Result | Time |
+| --- | --- | ---: |
+| Cancel while the VLM streamed | ASR final at 0.192 s; one `vlm_delta` at 0.449 s; public `/abort` 200 at 0.451 s; exactly one `cancelled`; no later delta; no error frame; `in_flight=0`; the worker recorded `request_start` and `abort` for `http-2:vlm` with no completion; the next request completed | 0.451 s |
+| ASR model stage unavailable | Dedicated backend stopped; one ASR `error` (`[Errno 54] Connection reset by peer`); no `asr_final`, no VLM delta, no `http-5:vlm`; `in_flight=0` | 0.025 s |
+| Recovery after the failure | Backend restarted in 20.8 s; exact Chinese reference transcript; one `complete`; `in_flight=0` | 6.924 s |
+
+A requested cancellation is not reported as a generation error: the SSE terminal
+is `cancelled` and the stream carries no `error` frame. Deterministic contract
+tests cover both cases and the cancellation test fails on the pre-fix source.
+
+Recorded evidence is under `/tmp/umminfer-phase4-cancel-failure-evidence/`
+(`results/`, `workers/`, `server/`, `backend/`, `tests/`, `SHA256SUMS`); it is
+not a committed artifact. Still `NOT_COVERED`: an SGLang-side abort line (this
+backend logs none), GPU-level confirmation that decode stopped, a failure inside
+model compute rather than loss of the backend process, incremental ASR partials,
+realtime partials, session reuse, joint image+audio input, and natural control
+frame interleaving. Both model revisions remain `UNKNOWN`.
 
 ## Run the audio test pipeline
 

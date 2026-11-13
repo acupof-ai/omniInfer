@@ -25,9 +25,9 @@ MLXStage = load_pipeline_stage()
 class QwenOmniWorker(MLXStage):
     def __init__(self, name, recv_endpoint, coordinator_endpoint, abort_endpoint,
                  upstream_base_url, upstream_model, request_timeout=300.0,
-                 log_requests=False):
+                 log_requests=False, perf_log=None):
         super().__init__(name, recv_endpoint, coordinator_endpoint, abort_endpoint,
-                         upstream_base_url.rstrip("/"))
+                         upstream_base_url.rstrip("/"), perf_log=perf_log)
         self.upstream_model = upstream_model
         self.request_timeout = request_timeout
         self.log_requests = log_requests
@@ -169,13 +169,15 @@ def main():
     parser.add_argument("--upstream-model", required=True)
     parser.add_argument("--request-timeout", type=float, default=300.0)
     parser.add_argument("--log-requests", action="store_true")
+    # Optional JSON-lines record of queue, abort, start and completion events.
+    parser.add_argument("--perf-log", default=None)
     args = parser.parse_args()
     if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
         parser.error("--request-timeout must be positive and finite")
     stage = QwenOmniWorker(
         args.name, args.recv, args.coordinator, args.abort,
         args.upstream_base_url, args.upstream_model, args.request_timeout,
-        args.log_requests)
+        args.log_requests, args.perf_log)
 
     def stop(signum, frame):
         stage.running = False
