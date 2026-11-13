@@ -57,7 +57,8 @@ explicit: a model-compute failure distinct from backend loss and the Mac
 unified profile are `NOT_COVERED`. Model
 revisions are `UNKNOWN`; weights hashes, full resource attribution, and output
 reproducibility are not a complete Phase 3 record. CUDA build, IPC, sanitizer,
-and stress are separate `NOT_COVERED` rows. No full Phase 2 or Phase 3 claim is
+and stress ran separately on H20B on 2026-11-14 and passed on dedicated GPUs 2
+and 3; see [H20B status](#h20b-status). No full Phase 2 or Phase 3 claim is
 made.
 
 ### Phase 0 — Contract and orchestration
@@ -315,9 +316,26 @@ The 2026-11-13 evidence directory is
 `/tmp/umminfer-integration-logs/h20b-final/`. It contains the topology, model
 metadata, real audio hashes, transcripts, answers, event timings, Worker receive
 logs, cancellation and failure checks, GPU snapshot, and `SHA256SUMS`. The run
-is local evidence, not a committed result artifact. It does not establish CUDA
-build/execution, CUDA IPC, sanitizer, stress, a full BF16 baseline, image input,
-session reuse, or the Mac profile. Those remain `NOT_COVERED`.
+is local evidence, not a committed result artifact. It does not establish a
+full BF16 baseline, image input, session reuse, or the Mac profile. Those
+remain `NOT_COVERED`.
+
+A separate window on 2026-11-14 covered the CUDA path in the same container.
+It used `CUDA_VISIBLE_DEVICES=2,3`, so the SGLang workers on GPUs 0 and 1 were
+not touched, and no benchmark ran at the same time. All four checks passed:
+
+| Check | Evidence |
+| --- | --- |
+| CUDA build | `zig build -Doptimize=ReleaseFast -Dcuda`, exit 0 in 27 s from a clean cache |
+| CUDA IPC | `cuda_ipc_test` and `cuda_pipeline_test`, exit 0, `all checks passed` |
+| Sanitizer | `tests/cuda_sanitize.py`, exit 0; 0 memcheck errors in the clean runs, and the expected 2 API reports from the corrupted-handle case |
+| Stress | `tests/cuda_stress.py --rounds 10`, 10/10 rounds |
+
+The window needed two Linux build fixes: the dependency prefix now precedes
+distro headers in `build.zig`, and `src/client/openai.cpp` names the `std::min`
+type. Evidence is in `/tmp/umminfer-phase5-cuda-stress-evidence/`. Still
+`NOT_COVERED`: CUDA relay under real model load, zero-copy device-tensor
+transfer, and multi-host IPC.
 
 ## Next priorities
 
@@ -326,15 +344,17 @@ session reuse, or the Mac profile. Those remain `NOT_COVERED`.
 2. Add joint image+audio input and session reuse, then run their Phase 2 gates.
 3. Record model revisions, weights hashes, reproducibility, and complete resource
    attribution for Phase 3; run the Mac profile separately.
-4. Run the H20B CUDA build, IPC, sanitizer, and stress windows under the existing
-   single-owner rule. These are not established by the Qwen worker run.
+4. Repeat the H20B CUDA window under real model load, and add zero-copy
+   device-tensor transfer and multi-host IPC if a use case needs them.
 5. Keep the fixed-upstream proxy independent of the local unified path.
 
 ## Explicitly unverified or unsupported
 
 These are not repeated from the README limits list.
 
-- CUDA build, execution, IPC, stress, and compute-sanitizer on any host.
+- CUDA relay under real model load, zero-copy device-tensor transfer, and
+  multi-host CUDA IPC. The build, IPC tests, compute-sanitizer, and stress pass
+  are recorded for H20B on 2026-11-14.
 - Session reuse and the Mac unified profile. Unified ASR partials, joint
   image+audio, and VLM/Omni GPU abort confirmation are covered by the unified
   H20B run; realtime partials, ASR GPU abort, and real-client control-frame

@@ -141,7 +141,7 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | C++20 control plane: Coordinator, request abort, ready gating | `serve` | Implemented |
 | ZeroMQ transport with MessagePack control messages | internal | Implemented |
 | POSIX shared-memory payload relay with bounded credits | `stage --next/--peer` | Implemented |
-| Optional CUDA IPC relay path | `stage --gpu-id/--peer-gpu` | Build path present; unbuilt and unexecuted here (no CUDA toolkit) |
+| Optional CUDA IPC relay path | `stage --gpu-id/--peer-gpu` | Built and executed on H20B 2026-11-14: build, IPC tests, compute-sanitizer, and 10/10 stress rounds passed on dedicated GPUs 2 and 3 |
 | External persistent Python stage protocol | `serve --entry-endpoint` | Implemented |
 | Text chat, JSON and SSE | `chat`, `/v1/chat/completions` | Implemented on MLX-LM; checked against a real local model with no run artifact committed |
 | File and realtime transcription | `transcribe`, `realtime`, `/v1/audio/transcriptions`, `/v1/realtime` | Implemented against the deterministic TinyCTC test model only |
@@ -156,7 +156,7 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | Cross-model orchestration | `UnifiedEngine`, `serve --vlm-entry-endpoint` | Public HTTP/SSE and real CLI ASR -> VLM verified on H20B |
 | Shared session across modalities | `session_id` on `/v1/chat/completions` | Implemented as a grouping label; sequential, concurrent, error, and cancel cases verified on H20B |
 | Unified multimodal end-to-end acceptance | `chat --audio`, `/v1/chat/completions` | Real joint image+audio, same-session reuse, cancel, failure, and recovery verified on H20B; full Phase 2/3 gates `NOT_COVERED` |
-| H20B verification | Two SGLang workers | Accessible; Qwen ASR GPU 1 and Qwen Omni GPU 0 verified; CUDA build/IPC/sanitizer/stress `NOT_COVERED` |
+| H20B verification | Two SGLang workers | Accessible; Qwen ASR GPU 1 and Qwen Omni GPU 0 verified; CUDA build, IPC, sanitizer, and stress verified 2026-11-14 on GPUs 2 and 3 |
 
 TinyCTC has deterministic initialized weights; it is not a speech recognizer.
 The MLX-LM chat path is text-only inference, not a VLM. The Mac and H20B
@@ -705,9 +705,30 @@ device, and give the sender the device of the stage it sends to:
   `UMMINFER_DISABLE_CUDA_IPC=1` is set, the edge uses POSIX shared memory.
   The fallback is logged once per edge.
 
-None of these commands has been executed on this machine, which has no CUDA
-toolkit: `zig build -Dcuda` stops here when `cuda_runtime_api.h` is not found.
-The relay code has default-test coverage only.
+These commands are not executable on the Apple Silicon Mac, which has no CUDA
+toolkit. They were executed on H20B on 2026-11-14; the recorded results are
+below.
+
+### H20B CUDA run recorded on 2026-11-14
+
+The run used container `linyu-dev` (Ubuntu 24.04, driver 535.161.08, CUDA 12.4,
+Zig 0.16.0) and dedicated GPUs 2 and 3 through `CUDA_VISIBLE_DEVICES=2,3`. The
+SGLang workers on GPUs 0 and 1 were not touched, and no run shared the window.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| CUDA build | `zig build -Doptimize=ReleaseFast -Dcuda -Dcuda-prefix=/usr/local/cuda -Ddeps-prefix=<prefix>` | Exit 0, 27 s from a clean cache; four binaries installed |
+| CUDA IPC tests | `cuda_ipc_test`, `cuda_pipeline_test` | Exit 0 each, `all checks passed` |
+| Sanitizer | `tests/cuda_sanitize.py` with `compute-sanitizer --tool memcheck --target-processes all` | Exit 0; ipc and pipeline report 0 errors; the default-API ipc run exits 99 with 2 expected `cudaIpcOpenMemHandle` reports from the corrupted-handle case |
+| Stress | `tests/cuda_stress.py --rounds 10` | 10/10 rounds passed, 29 s |
+
+The build needed two source fixes on Linux: `build.zig` now gives the
+dependency prefix precedence over distro headers (`-I`, not `-isystem`), and
+`src/client/openai.cpp` names the `std::min` type explicitly. Evidence,
+including environment, commands, exit codes, raw logs, and `SHA256SUMS`, is in
+`/tmp/umminfer-phase5-cuda-stress-evidence/`; it is not a committed artifact.
+Still `NOT_COVERED`: CUDA relay under real model load, zero-copy device-tensor
+transfer, and multi-host IPC.
 
 ## Fixed upstream proxy mode
 

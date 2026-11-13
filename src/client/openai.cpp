@@ -572,7 +572,7 @@ ChatResponse OpenAIClient::chat(const ChatRequest& request) const {
         for (int retry = 1; retry < attempt && cap < config_.retry_max.count(); ++retry) {
           cap = cap > config_.retry_max.count() / 2 ? config_.retry_max.count() : cap * 2;
         }
-        cap = std::min(cap, config_.retry_max.count());
+        cap = std::min<int64_t>(cap, config_.retry_max.count());
         const int64_t floor = cap / 2;
         thread_local std::mt19937_64 generator(std::random_device{}());
         const double jitter = std::uniform_real_distribution<double>(0.0, 1.0)(generator);

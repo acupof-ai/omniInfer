@@ -4,7 +4,10 @@ fn configure(mod: *std.Build.Module, b: *std.Build, deps_prefix: ?[]const u8, cu
     mod.addIncludePath(b.path("include"));
     mod.addIncludePath(b.path("src"));
     if (deps_prefix) |prefix| {
-        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
+        // -I, not -isystem: Zig's clang searches its own system include
+        // directories before -isystem paths, so a distro httplib.h would win
+        // over the pinned one in the dependency prefix.
+        mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
     }
     if (curl_prefix) |prefix| {

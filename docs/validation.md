@@ -324,6 +324,40 @@ worker logs `SGLANG_ABORT_CONFIRMED ... finish=abort`; the next request
 completes. `tests/sglang_abort_probe.py` records the backend-only confirmation:
 `/abort_request` 200 and a raw SSE `finish_reason="abort"` frame.
 
+## 8. CUDA build, IPC, sanitizer and stress on H20B
+
+Run these on a CUDA host with at least two free GPUs. On a shared host, select
+dedicated devices with `CUDA_VISIBLE_DEVICES` so the tests see them as 0 and 1.
+Do not run them at the same time as a model benchmark.
+
+```sh
+zig build -Doptimize=ReleaseFast -Dcuda -Dcuda-prefix=/usr/local/cuda \
+  -Ddeps-prefix=/path/to/deps
+zig-out/bin/cuda_ipc_test
+zig-out/bin/cuda_pipeline_test
+python3 -I tests/cuda_sanitize.py --ipc zig-out/bin/cuda_ipc_test \
+  --pipeline zig-out/bin/cuda_pipeline_test --log-dir /tmp/cuda-sanitize
+python3 -I tests/cuda_stress.py --ipc zig-out/bin/cuda_ipc_test \
+  --pipeline zig-out/bin/cuda_pipeline_test --rounds 10 --log-dir /tmp/cuda-stress
+```
+
+`-Ddeps-prefix` must contain the pinned `httplib.h`, `nlohmann/`, and the
+`libzmq`, `libmsgpackc`, `libcurl`, and `libwebsockets` libraries. The build
+puts that prefix before distro headers.
+
+Expected results, recorded on H20B 2026-11-14 on GPUs 2 and 3:
+
+| Check | Expected |
+| --- | --- |
+| Build | Exit 0; `cuda_ipc_test`, `cuda_pipeline_test`, `cuda_bench`, and `umm-infer` installed |
+| CUDA IPC | Both test binaries exit 0 and print `all checks passed` |
+| Sanitizer | Exit 0. The clean `ipc` and `pipeline` runs report `ERROR SUMMARY: 0 error`. The default-API `ipc` run exits 99 and reports `cudaIpcOpenMemHandle`, because test [5] opens a corrupted handle in a child process on purpose |
+| Stress | `cuda_stress: 10/10 rounds passed`; the stress environment also adds the 1 MiB and slot-limit-minus-one cases |
+
+Evidence is in `/tmp/umminfer-phase5-cuda-stress-evidence/`; it is not a
+committed artifact. This run does not cover CUDA relay under real model load,
+zero-copy device-tensor transfer, or multi-host IPC.
+
 ## NOT_COVERED
 
 - A first-party HTTP 429 with `Retry-After`: this server does not emit one.
