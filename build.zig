@@ -175,6 +175,12 @@ pub fn build(b: *std.Build) void {
     const mlx_test_step = b.step("mlx-test", "Run MLX stage unit tests");
     mlx_test_step.dependOn(&mlx_test.step);
 
+    const mac_unified_test = b.addSystemCommand(&.{ "python3", "-I" });
+    mac_unified_test.addFileArg(b.path("tests/mac_unified_validation_test.py"));
+    const mac_unified_test_step = b.step(
+        "mac-unified-test", "Run Mac unified harness unit tests");
+    mac_unified_test_step.dependOn(&mac_unified_test.step);
+
     const qwen_omni_test = b.addSystemCommand(&.{ "python3", "-I" });
     qwen_omni_test.addFileArg(b.path("tests/qwen_omni_worker_test.py"));
     const qwen_omni_test_step = b.step(

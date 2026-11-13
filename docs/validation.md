@@ -157,6 +157,20 @@ Expected result: JSON, SSE, abort, disconnected-client recovery, and concurrent
 requests pass with one persistent stage. Reported latency is a local
 measurement, not a performance guarantee.
 
+## 5b. Mac unified low-resource profile
+
+Run the unified ASR -> text path with the local TinyCTC test ASR stage and a
+real MLX text stage:
+
+```sh
+python3 -I tests/mac_unified_validation.py \
+  --model "$MLX_MODEL" --evidence-dir /tmp/umminfer-phase5-mac-evidence
+```
+
+See `docs/mac-unified.md` for scope, recorded results, evidence layout, and
+limits. TinyCTC is an inference test model; it is not recognition-quality
+evidence.
+
 ## 6. Manual smoke during development
 
 Start the text or audio processes as shown in README. Then check:
