@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import errno
 import hashlib
 import http.client
 import importlib.util
@@ -20,6 +21,8 @@ import tempfile
 import threading
 import time
 import wave
+
+from websockets.sync.client import connect
 
 
 LOG_CAP = 65536
@@ -341,6 +344,10 @@ class WireProxy:
         self.errors = []
         self.lock = threading.Lock()
         self.stopping = threading.Event()
+        # A WebSocket Close frame or an observed EOF means the connection is
+        # already ending. Transport errors after that are teardown.
+        self.close_seen = threading.Event()
+        self.eof_seen = threading.Event()
         self.connections = []
         self.forwarders = []
         self.fragmented_messages = 0
@@ -362,6 +369,7 @@ class WireProxy:
             if opcode == 8:
                 code = int.from_bytes(payload[:2], "big") if len(payload) >= 2 else None
                 self.events.append((direction, code))
+                self.close_seen.set()
 
     def observe_client_message(self, message):
         event = json.loads(message)
@@ -456,6 +464,18 @@ class WireProxy:
             return None
         return head
 
+    # ENOTCONN and EPIPE mean the local descriptor is already shut down, so
+    # they cannot occur on a healthy forwarding path. ECONNRESET is a peer
+    # fault unless this proxy already observed a Close frame or EOF. Protocol
+    # assertions raise AssertionError and are never classified as teardown.
+    def expected_close_error(self, exc):
+        if not isinstance(exc, OSError):
+            return False
+        if exc.errno in (errno.ENOTCONN, errno.EPIPE):
+            return True
+        return (exc.errno == errno.ECONNRESET and
+                (self.close_seen.is_set() or self.eof_seen.is_set()))
+
     def forward(self, source, destination, direction, parser, head=b""):
         try:
             if head:
@@ -464,7 +484,14 @@ class WireProxy:
             for _ in range(100000):
                 data = source.recv(65536)
                 if not data:
-                    destination.shutdown(socket.SHUT_WR)
+                    # The peer sent EOF. Its write side may already be shut,
+                    # so a failure here is a close, not a forwarding error.
+                    self.eof_seen.set()
+                    try:
+                        destination.shutdown(socket.SHUT_WR)
+                    except OSError as exc:
+                        if not self.expected_close_error(exc):
+                            raise
                     return
                 if direction == "server" and self.fragment:
                     outgoing = parser.feed(data)
@@ -474,7 +501,15 @@ class WireProxy:
                     parser.feed(data)
                     destination.sendall(data)
             self.errors.append("proxy forwarding iteration cap reached")
+        except OSError as exc:
+            if self.expected_close_error(exc):
+                self.eof_seen.set()
+                return
+            if not self.stopping.is_set():
+                self.errors.append(f"proxy forward: {exc}")
         except Exception as exc:
+            # AssertionError from a frame parser is a protocol defect and is
+            # always recorded.
             if not self.stopping.is_set():
                 self.errors.append(f"proxy forward: {exc}")
 
@@ -712,6 +747,38 @@ def main():
             wait_for(stage_ready.is_set, processes["stage"], 120)
             print(f"PASS real_startup http_port={http_port} ws_port={ws_port} "
                   f"stage_pid={processes['stage'].pid}", flush=True)
+
+            # Normal-close regression: a real WebSocket client closes right
+            # after the session is accepted. Repeat enough times to exercise
+            # the teardown race. Every round must record a complete close
+            # handshake and no forwarded-error entry.
+            for round_index in range(20):
+                close_proxy = WireProxy(ws_port)
+                proxies.append(close_proxy)
+                try:
+                    with connect(
+                            f"ws://127.0.0.1:{close_proxy.port}/v1/realtime"
+                            "?intent=transcription&model=tiny-ctc",
+                            compression=None, open_timeout=5, close_timeout=5,
+                            ping_interval=None, max_size=1 << 20) as ws:
+                        ws.send(json.dumps({
+                            "type": "session.update",
+                            "session": {"input_audio_format": "pcm16"}}))
+                        reply = json.loads(ws.recv(timeout=5))
+                        require(reply.get("type") ==
+                                "transcription_session.updated",
+                                f"normal-close round {round_index}: {reply!r}")
+                except Exception:
+                    print(f"DIAG normal_close round={round_index} "
+                          f"errors={close_proxy.errors} "
+                          f"events={close_proxy.events}", flush=True)
+                    raise
+                close_events = close_proxy.close()
+                require(("client", 1000) in close_events and
+                        ("server", 1000) in close_events,
+                        f"normal-close round {round_index} handshake: "
+                        f"{close_events}")
+            print("PASS real_normal_close_regression rounds=20", flush=True)
 
             for option in ("--max-new-tokens", "--final-timeout-ms", "--stall-ms"):
                 rejected = start_cli([str(binary), "realtime", "--url",

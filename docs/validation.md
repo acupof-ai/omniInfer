@@ -98,6 +98,12 @@ Expected results:
 - Active close and SIGKILL produce abort events, return `in_flight` to zero, and
   allow a following real request to succeed.
 - Real continuation fragments are reassembled.
+- A 20-round normal-close regression opens a real WebSocket session through
+  the wire proxy and closes it. Every round must record both Close frames and
+  no forwarded-error entry. ENOTCONN/EPIPE count as teardown; ECONNRESET counts
+  only after an observed Close frame or EOF. Other transport errors and
+  protocol assertions remain test failures. `tests/wire_proxy_teardown_test.py`
+  pins that classifier without a server.
 - `--ping-interval-ms` makes the real CLI send PING control frames while it
   streams audio. The wire proxy observes those frames and injects none. The
   stream keeps its order, ends with exactly one terminal event, and later
