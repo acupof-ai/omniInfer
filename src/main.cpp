@@ -370,6 +370,9 @@ int run_serve(const Flags& flags) {
     unified_engine = std::make_unique<UnifiedEngine>(coordinator, unified_config);
     api.set_unified_engine(*unified_engine, vlm_name);
   }
+  // Realtime partials share the one Coordinator event stream. Chain after the
+  // HTTP and unified sinks so every consumer still receives the same chunk.
+  if (realtime) realtime->install_stream_sink();
   coordinator.start();
   std::thread coordinator_thread([&] { coordinator.run(); });
 

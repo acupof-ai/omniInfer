@@ -149,6 +149,9 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | Bearer authentication | `serve --api-key` | Implemented |
 | Image generation and edit, video jobs | `image`, `video`, `/v1/images/*`, `/v1/videos*` | Fixed upstream proxy only |
 | Trained ASR worker | `umminfer_qwen_asr_stage.py` | Real `qwen3-asr` transcription verified on H20B |
+| Incremental ASR streaming and realtime partials | `stream=true` stage request, `/v1/realtime` | Verified on real `qwen3-asr` on H20B: 7 cumulative partials then one final; audio is buffered until `transcription.done` |
+| GPU-side abort confirmation, ASR leg | stage abort -> SGLang `/abort_request` | Verified on H20B: backend ended the stream with `finish_reason=abort`; VLM/Omni leg `NOT_COVERED` |
+| WebSocket control-frame interleaving | `realtime --ping-interval-ms` | Verified with real client PING/PONG frames during a continuous stream |
 | Real VLM worker | `umminfer_qwen_omni_worker.py` | Real `qwen3-omni` streamed text and image input verified on H20B |
 | Cross-model orchestration | `UnifiedEngine`, `serve --vlm-entry-endpoint` | Public HTTP/SSE and real CLI ASR -> VLM verified on H20B |
 | Shared session across modalities | `session_id` on `/v1/chat/completions` | Implemented as a grouping label; sequential, concurrent, error, and cancel cases verified on H20B |
@@ -191,8 +194,11 @@ model.
 - Chat supports retries before a stream emits a delta. ASR and realtime do not
   retry inference. Chat supports total, first-token, and stall timeouts. HTTP
   transcription supports total and activity timeouts. Realtime supports setup,
-  write, close, and live-result timeouts. Cancellation interrupts transport;
-  MLX abort takes effect at token boundaries.
+  write, close, and live-result timeouts. `--ping-interval-ms N` sends WebSocket
+  PING control frames during the session; the server answers with PONG.
+  Cancellation interrupts transport; MLX abort takes effect at token boundaries.
+  The Qwen ASR stage additionally sends SGLang `/abort_request` and reports the
+  backend's `finish_reason=abort` acknowledgement.
 - One external MLX stage processes one request at a time. Other requests queue.
 - The C++ stage host contains reference echo compute only. It does not load a
   model.
@@ -460,9 +466,7 @@ for the English PCM16/16 kHz transcode of the supplied real recording. Local
 run evidence is under `/tmp/umminfer-integration-logs/h20b-final/`; it is not a
 committed artifact. `SHA256SUMS` records the evidence hashes.
 
-These cases remain `NOT_COVERED`: incremental ASR partials, realtime partials,
-GPU-side abort confirmation, and natural `real_control_frame_interleaving`. The
-Phase 4 joint-input and session-reuse cases are verified below.
+Phase 4 joint-input, session reuse, and realtime streaming are verified below.
 
 ### Joint image + audio and same-session reuse, recorded on 2026-11-13
 
@@ -533,9 +537,28 @@ Recorded evidence is under `/tmp/umminfer-phase4-cancel-failure-evidence/`
 (`results/`, `workers/`, `server/`, `backend/`, `tests/`, `SHA256SUMS`); it is
 not a committed artifact. Still `NOT_COVERED`: an SGLang-side abort line (this
 backend logs none), GPU-level confirmation that decode stopped, a failure inside
-model compute rather than loss of the backend process, incremental ASR partials,
-realtime partials, session reuse, joint image+audio input, and natural control
-frame interleaving. Both model revisions remain `UNKNOWN`.
+model compute rather than loss of the backend process, ASR partials through the
+unified chat route, and GPU abort confirmation for the VLM/Omni leg. Both model
+revisions remain `UNKNOWN`.
+
+### Realtime streaming and ASR abort, recorded on 2026-11-13
+
+The realtime streaming run added seven cumulative `transcription.segment`
+partials before one final segment with the exact transcript, 223 client PING
+frames with 223 server PONG frames interleaved in the stream, and a cancellation
+whose abort reached SGLang and ended with `finish_reason=abort` at token 174. A
+20-round normal-close regression passed in every realtime client run. A later
+request succeeded. Functional evidence is under
+`/tmp/umminfer-phase4-20261113-streaming-evidence/`, with `SHA256SUMS`; the
+teardown regression matrix is under
+`/tmp/umminfer-phase4-streaming-supervisor/rework/`.
+
+These cases remain `NOT_COVERED`: ASR partials through the unified chat route
+(that route still submits ASR non-streaming), GPU-side abort confirmation for
+the VLM/Omni leg, a model-compute failure distinct from backend loss, an
+SGLang-side abort log line (this backend logs none), and GPU-level confirmation
+that decode stopped. Both model revisions remain `UNKNOWN`. Audio-only evidence
+does not complete every Phase 2 or Phase 3 gate.
 
 ## Run the audio test pipeline
 
@@ -748,7 +771,7 @@ tests/{omni_client_test.cpp,omni_serve_test.cpp,omni_transport_test.cpp}
 tests/{unified_contract_test.cpp,qwen_asr_stage_test.py,qwen_omni_worker_test.py}
 tests/{cuda_stress.py,cuda_sanitize.py,http_smoke.py,tla_test.py}
 tests/{client_smoke.py,client_retry_e2e.py,client_boundary_e2e.py}
-tests/{realtime_contract_e2e.py,realtime_client_contract_e2e.py}
+tests/{realtime_contract_e2e.py,realtime_client_contract_e2e.py,realtime_streaming_live.py}
 tests/{mlx_smoke.py,mlx_stage_test.py,mlx_*_perf.py,client_benchmark.py}
 tests/{qwen_omni_live.py,h3_live.py,h3_image_live.py,live_common.py}
 tests/tla/{RequestLifecycle.tla,RequestLifecycle.cfg}

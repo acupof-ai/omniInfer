@@ -97,8 +97,16 @@ Expected results:
   the reconstructed PCM hash matches the original input.
 - Active close and SIGKILL produce abort events, return `in_flight` to zero, and
   allow a following real request to succeed.
-- Real continuation fragments are reassembled. Natural control-frame
-  interleaving remains `NOT_COVERED` without a real-client trigger.
+- Real continuation fragments are reassembled.
+- `--ping-interval-ms` makes the real CLI send PING control frames while it
+  streams audio. The wire proxy observes those frames and injects none. The
+  stream keeps its order, ends with exactly one terminal event, and later
+  requests succeed.
+- `tests/realtime_streaming_live.py` drives the real Qwen3-ASR backend. It
+  checks cumulative partials, PING/PONG interleaving, one terminal event, and
+  cancellation. The cancelled request must show `SGLANG_ABORT_CONFIRMED` with
+  `finish=abort` in the stage log: that is the backend's own acknowledgement,
+  not a local socket close.
 
 Check each script's argument help if its local stage defaults differ from your
 checkout. Do not use `--skip-real` when validating the end-to-end journey.
@@ -273,8 +281,11 @@ remains `NOT_COVERED`.
 
 ## NOT_COVERED
 
-- Natural WebSocket control-frame interleaving: no stable real-client trigger
-  exists without injected frames. Real continuation fragments remain covered.
+- ASR partials through the unified chat route: that route still submits the ASR
+  leg with `stream=false`. Realtime partials are covered.
+- GPU-side abort confirmation for the VLM/Omni leg: the Omni worker closes its
+  upstream stream, and this path observes no per-request backend abort
+  acknowledgement. The ASR leg is confirmed through `/abort_request`.
 - A first-party HTTP 429 with `Retry-After`: this server does not emit one.
   Synthetic protocol responses are not validation evidence.
 - `other_501_502_public_client`: upstream route status mapping is being changed

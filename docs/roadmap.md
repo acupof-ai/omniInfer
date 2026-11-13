@@ -46,10 +46,13 @@ run cancelled while the VLM was streaming and failed the ASR leg by stopping its
 real backend; evidence is in
 `/tmp/umminfer-phase4-cancel-failure-evidence/`.
 
-The remaining gates are explicit: incremental ASR partials, realtime partials,
-GPU abort confirmation, a model-compute failure distinct from backend loss,
-natural `real_control_frame_interleaving`, session reuse,
-joint image+audio input, and the Mac unified profile are `NOT_COVERED`. Model
+Realtime streaming added on 2026-11-13: the Qwen ASR stage requests SGLang
+streaming, the realtime route forwards cumulative partials, the real client
+sends PING control frames during the stream, and cancellation asks SGLang to
+abort and records its `finish_reason=abort`. The remaining gates are explicit:
+ASR partials through the unified chat route, GPU abort confirmation for the
+VLM/Omni leg, a model-compute failure distinct from backend loss, and the Mac
+unified profile are `NOT_COVERED`. Model
 revisions are `UNKNOWN`; weights hashes, full resource attribution, and output
 reproducibility are not a complete Phase 3 record. CUDA build, IPC, sanitizer,
 and stress are separate `NOT_COVERED` rows. No full Phase 2 or Phase 3 claim is
@@ -323,10 +326,10 @@ session reuse, or the Mac profile. Those remain `NOT_COVERED`.
 These are not repeated from the README limits list.
 
 - CUDA build, execution, IPC, stress, and compute-sanitizer on any host.
-- Incremental ASR partials, realtime partials, GPU abort confirmation, session
-  reuse, joint image+audio input, and the Mac unified profile.
-- Natural WebSocket control-frame interleaving in the continuation regression.
-  No stable real-client trigger exists without injecting frames.
+- ASR partials through the unified chat route, GPU-side abort confirmation for
+  the VLM/Omni leg, session reuse, joint image+audio input, and the Mac unified
+  profile. Realtime partials, ASR GPU abort, and real-client control-frame
+  interleaving are covered on the realtime route only.
 - A first-party HTTP 429 with `Retry-After` from this server.
 - A successful upstream forward through the proxy. The in-tree tests prove
   configuration, route gating, and a connect failure only.

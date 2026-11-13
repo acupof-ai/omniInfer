@@ -189,6 +189,7 @@ struct RealtimeSession::Impl {
       if (reader_error) std::rethrow_exception(reader_error);
       throw Error(ErrorCode::kBadResponse, "realtime session closed before it was accepted");
     }
+    start_pings();
   }
 
   void event(std::string_view message) {
@@ -341,7 +342,29 @@ struct RealtimeSession::Impl {
     return final(pcm);
   }
 
+  void start_pings() {
+    if (request.ping_interval.count() <= 0) return;
+    ping_thread = std::thread([this] {
+      constexpr auto kStep = std::chrono::milliseconds{10};
+      auto next = Clock::now() + request.ping_interval;
+      while (!ping_stop.load() && !cancelled.load()) {
+        if (Clock::now() >= next) {
+          socket.ping();
+          next = Clock::now() + request.ping_interval;
+          std::lock_guard lock(mu);
+          if (finished || reader_done || completed) return;
+        }
+        std::this_thread::sleep_for(kStep);
+      }
+    });
+  }
+
   void close() {
+    ping_stop = true;
+    if (ping_thread.joinable() &&
+        ping_thread.get_id() != std::this_thread::get_id()) {
+      ping_thread.join();
+    }
     if (!closed.exchange(true)) {
       cancelled = true;
       socket.close();
@@ -360,6 +383,8 @@ struct RealtimeSession::Impl {
   detail::WebSocket socket;
   std::thread reader;
   std::thread cancel_thread;
+  std::thread ping_thread;
+  std::atomic<bool> ping_stop{false};
   std::mutex mu;
   std::mutex send_mu;
   std::condition_variable cv;
@@ -401,6 +426,10 @@ TranscribeResponse RealtimeSession::finish() {
 
 void RealtimeSession::close() {
   if (impl_) impl_->close();
+}
+
+RealtimeSession::PingStats RealtimeSession::ping_stats() const {
+  return {impl_->socket.pings_sent(), impl_->socket.pongs_received()};
 }
 
 std::unique_ptr<RealtimeSession> ASRClient::realtime(const RealtimeRequest& input) const {

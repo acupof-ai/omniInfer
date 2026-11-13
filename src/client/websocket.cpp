@@ -180,6 +180,16 @@ struct WebSocket::Impl {
     throw Error(ErrorCode::kCancelled, "request cancelled");
   }
 
+  void ping() {
+    std::lock_guard lock(io_mu);
+    if (closed || closing) return;
+    size_t sent = 0;
+    if (curl_ws_send(curl.get(), "p", 1, &sent, 0, CURLWS_PING) == CURLE_OK &&
+        sent == 1) {
+      pings_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   void send(std::string_view text) {
     std::lock_guard lock(io_mu);
     const auto deadline = Clock::now() + std::chrono::seconds{30};
@@ -272,7 +282,12 @@ struct WebSocket::Impl {
           throw Error(ErrorCode::kNetwork,
                       "realtime WebSocket read failed: " + std::string(curl_easy_strerror(result)));
         }
-        if (!meta || (meta->flags & (CURLWS_PING | CURLWS_PONG))) continue;
+        if (!meta) continue;
+        if (meta->flags & CURLWS_PONG) {
+          pongs_.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+        if (meta->flags & CURLWS_PING) continue;
         if (meta->flags & CURLWS_CLOSE) {
           send_close();
           shutdown_now();
@@ -316,6 +331,8 @@ struct WebSocket::Impl {
   CurlHandle curl;
   curl_socket_t socket = CURL_SOCKET_BAD;
   std::mutex io_mu;
+  std::atomic<uint64_t> pings_{0};
+  std::atomic<uint64_t> pongs_{0};
 };
 
 WebSocket::WebSocket(std::string url, Milliseconds connect_timeout, CancelFlag cancel,
@@ -323,6 +340,13 @@ WebSocket::WebSocket(std::string url, Milliseconds connect_timeout, CancelFlag c
     : impl_(std::make_unique<Impl>(url, connect_timeout, cancel, external_cancel, bearer)) {}
 WebSocket::~WebSocket() = default;
 void WebSocket::send_text(std::string_view text) { impl_->send(text); }
+void WebSocket::ping() { impl_->ping(); }
+uint64_t WebSocket::pings_sent() const {
+  return impl_->pings_.load(std::memory_order_relaxed);
+}
+uint64_t WebSocket::pongs_received() const {
+  return impl_->pongs_.load(std::memory_order_relaxed);
+}
 void WebSocket::run(const std::function<void(std::string_view)>& on_message) {
   impl_->run(on_message);
 }

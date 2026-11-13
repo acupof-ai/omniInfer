@@ -337,6 +337,7 @@ class WireProxy:
         self.port = self.listener.getsockname()[1]
         self.events = []
         self.frame_events = []
+        self.frame_payloads = []
         self.errors = []
         self.lock = threading.Lock()
         self.stopping = threading.Event()
@@ -355,6 +356,7 @@ class WireProxy:
         with self.lock:
             require(len(self.frame_events) < 10000, "wire event cap reached")
             self.frame_events.append((direction, opcode, fin))
+            self.frame_payloads.append((direction, opcode, fin, bytes(payload)))
             if direction == "server" and opcode == 1 and fin:
                 self.server_text_messages.append(payload)
             if opcode == 8:
@@ -704,7 +706,7 @@ def main():
                             "--observed-stage", str(tiny_stage), "--name", "asr",
                             "--recv", entry, "--coordinator", completion,
                             "--abort", abort_endpoint, "--model", str(work / "model"),
-                            "--omit-metadata-request", "realtime-5",
+                            "--omit-metadata-request", "realtime-6",
                             "--omit-metadata-request", "req-4"],
                   project, env, processes, logs, readers, stage_ready, abort_events, submit_events)
             wait_for(stage_ready.is_set, processes["stage"], 120)
@@ -796,8 +798,45 @@ def main():
             print(f"PASS real_continuation_fragments "
                   f"fragmented_messages={live_proxy.fragmented_messages} "
                   f"wire_events={live_events}", flush=True)
-            print("NOT_COVERED real_control_frame_interleaving: no natural real-client "
-                  "trigger without injected frames", flush=True)
+            # The real CLI now sends WebSocket PING control frames while it is
+            # streaming audio. The proxy only observes those real frames; it
+            # injects nothing. Every application event must still arrive once,
+            # in order, with one terminal result.
+            ping_proxy = WireProxy(ws_port)
+            proxies.append(ping_proxy)
+            pingged = start_cli(
+                realtime_command(binary, ping_proxy.port, audio) +
+                ["--ping-interval-ms", "20"], env, children)
+            ping_output, ping_error = finish_cli(pingged)
+            require(ping_output == b"b\n", f"ping run output was {ping_output!r}")
+            ping_events = ping_proxy.close()
+            verify_handshake(ping_events, client_first=False)
+            frames = list(ping_proxy.frame_events)
+            client_ping = [i for i, (d, op, _) in enumerate(frames)
+                           if d == "client" and op == 9]
+            server_pong = [i for i, (d, op, _) in enumerate(frames)
+                           if d == "server" and op == 10]
+            client_data = [i for i, (d, op, _) in enumerate(frames)
+                           if d == "client" and op in (1, 2)]
+            require(len(client_ping) >= 2,
+                    f"real client sent too few PING frames: {len(client_ping)}")
+            require(server_pong, "server never answered a real PING with PONG")
+            require(client_data and
+                    any(client_data[0] < i < client_data[-1] for i in client_ping),
+                    f"PING frames were not interleaved in the client stream: "
+                    f"ping={client_ping} data={client_data}")
+            texts = list(ping_proxy.server_text_messages)
+            completed = [m for m in texts if b'"transcription.completed"' in m]
+            segments = [m for m in texts if b'"transcription.segment"' in m]
+            require(len(completed) == 1,
+                    f"expected exactly one terminal event, got {texts!r}")
+            require(segments and texts.index(completed[0]) == len(texts) - 1,
+                    f"terminal event was not last or segments were missing: {texts!r}")
+            require(b"realtime ping sent=" in ping_error,
+                    f"real client did not report its PING stats: {ping_error!r}")
+            print(f"PASS real_control_frame_interleaving pings={len(client_ping)} "
+                  f"pongs={len(server_pong)} data_frames={len(client_data)} "
+                  f"segments={len(segments)} terminal=1 output=b\n", flush=True)
             wait_for(lambda: in_flight(http_port) == 0, timeout_s=10)
             print("PASS real_final_segment_not_partial output=b "
                   "stderr_no_partial=true in_flight=0", flush=True)
@@ -859,7 +898,8 @@ def main():
                               f"http://127.0.0.1:{cancel_proxy.port}", "--model", "tiny-ctc",
                               "--file", str(large_wav), "--live-result",
                               "--chunk-ms", "5000",
-                              "--final-timeout-ms", "5000", "--stall-ms", "20000"],
+                              "--final-timeout-ms", "5000", "--stall-ms", "20000",
+                              "--ping-interval-ms", "20"],
                              env, children)
             # One observed append proves the real session is streaming. The
             # 5 s pause after it is the window SIGINT must cut short.

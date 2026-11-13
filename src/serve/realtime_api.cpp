@@ -9,10 +9,13 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <map>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "asr_common.hpp"
@@ -30,6 +33,9 @@ struct RealtimeSession {
   std::string incoming;
   std::string audio;
   std::string request_id;
+  // Cumulative text the stage has streamed so far. Partial events carry the
+  // cumulative value: the client Assembler replaces its provisional segment.
+  std::string partial_text;
   std::deque<std::string> outbound;
   Clock::time_point deadline;
   int64_t max_tokens = 128;
@@ -176,6 +182,68 @@ class RealtimeApi::Impl {
     if (context_) lws_context_destroy(context_);
   }
 
+  // Chains this listener in front of the sinks already installed by OpenAIApi
+  // (and the unified engine, when present). Must run before Coordinator::run;
+  // exchange_sinks_before_run enforces that. Every other consumer still
+  // receives the same messages.
+  void install_stream_sink() {
+    auto previous = coordinator_.exchange_sinks_before_run(
+        [this](const StreamMessage& msg) {
+          enqueue_partial(msg);
+          if (previous_stream_) previous_stream_(msg);
+        },
+        [this](const RequestInfo& info) {
+          if (previous_complete_) previous_complete_(info);
+        });
+    previous_stream_ = std::move(previous.first);
+    previous_complete_ = std::move(previous.second);
+  }
+
+  // Called on the coordinator thread. WebSocket session state belongs to the
+  // libwebsockets thread, so this only queues the delta.
+  void enqueue_partial(const StreamMessage& msg) {
+    if (!msg.chunk.is_map()) return;
+    if (const Value* final = msg.chunk.find("is_final");
+        final != nullptr && final->is_bool() && final->as_bool()) {
+      return;
+    }
+    const Value* text = msg.chunk.find("text");
+    if (text == nullptr || !text->is_str() || text->as_str().empty()) return;
+    std::lock_guard<std::mutex> lock(partial_mu_);
+    // ponytail: fixed cap; a stalled WebSocket must not grow the control plane.
+    if (partial_queue_.size() >= 4096) return;
+    partial_queue_.emplace_back(msg.request_id, text->as_str());
+  }
+
+  // Called on the libwebsockets thread only. Converts stage deltas into
+  // cumulative, non-final segments for the matching session.
+  void drain_partials() {
+    std::deque<std::pair<std::string, std::string>> batch;
+    {
+      std::lock_guard<std::mutex> lock(partial_mu_);
+      batch.swap(partial_queue_);
+    }
+    for (auto& [request_id, delta] : batch) {
+      for (lws* wsi : sessions_) {
+        auto* session = static_cast<RealtimeSession*>(lws_wsi_user(wsi));
+        if (session == nullptr || session->request_id != request_id ||
+            session->close_after_write) {
+          continue;
+        }
+        session->partial_text += delta;
+        // ponytail: drop preview events under outbound backpressure; the final
+        // segment still carries the complete text.
+        if (session->outbound.size() >= 512) break;
+        send(wsi, session, {{"type", "transcription.segment"},
+                            {"event_index", 0},
+                            {"segment_id", 0},
+                            {"text", session->partial_text},
+                            {"is_final", false}});
+        break;
+      }
+    }
+  }
+
   bool bind() {
     if (context_) return true;
     lws_context_creation_info info{};
@@ -266,6 +334,9 @@ class RealtimeApi::Impl {
     try {
       StagePayload payload = serve_detail::make_asr_payload(
           session->audio, session->max_tokens, "", "");
+      // Ask the stage to stream. A stage that ignores stream sends no chunk;
+      // this listener then emits only the final segment, as before.
+      payload.request.params["stream"] = Value(true);
       session->request_id = "realtime-" + std::to_string(++next_request_id_);
       payload.request_id = session->request_id;
       session->deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
@@ -386,6 +457,7 @@ class RealtimeApi::Impl {
   }
 
   void poll_sessions() {
+    drain_partials();
     const auto now = Clock::now();
     for (lws* wsi : sessions_) {
       auto* session = static_cast<RealtimeSession*>(lws_wsi_user(wsi));
@@ -429,6 +501,10 @@ class RealtimeApi::Impl {
   lws_sorted_usec_list_t poll_sul_{};
   std::atomic<bool> running_{false};
   std::set<lws*> sessions_;
+  Coordinator::StreamSink previous_stream_;
+  Coordinator::CompleteSink previous_complete_;
+  std::mutex partial_mu_;
+  std::deque<std::pair<std::string, std::string>> partial_queue_;
   uint64_t next_request_id_ = 0;
   int bound_port_ = -1;
 };
@@ -492,6 +568,7 @@ int realtime_callback(lws* wsi, lws_callback_reasons reason, void* user,
 RealtimeApi::RealtimeApi(Coordinator& coordinator, ApiConfig config)
     : impl_(std::make_unique<Impl>(coordinator, std::move(config))) {}
 RealtimeApi::~RealtimeApi() = default;
+void RealtimeApi::install_stream_sink() { impl_->install_stream_sink(); }
 bool RealtimeApi::bind() { return impl_->bind(); }
 bool RealtimeApi::listen() { return impl_->listen(); }
 void RealtimeApi::stop() { impl_->stop(); }

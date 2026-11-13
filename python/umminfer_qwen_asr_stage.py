@@ -108,6 +108,109 @@ class SGLangBackend:
     def prepare_request(self):
         self._cancelled.clear()
 
+    def abort_request(self, request_id):
+        """Ask SGLang to stop this request on the scheduler.
+
+        This is not a local socket close: the backend acknowledges by ending
+        the generate stream with finish_reason type "abort". A separate
+        connection is used because the generate connection is still open.
+        """
+        body = json.dumps({"rid": request_id}, separators=(",", ":")).encode("utf-8")
+        connection = http.client.HTTPConnection(self.host, self.port, 10.0)
+        try:
+            connection.request("POST", "/abort_request", body=body,
+                               headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            data = response.read(4096)
+            if not 200 <= response.status < 300:
+                detail = data.decode("utf-8", "replace")
+                raise RuntimeError(
+                    f"SGLang abort HTTP {response.status}: {detail}")
+            return True
+        finally:
+            connection.close()
+
+    def _generate_payload(self, pcm, max_tokens, temperature, request_id,
+                          stream):
+        return {
+            "text": "",
+            "audio_data": pcm16_wav_data_url(pcm),
+            "sampling_params": {
+                "temperature": temperature,
+                "max_new_tokens": max_tokens,
+            },
+            "stream": stream,
+            "modalities": ["audio"],
+            "rid": request_id,
+        }
+
+    def iter_stream(self, pcm, max_tokens, temperature, request_id):
+        """Yield one cumulative text event per SGLang SSE data line.
+
+        Each event is a SimpleNamespace with the cumulative text, the token
+        count and the finish reason (None until the last event). The caller
+        turns cumulative text into deltas.
+        """
+        payload = self._generate_payload(pcm, max_tokens, temperature,
+                                         request_id, True)
+        print(f"SGLang stream request {request_id} started", flush=True)
+        connection = http.client.HTTPConnection(self.host, self.port,
+                                                self.timeout)
+        with self._lock:
+            if self._active is not None:
+                connection.close()
+                raise RuntimeError("another SGLang request is already active")
+            self._active = connection
+        try:
+            body = json.dumps(payload, ensure_ascii=False,
+                              separators=(",", ":")).encode("utf-8")
+            with self._lock:
+                if self._cancelled.is_set():
+                    raise RuntimeError("SGLang request was cancelled")
+                connection.request("POST", "/generate", body=body,
+                                   headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            if not 200 <= response.status < 300:
+                detail = response.read(4096).decode("utf-8", "replace")
+                raise RuntimeError(f"SGLang HTTP {response.status}: {detail}")
+            data_lines = []
+            for raw_line in response:
+                line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                if line:
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                    continue
+                if not data_lines:
+                    continue
+                data = "\n".join(data_lines)
+                data_lines = []
+                if data == "[DONE]":
+                    return
+                event = json.loads(data)
+                yield self._stream_event(event)
+        finally:
+            with self._lock:
+                if self._active is connection:
+                    self._active = None
+            connection.close()
+
+    @staticmethod
+    def _stream_event(event):
+        if not isinstance(event, dict) or not isinstance(event.get("text"), str):
+            raise ValueError("SGLang stream event must carry text")
+        metadata = event.get("meta_info")
+        if not isinstance(metadata, dict):
+            raise ValueError("SGLang stream event did not report meta_info")
+        count = metadata.get("completion_tokens")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("SGLang did not report completion_tokens")
+        finish = metadata.get("finish_reason")
+        reason = finish.get("type") if isinstance(finish, dict) else None
+        if reason is not None and (not isinstance(reason, str) or not reason):
+            raise ValueError("SGLang reported an invalid finish_reason")
+        return SimpleNamespace(text=event["text"], generation_tokens=count,
+                               finish_reason=reason)
+
     def check_model(self):
         self.prepare_request()
         body = self._request_json("GET", "/v1/models")
@@ -161,6 +264,7 @@ class QwenASRStage(MLXStage):
         self.backend = SGLangBackend(backend_url, model_path, timeout)
         self.poll_interval = 0.1
         self._backend_request_id = None
+        self._stream_requested = False
 
     def load(self):
         if self.generate is not None:
@@ -198,13 +302,28 @@ class QwenASRStage(MLXStage):
         stream = params.get("stream", False)
         if not isinstance(stream, bool):
             raise ValueError("stream must be a boolean")
-        if stream:
-            raise ValueError("incremental ASR streaming is not supported")
+        self._stream_requested = stream
         self._backend_request_id = "umminfer-" + message["request_id"]
-        return pcm, max_tokens, 0.0, False
+        return pcm, max_tokens, 0.0, stream
+
+    def _abort_backend(self, reason):
+        """Ask SGLang to stop the active request on the GPU scheduler."""
+        request_id = self._backend_request_id
+        print(f"SGLANG_ABORT_REQUEST rid={request_id} reason={reason}",
+              flush=True)
+        try:
+            self.backend.abort_request(request_id)
+            print(f"SGLANG_ABORT_ACCEPTED rid={request_id} http=ok", flush=True)
+        except Exception as exc:
+            print(f"SGLang abort_request failed for {request_id}: {exc}",
+                  file=sys.stderr, flush=True)
 
     def _generate(self, pcm, max_tokens, temperature):
+        if getattr(self, "_stream_requested", False):
+            yield from self._generate_stream(pcm, max_tokens, temperature)
+            return
         results = queue.Queue(maxsize=1)
+        completed = False
 
         def call():
             try:
@@ -226,12 +345,102 @@ class QwenASRStage(MLXStage):
                     yield SimpleNamespace(text="")
             if isinstance(result, Exception):
                 raise result
+            completed = True
             yield result
         finally:
+            if not completed:
+                self._abort_backend("cancelled-before-completion")
             self.backend.close_active()
-            thread.join(2)
+            thread.join(5)
             if thread.is_alive():
                 print("SGLang HTTP thread did not exit after connection close",
+                      file=sys.stderr, flush=True)
+
+    def _generate_stream(self, pcm, max_tokens, temperature):
+        """Yield deltas as SGLang decodes, not one buffered final result."""
+        events = queue.Queue()
+        end_of_stream = object()
+
+        def call():
+            try:
+                for event in self.backend.iter_stream(
+                        pcm, max_tokens, temperature,
+                        self._backend_request_id):
+                    events.put(event)
+                    if event.finish_reason == "abort":
+                        print(f"SGLANG_ABORT_CONFIRMED "
+                              f"rid={self._backend_request_id} finish=abort "
+                              f"tokens={event.generation_tokens}", flush=True)
+                        break
+            except Exception as exc:
+                events.put(exc)
+            finally:
+                events.put(end_of_stream)
+
+        thread = threading.Thread(target=call, name="qwen-asr-stream",
+                                  daemon=True)
+        self.backend.prepare_request()
+        thread.start()
+        completed = False
+        prefix_seen = False
+        accumulated = ""
+        emitted = 0
+        try:
+            while True:
+                try:
+                    item = events.get(timeout=self.poll_interval)
+                except queue.Empty:
+                    # Empty responses let MLXStage.poll_events observe aborts.
+                    yield SimpleNamespace(text="")
+                    continue
+                if item is end_of_stream:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                if item.finish_reason is not None:
+                    if item.finish_reason == "abort":
+                        raise ValueError("SGLang aborted the transcription")
+                    completed = True
+                    print(f"SGLANG_STREAM_DONE rid={self._backend_request_id} "
+                          f"tokens={item.generation_tokens} "
+                          f"finish={item.finish_reason}", flush=True)
+                    yield SimpleNamespace(text="",
+                                          generation_tokens=item.generation_tokens,
+                                          finish_reason=item.finish_reason)
+                    break
+                full = item.text
+                # SGLang repeats "language ...<asr_text>" on every cumulative
+                # event, so strip the marker from each event, not only the first.
+                marker = full.find("<asr_text>")
+                if marker >= 0:
+                    prefix_seen = True
+                    full = full[marker + len("<asr_text>"):]
+                elif not prefix_seen:
+                    continue
+                # SGLang streams cumulative text. Emit only the new suffix.
+                if full.startswith(accumulated):
+                    delta = full[len(accumulated):]
+                else:
+                    delta = full
+                accumulated = full
+                if delta:
+                    emitted += 1
+                    print(f"SGLANG_STREAM_DELTA "
+                          f"rid={self._backend_request_id} index={emitted} "
+                          f"chars={len(delta)}", flush=True)
+                    yield SimpleNamespace(text=delta)
+        finally:
+            if not completed:
+                self._abort_backend("cancelled-during-stream")
+            thread.join(10)
+            if thread.is_alive():
+                self.backend.close_active()
+                thread.join(2)
+            if not completed:
+                print(f"SGLANG_ABORT_THREAD rid={self._backend_request_id} "
+                      f"alive={thread.is_alive()}", flush=True)
+            if thread.is_alive():
+                print("SGLang stream thread did not exit after abort",
                       file=sys.stderr, flush=True)
 
 

@@ -106,7 +106,8 @@ void usage(const std::string& command, std::ostream& out) {
   } else if (command == "realtime") {
     out << "usage: umm-infer realtime --url http://127.0.0.1:8000 --model M --file PATH "
            "[--format wav|pcm] [--language L] [--prompt TEXT] [--live-result] "
-           "[--chunk-ms N] [--final-timeout-ms N] [--final-url URL] [--stall-ms N]\n";
+           "[--chunk-ms N] [--final-timeout-ms N] [--final-url URL] [--stall-ms N] "
+           "[--ping-interval-ms N]\n";
   } else if (command == "image") {
     out << "usage: umm-infer image generate --url URL --model M --prompt TEXT --out PATH\n"
            "           [--n N] [--size WxH] [--field NAME=VALUE ...] [--timeout-ms N]\n"
@@ -517,7 +518,8 @@ int transcribe(int argc, char** argv, std::atomic<bool>* cancel) {
 int realtime(int argc, char** argv, std::atomic<bool>* cancel) {
   Options options(argc, argv, 2,
                   {"url", "final-url", "model", "file", "format", "language", "prompt", "audio-layout",
-                   "max-new-tokens", "chunk-ms", "final-timeout-ms", "stall-ms"},
+                   "max-new-tokens", "chunk-ms", "final-timeout-ms", "stall-ms",
+                   "ping-interval-ms"},
                   {"live-result"});
   if (options.help) {
     usage("realtime", std::cout);
@@ -531,6 +533,7 @@ int realtime(int argc, char** argv, std::atomic<bool>* cancel) {
   request.max_new_tokens = static_cast<int>(integer(options, "max-new-tokens", 0, 0, 1000000));
   request.live_result = options.has("live-result");
   request.final_timeout = milliseconds(options, "final-timeout-ms", request.final_timeout.count());
+  request.ping_interval = milliseconds(options, "ping-interval-ms", 0);
   request.cancel = cancel;
   request.on_partial = [](const std::string& text) {
     std::cerr << "partial: " << text << '\n';
@@ -555,7 +558,13 @@ int realtime(int argc, char** argv, std::atomic<bool>* cancel) {
     if (offset < pcm.size()) pause(chunk_ms);
   }
   if (cancel->load()) throw Error(ErrorCode::kCancelled, "request cancelled");
-  std::cout << session->finish().text << '\n';
+  const TranscribeResponse response = session->finish();
+  if (request.ping_interval.count() > 0) {
+    const auto stats = session->ping_stats();
+    std::cerr << "realtime ping sent=" << stats.sent << " pong=" << stats.pongs
+              << '\n';
+  }
+  std::cout << response.text << '\n';
   return 0;
 }
 

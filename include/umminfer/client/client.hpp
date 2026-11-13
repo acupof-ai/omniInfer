@@ -245,6 +245,9 @@ struct RealtimeRequest {
   bool live_result = false;
   Milliseconds connect_timeout{0};
   Milliseconds final_timeout{20000};
+  // Sends WebSocket PING control frames at this interval while the session is
+  // active. Zero disables them. Pongs are counted, not injected by a test.
+  Milliseconds ping_interval{0};
   std::function<void(const std::string&)> on_partial;
   CancelFlag cancel = nullptr;
 };
@@ -271,9 +274,15 @@ class RealtimeSession {
   RealtimeSession(const RealtimeSession&) = delete;
   RealtimeSession& operator=(const RealtimeSession&) = delete;
 
+  struct PingStats {
+    uint64_t sent = 0;
+    uint64_t pongs = 0;
+  };
+
   void send(std::string_view pcm);
   TranscribeResponse finish();
   void close();
+  PingStats ping_stats() const;
 
  private:
   struct Impl;

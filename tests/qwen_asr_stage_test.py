@@ -198,7 +198,7 @@ class StageTests(unittest.TestCase):
         invalid = [submit(audio=value) for value in (None, bytearray(PCM), b"", b"\x00")]
         invalid += [submit(max_new_tokens=value) for value in (True, 0, 4097, "3")]
         invalid += [submit(temperature=value) for value in (True, math.nan, -0.1, 0.1)]
-        invalid += [submit(stream=True), submit(stream=1)]
+        invalid += [submit(stream=1)]
         extra = submit()
         extra["data"]["request"]["inputs"]["language"] = "zh"
         invalid.append(extra)
@@ -267,6 +267,86 @@ class StageTests(unittest.TestCase):
         result = stage.coordinator_socket.messages[-1]
         self.assertTrue(result["success"])
         self.assertEqual(result["request_id"], "after-abort")
+
+    def test_stream_emits_incremental_deltas_and_one_final(self):
+        class StreamBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.aborted = []
+
+            def prepare_request(self):
+                pass
+
+            def abort_request(self, request_id):
+                self.aborted.append(request_id)
+
+            def iter_stream(self, pcm, max_tokens, temperature, request_id):
+                self.calls.append((pcm, max_tokens, temperature, request_id))
+                for text in ("language Chinese",
+                             "language Chinese<asr_text>甚至",
+                             "language Chinese<asr_text>甚至出现",
+                             "language Chinese<asr_text>甚至出现交易。"):
+                    yield SimpleNamespace(text=text, generation_tokens=len(text),
+                                          finish_reason=None)
+                yield SimpleNamespace(text="", generation_tokens=12,
+                                      finish_reason="stop")
+
+        backend = StreamBackend()
+        stage = self.make_stage(backend)
+        stage.process(submit(request_id="stream-1", stream=True))
+        messages = stage.coordinator_socket.messages
+        deltas = [m["chunk"]["text"] for m in messages if m["type"] == "stream"]
+        # The language prefix is not transcript; each delta is new text only.
+        self.assertEqual(deltas, ["甚至", "出现", "交易。"])
+        self.assertEqual([m["type"] for m in messages],
+                         ["stream", "stream", "stream", "complete"])
+        self.assertEqual(messages[-1]["result"], {
+            "text": "甚至出现交易。", "generated_token_count": 12,
+            "finish_reason": "stop"})
+        self.assertEqual(backend.calls, [(PCM, 128, 0.0, "umminfer-stream-1")])
+        self.assertEqual(backend.aborted, [])
+
+    def test_stream_abort_requests_gpu_abort_and_next_request_works(self):
+        class SlowStreamBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.aborted = []
+
+            def prepare_request(self):
+                pass
+
+            def abort_request(self, request_id):
+                self.aborted.append(request_id)
+                self.release.set()
+
+            def iter_stream(self, pcm, max_tokens, temperature, request_id):
+                self.started.set()
+                yield SimpleNamespace(text="language Chinese<asr_text>a",
+                                      generation_tokens=1, finish_reason=None)
+                self.release.wait(3)
+                yield SimpleNamespace(text="", generation_tokens=2,
+                                      finish_reason="abort")
+
+        backend = SlowStreamBackend()
+        stage = self.make_stage(backend)
+        thread = threading.Thread(
+            target=stage.process, args=(submit(request_id="stream-abort",
+                                               stream=True),))
+        thread.start()
+        self.assertTrue(backend.started.wait(1))
+        stage.record_abort("stream-abort")
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        # No complete is emitted for an aborted request, and the backend was
+        # asked to stop on the scheduler rather than only closing the socket.
+        self.assertFalse(any(m["type"] == "complete"
+                             for m in stage.coordinator_socket.messages))
+        self.assertEqual(backend.aborted, ["umminfer-stream-abort"])
+        stage.backend = FakeBackend()
+        stage.process(submit(request_id="after-stream-abort"))
+        self.assertTrue(stage.coordinator_socket.messages[-1]["success"])
 
     def test_real_zmq_ready_submit_and_shutdown(self):
         context = zmq.Context()
