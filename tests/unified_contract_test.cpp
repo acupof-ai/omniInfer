@@ -2192,6 +2192,47 @@ void test_public_http_asr_model_failure() {
   engine.release(next);
 }
 
+// Without a unified engine, session_id must be rejected, not accepted and
+// dropped. This keeps the server-wide unknown-field contract intact.
+void test_public_http_session_id_requires_unified() {
+  Harness h("plainsession");
+  ApiConfig config;
+  config.host = "127.0.0.1";
+  config.port = 0;
+  config.model = "qwen3-unified";
+  config.request_timeout_s = 5.0;
+  OpenAIApi api(h.coordinator, config);
+  check(api.bind(), "plain server did not bind");
+  h.start_pump();
+  std::thread server_thread([&] { api.listen(); });
+
+  nlohmann::json body = {
+      {"model", "qwen3-unified"},
+      {"session_id", "plain-session"},
+      {"messages", nlohmann::json::array({nlohmann::json{
+           {"role", "user"}, {"content", "hello"}}})}};
+  client::detail::HttpRequest request;
+  request.url = "http://127.0.0.1:" + std::to_string(api.bound_port()) +
+                "/v1/chat/completions";
+  request.body = body.dump();
+  request.headers.emplace("Content-Type", "application/json");
+  request.timeout = client::Milliseconds{5000};
+  bool rejected_with_400 = false;
+  try {
+    client::detail::perform(request);
+  } catch (const client::Error& exc) {
+    rejected_with_400 =
+        std::string(exc.what()).find("HTTP 400") != std::string::npos &&
+        std::string(exc.what()).find("requires unified mode") != std::string::npos;
+  }
+  check(rejected_with_400,
+        "a non-unified request accepted session_id instead of rejecting it");
+  check(h.no_submit(h.asr_recv),
+        "a non-unified request with session_id reached the ASR stage");
+  api.stop();
+  server_thread.join();
+}
+
 }  // namespace
 
 int main() {
@@ -2232,5 +2273,6 @@ int main() {
   test_public_http_asr_model_failure();
   test_public_http_joint_input();
   test_public_http_unified_errors();
+  test_public_http_session_id_requires_unified();
   return g_failures == 0 ? 0 : 1;
 }

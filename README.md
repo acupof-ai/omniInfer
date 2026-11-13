@@ -411,7 +411,9 @@ characters. It is a grouping label, not conversation history:
 - no transcript, answer, or message history crosses between requests.
 
 There is no multi-turn context in this mode. A client that needs history must
-send it as its own state.
+send it as its own state. A server without a unified engine rejects a non-null
+`session_id` with HTTP 400 `session_id requires unified mode`; it is never
+accepted and dropped.
 
 SSE remains `chat.completion.chunk`. A chunk can carry a `unified` object with
 `kind`, `stage`, `seq`, `session_id`, `is_final`, and `text`. Assistant `content`

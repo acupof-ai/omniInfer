@@ -1033,6 +1033,14 @@ class OpenAIApi::Impl {
         return;
       }
     }
+    // session_id is a unified-mode field. No other mode consumes it, so
+    // accepting it there would silently drop it and weaken the unknown-field
+    // contract.
+    if (body.contains("session_id") && !body["session_id"].is_null() &&
+        !unified_engine_) {
+      reject("session_id requires unified mode");
+      return;
+    }
     if (body.contains("stream_options") && !body["stream_options"].is_null()) {
       const json& options = body["stream_options"];
       if (!stream) {
