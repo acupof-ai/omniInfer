@@ -46,6 +46,13 @@ class FakeSGLang(BaseHTTPRequestHandler):
         self.reply_json({"data": [{"id": "qwen3-omni"}]})
 
     def do_POST(self):
+        if self.path == "/abort_request":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length))
+            self.server.aborts.append(body.get("rid"))
+            self.server.cancelled.set()
+            self.reply_json({})
+            return
         if self.path != "/v1/chat/completions":
             self.send_error(404)
             return
@@ -63,6 +70,11 @@ class FakeSGLang(BaseHTTPRequestHandler):
                 self.chunk("first")
                 for index in range(200):
                     time.sleep(0.02)
+                    if self.server.cancelled.is_set():
+                        # Same confirmation frame SGLang sends for a graceful
+                        # /abort_request: a finish_reason=abort chunk.
+                        self.chunk(finish="abort")
+                        return
                     self.chunk("x")
                 return
             for text in ("a", "", "b"):
@@ -109,10 +121,16 @@ class OverlapSGLang(FakeSGLang):
                 OverlapSGLang.active -= 1
 
 
+def forwarded_rids(requests):
+    """The rid each chat request registered with the backend, in arrival order."""
+    return [request.get("rid") for request in requests]
+
+
 class WorkerProtocolTests(unittest.TestCase):
     def setUp(self):
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeSGLang)
         self.upstream.requests = []
+        self.upstream.aborts = []
         self.upstream.cancelled = threading.Event()
         self.upstream_thread = threading.Thread(
             target=self.upstream.serve_forever, daemon=True)
@@ -192,7 +210,16 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertEqual(first["chunk"]["text"], "first")
             sender.send(pack_message({"type": "abort", "request_id": "cancel"}))
             self.assertTrue(self.upstream.cancelled.wait(5),
-                            "abort did not close the upstream HTTP response")
+                            "abort did not reach the upstream")
+            # The worker must address the same rid the chat request registered.
+            rids = [request["rid"] for request in self.upstream.requests]
+            self.assertEqual(len(self.upstream.aborts), 1)
+            self.assertEqual(self.upstream.aborts[0], rids[2])
+            self.assertTrue(rids[0].startswith("r@"))
+            self.assertTrue(rids[1].startswith("plain@"))
+            self.assertTrue(rids[2].startswith("cancel@"))
+            # Every rid carries the per-process tag, so restarts cannot collide.
+            self.assertEqual(len({rid.split("@", 1)[1] for rid in rids}), 1)
 
             sender.send(pack_message(self.submit(request_id="after")))
             while True:

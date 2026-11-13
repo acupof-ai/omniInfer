@@ -218,6 +218,17 @@ StagePayload joint_request(const std::string& session_id = "") {
   return payload;
 }
 
+// Real PCM selects the ASR leg. The optional flag is the documented opt-in for
+// incremental ASR events through the unified chat route.
+StagePayload audio_leg_request(bool asr_partials) {
+  StagePayload payload = audio_request();
+  Value::Map inputs = payload.request.inputs.as_map();
+  inputs["audio"] = Value::bin(std::string(800, '\0'));
+  if (asr_partials) inputs["asr_partials"] = Value(true);
+  payload.request.inputs = Value(std::move(inputs));
+  return payload;
+}
+
 Value::Map text_chunk(const std::string& text, bool is_final) {
   Value::Map chunk;
   chunk["text"] = Value(text);
@@ -426,6 +437,151 @@ void test_streaming_asr_to_vlm() {
             final_info->result.find("text") != nullptr &&
             final_info->result.find("text")->as_str() == "hi there",
         "info() did not retain the unified VLM terminal state");
+  engine.release(id);
+}
+
+// Opt-in ASR partials: the ASR leg request streams, partial deltas precede one
+// final, and the final replaces the concatenated partials for the VLM prompt.
+void test_asr_partials_opt_in() {
+  Harness h("partials");
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
+  EventLog log;
+  engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
+
+  const std::string id = engine.submit(audio_leg_request(true));
+  auto asr_submit = h.next_submit(h.asr_recv);
+  check(asr_submit.has_value(), "opt-in ASR partial request was not submitted");
+  if (asr_submit) {
+    StagePayload sent = StagePayload::from_value(asr_submit->data);
+    check(sent.request.params.at("stream").as_bool(),
+          "opt-in request did not ask the ASR stage to stream");
+    check(sent.request.inputs.find("asr_partials") == nullptr,
+          "the ASR stage received the opt-in hint instead of audio only");
+  }
+
+  h.stream(id, "asr", text_chunk("hel", false));
+  h.stream(id, "asr", text_chunk("lo", false));
+  h.complete(id, "asr", true, text_result("hello"));
+  auto vlm_submit = h.next_submit(h.vlm_recv);
+  check(vlm_submit.has_value(), "opt-in ASR leg did not reach the VLM leg");
+  if (vlm_submit) {
+    StagePayload sent = StagePayload::from_value(vlm_submit->data);
+    const Value& messages = *sent.request.inputs.find("messages");
+    check(messages.as_array().at(0).find("content")->as_str() == "hello",
+          "partial deltas were not replaced by the final transcript");
+  }
+  h.complete(id + ":vlm", "vlm", true, text_result("answer"));
+  check(engine.wait(id, 5.0), "opt-in ASR partial request did not complete");
+
+  const auto events = log.snapshot();
+  if (events.size() != 4) {
+    check(false, "wrong event count for the ASR partial flow");
+    engine.release(id);
+    return;
+  }
+  const UnifiedEvent::Kind expected[] = {
+      UnifiedEvent::Kind::kAsrPartial, UnifiedEvent::Kind::kAsrPartial,
+      UnifiedEvent::Kind::kAsrFinal, UnifiedEvent::Kind::kComplete};
+  for (size_t i = 0; i < events.size(); ++i) {
+    check(events[i].seq == static_cast<int64_t>(i),
+          "ASR partial sequence is not gap-free");
+    check(events[i].kind == expected[i], "ASR partial event out of order");
+    check(events[i].request_id == id, "ASR partial leaked the child id");
+  }
+  check(events[0].text == "hel" && events[1].text == "lo" &&
+            !events[0].is_final && !events[1].is_final,
+        "ASR partial events do not carry the delta text");
+  check(events[2].is_final && events[2].text == "hello",
+        "ASR final does not replace the partial text");
+  engine.release(id);
+}
+
+// Default request: the ASR leg is not asked to stream and no partial is emitted.
+void test_asr_partials_default_off() {
+  Harness h("partialsoff");
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
+  EventLog log;
+  engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
+
+  const std::string id = engine.submit(audio_leg_request(false));
+  auto asr_submit = h.next_submit(h.asr_recv);
+  check(asr_submit.has_value(), "default ASR request was not submitted");
+  if (asr_submit) {
+    StagePayload sent = StagePayload::from_value(asr_submit->data);
+    check(!sent.request.params.at("stream").as_bool(),
+          "a default request asked the ASR stage to stream");
+  }
+  h.complete(id, "asr", true, text_result("hello"));
+  check(h.next_submit(h.vlm_recv).has_value(),
+        "default ASR leg did not reach the VLM leg");
+  h.complete(id + ":vlm", "vlm", true, text_result("answer"));
+  check(engine.wait(id, 5.0), "default request did not complete");
+  for (const auto& event : log.snapshot()) {
+    check(event.kind != UnifiedEvent::Kind::kAsrPartial,
+          "a default request emitted an ASR partial");
+  }
+  engine.release(id);
+}
+
+// Cancel after a partial: exactly one cancelled terminal, no VLM submit.
+void test_asr_partials_cancel() {
+  Harness h("partialscancel");
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
+  EventLog log;
+  engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
+  engine.on_terminal = [&](const UnifiedEvent& event) {
+    log.finish(event);
+  };
+
+  const std::string id = engine.submit(audio_leg_request(true));
+  check(h.next_submit(h.asr_recv).has_value(), "ASR leg was not submitted");
+  h.stream(id, "asr", text_chunk("par", false));
+  wait_until([&] { return log.size() == 1; },
+             "the ASR partial event was not delivered before the cancel");
+  check(engine.cancel(id), "cancel was rejected before the ASR leg finished");
+  check(h.wait_abort(id), "the ASR stage did not observe the abort");
+  h.complete(id, "asr", false, Value{}, std::string("request aborted"));
+  check(engine.wait(id, 5.0), "cancelled request did not settle");
+  h.no_submit(h.vlm_recv);
+
+  const auto terminal = log.terminal_for(id);
+  check(terminal && terminal->kind == UnifiedEvent::Kind::kCancelled,
+        "cancel after a partial did not produce a cancelled terminal");
+  check(log.terminal_count(id) == 1,
+        "cancel after a partial produced more than one terminal");
+  for (const auto& event : log.snapshot()) {
+    check(event.kind != UnifiedEvent::Kind::kVlmDelta,
+          "a cancelled partial request emitted a VLM delta");
+  }
+  check(engine.in_flight() == 0, "cancelled request stayed in flight");
+  engine.release(id);
+}
+
+// An ASR stream failure after a partial: exactly one error terminal.
+void test_asr_partials_error() {
+  Harness h("partialserror");
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
+  EventLog log;
+  engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
+  engine.on_terminal = [&](const UnifiedEvent& event) { log.finish(event); };
+
+  const std::string id = engine.submit(audio_leg_request(true));
+  check(h.next_submit(h.asr_recv).has_value(), "ASR leg was not submitted");
+  h.stream(id, "asr", text_chunk("par", false));
+  h.complete(id, "asr", false, Value{}, std::string("backend reset"));
+  check(engine.wait(id, 5.0), "failed partial request did not settle");
+
+  const auto terminal = log.terminal_for(id);
+  check(terminal && terminal->kind == UnifiedEvent::Kind::kError &&
+            terminal->error == "backend reset",
+        "ASR stream failure did not produce the error terminal");
+  check(log.terminal_count(id) == 1,
+        "ASR stream failure produced more than one terminal");
+  check(h.no_submit(h.vlm_recv), "a failed ASR leg started the VLM leg");
   engine.release(id);
 }
 
@@ -2238,6 +2394,10 @@ void test_public_http_session_id_requires_unified() {
 int main() {
   alarm(120);
   test_streaming_asr_to_vlm();
+  test_asr_partials_opt_in();
+  test_asr_partials_default_off();
+  test_asr_partials_cancel();
+  test_asr_partials_error();
   test_nonstream_asr_synthesizes_final();
   test_asr_plain_string_result();
   test_asr_malformed_result_fails();

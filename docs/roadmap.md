@@ -49,9 +49,11 @@ real backend; evidence is in
 Realtime streaming added on 2026-11-13: the Qwen ASR stage requests SGLang
 streaming, the realtime route forwards cumulative partials, the real client
 sends PING control frames during the stream, and cancellation asks SGLang to
-abort and records its `finish_reason=abort`. The remaining gates are explicit:
-ASR partials through the unified chat route, GPU abort confirmation for the
-VLM/Omni leg, a model-compute failure distinct from backend loss, and the Mac
+abort and records its `finish_reason=abort`. On 2026-11-13 the unified chat
+route also passed opt-in ASR partials and a VLM-leg GPU abort with SGLang
+`finish_reason=abort`; that evidence is in
+`/tmp/umminfer-phase5-streaming-abort-evidence/`. The remaining gates are
+explicit: a model-compute failure distinct from backend loss and the Mac
 unified profile are `NOT_COVERED`. Model
 revisions are `UNKNOWN`; weights hashes, full resource attribution, and output
 reproducibility are not a complete Phase 3 record. CUDA build, IPC, sanitizer,
@@ -333,10 +335,10 @@ session reuse, or the Mac profile. Those remain `NOT_COVERED`.
 These are not repeated from the README limits list.
 
 - CUDA build, execution, IPC, stress, and compute-sanitizer on any host.
-- ASR partials through the unified chat route, GPU-side abort confirmation for
-  the VLM/Omni leg, session reuse, joint image+audio input, and the Mac unified
-  profile. Realtime partials, ASR GPU abort, and real-client control-frame
-  interleaving are covered on the realtime route only.
+- Session reuse and the Mac unified profile. Unified ASR partials, joint
+  image+audio, and VLM/Omni GPU abort confirmation are covered by the unified
+  H20B run; realtime partials, ASR GPU abort, and real-client control-frame
+  interleaving are covered on the realtime route.
 - A first-party HTTP 429 with `Retry-After` from this server.
 - A successful upstream forward through the proxy. The in-tree tests prove
   configuration, route gating, and a connect failure only.

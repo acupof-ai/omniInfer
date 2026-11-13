@@ -168,7 +168,8 @@ request at a time. Concurrency 1 is the recommended mode for this deployment.
   commits. Image through `UnifiedEngine`, joint image + audio, and realtime
   partials were not exercised by this benchmark; their separate H20B evidence is
   in [README](../README.md#run-real-qwen-asr---vlm). ASR partials through the
-  unified chat route remain `NOT_COVERED`.
+  unified chat route and the VLM/Omni GPU abort were validated separately on
+  2026-11-13; this benchmark does not measure them.
 * Cancellation latency, queue depth, and per-worker model-time attribution were
   not measured by this benchmark. Cancellation correctness is covered by the
   separate Phase 4 cancel/failure evidence.

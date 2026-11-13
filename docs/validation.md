@@ -299,13 +299,33 @@ not establish model acceptance. Limit Mac execution to low-resource real-model
 tests. Any editing, reference-count, or output-format case that was not executed
 remains `NOT_COVERED`.
 
+## 5c. Unified ASR partials and VLM GPU abort
+
+`tests/unified_partial_abort_live.py` drives the real Qwen3-ASR and Qwen3-Omni
+workers through public HTTP/SSE. It requires `UMMINFER_LIVE_OPT_IN=1`, the
+ReleaseFast binary, both SGLang backends, and real audio.
+
+```sh
+UMMINFER_LIVE_OPT_IN=1 python3 -I tests/unified_partial_abort_live.py \
+  --server ./zig-out/bin/umm-infer \
+  --asr-backend http://127.0.0.1:43100 \
+  --omni-backend http://127.0.0.1:43101 \
+  --audio asr_zh.wav --cancel-audio asr_en_120s.wav \
+  --image man_ironing.png \
+  --evidence-dir /tmp/umminfer-phase5-streaming-abort-evidence
+```
+
+Expected result, recorded on H20B 2026-11-13: a default request carries one
+`asr_final` and no `asr_partial`; `stream_options.include_asr_partials` adds
+ordered `asr_partial` deltas before one `asr_final`, then `vlm_delta`, with
+gap-free `seq` and one terminal; a cancel during the VLM stream yields exactly
+one `cancelled`, no later delta, `/abort` 200, `in_flight=0`, and the Omni
+worker logs `SGLANG_ABORT_CONFIRMED ... finish=abort`; the next request
+completes. `tests/sglang_abort_probe.py` records the backend-only confirmation:
+`/abort_request` 200 and a raw SSE `finish_reason="abort"` frame.
+
 ## NOT_COVERED
 
-- ASR partials through the unified chat route: that route still submits the ASR
-  leg with `stream=false`. Realtime partials are covered.
-- GPU-side abort confirmation for the VLM/Omni leg: the Omni worker closes its
-  upstream stream, and this path observes no per-request backend abort
-  acknowledgement. The ASR leg is confirmed through `/abort_request`.
 - A first-party HTTP 429 with `Retry-After`: this server does not emit one.
   Synthetic protocol responses are not validation evidence.
 - `other_501_502_public_client`: upstream route status mapping is being changed

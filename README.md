@@ -150,7 +150,7 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | Image generation and edit, video jobs | `image`, `video`, `/v1/images/*`, `/v1/videos*` | Fixed upstream proxy only |
 | Trained ASR worker | `umminfer_qwen_asr_stage.py` | Real `qwen3-asr` transcription verified on H20B |
 | Incremental ASR streaming and realtime partials | `stream=true` stage request, `/v1/realtime` | Verified on real `qwen3-asr` on H20B: 7 cumulative partials then one final; audio is buffered until `transcription.done` |
-| GPU-side abort confirmation, ASR leg | stage abort -> SGLang `/abort_request` | Verified on H20B: backend ended the stream with `finish_reason=abort`; VLM/Omni leg `NOT_COVERED` |
+| GPU-side abort confirmation, both legs | stage abort -> SGLang `/abort_request` with the request `rid` | Verified on H20B: ASR and VLM/Omni streams each ended with `finish_reason=abort`; evidence in `/tmp/umminfer-phase5-streaming-abort-evidence/` |
 | WebSocket control-frame interleaving | `realtime --ping-interval-ms` | Verified with real client PING/PONG frames during a continuous stream |
 | Real VLM worker | `umminfer_qwen_omni_worker.py` | Real `qwen3-omni` streamed text and image input verified on H20B |
 | Cross-model orchestration | `UnifiedEngine`, `serve --vlm-entry-endpoint` | Public HTTP/SSE and real CLI ASR -> VLM verified on H20B |
@@ -432,6 +432,25 @@ contains VLM output only; the ASR transcript is in the `asr_final` metadata.
 `/ready` requires both workers. `/abort` cancels the unified request, and
 `/health.in_flight` reports unified requests in this mode.
 
+ASR increment output is opt-in per request. Send
+`"stream_options": {"include_asr_partials": true}` with `"stream": true` in
+unified mode. The ASR leg then requests SGLang streaming, and the event order is
+`asr_partial` (deltas, `is_final=false`) -> one `asr_final` (the complete
+transcript, which replaces the partials) -> `vlm_delta` -> one terminal. `seq`
+stays gap-free from 0. Without the field the ASR leg still submits
+`stream=false`, so the default stream is exactly one `asr_final`, then VLM
+deltas, then one terminal. A server without a unified engine rejects the field
+with HTTP 400 `stream_options.include_asr_partials requires unified mode`.
+`include_usage` remains unsupported.
+
+A cancel during the VLM leg reaches the GPU scheduler. The Omni worker registers
+a per-process-unique `rid` with `/v1/chat/completions` and, on cancel, posts that
+rid to SGLang `/abort_request`. SGLang confirms on the generate stream with
+`finish_reason: "abort"`; the worker records
+`SGLANG_ABORT_CONFIRMED rid=... finish=abort` after the abort POST returns 200.
+A local socket close is not treated as confirmation. The public stream still
+ends with exactly one `cancelled` terminal.
+
 Both Qwen workers accept `--concurrency N`, where 1 is the serial default and N
 runs up to N upstream requests in parallel so the SGLang backend can batch
 them. The H20B A/B used 4; see
@@ -546,10 +565,29 @@ tests cover both cases and the cancellation test fails on the pre-fix source.
 Recorded evidence is under `/tmp/umminfer-phase4-cancel-failure-evidence/`
 (`results/`, `workers/`, `server/`, `backend/`, `tests/`, `SHA256SUMS`); it is
 not a committed artifact. Still `NOT_COVERED`: an SGLang-side abort line (this
-backend logs none), GPU-level confirmation that decode stopped, a failure inside
-model compute rather than loss of the backend process, ASR partials through the
-unified chat route, and GPU abort confirmation for the VLM/Omni leg. Both model
+backend logs none), GPU-level confirmation that decode stopped, and a failure
+inside model compute rather than loss of the backend process. Both model
 revisions remain `UNKNOWN`.
+
+### Unified ASR partials and VLM abort, recorded on 2026-11-13
+
+`tests/unified_partial_abort_live.py` ran the real Qwen3-ASR and Qwen3-Omni
+workers through public HTTP/SSE on H20B. Five cases passed:
+
+| Case | Result |
+| --- | --- |
+| Default request | One `asr_final`, no `asr_partial`, VLM deltas, one `complete` |
+| `include_asr_partials` | 7 `asr_partial` deltas before one `asr_final`, then `vlm_delta`; gap-free `seq`; one `complete` |
+| Cancel during the VLM stream | One `cancelled`; no later delta; `/abort` 200; `in_flight=0`; worker logged `SGLANG_ABORT_CONFIRMED rid=http-3:vlm@<pid> finish=abort` |
+| Recovery | The next request completed with `in_flight=0` |
+| Joint image + audio, opt-in | Partials, final, VLM deltas, one `complete` |
+
+A separate `tests/sglang_abort_probe.py` run against the backend alone recorded
+`POST /abort_request` 200 and 16 raw SSE frames ending in `finish_reason=abort`.
+Evidence, including frames, worker logs, health, input SHA256, commands, env and
+`SHA256SUMS`, is under `/tmp/umminfer-phase5-streaming-abort-evidence/`; it is
+not a committed artifact. SGLang source evidence for caller `rid` and the
+graceful-abort frame is in `backend-code-evidence.txt` in that directory.
 
 ### Realtime streaming and ASR abort, recorded on 2026-11-13
 
@@ -563,12 +601,12 @@ request succeeded. Functional evidence is under
 teardown regression matrix is under
 `/tmp/umminfer-phase4-streaming-supervisor/rework/`.
 
-These cases remain `NOT_COVERED`: ASR partials through the unified chat route
-(that route still submits ASR non-streaming), GPU-side abort confirmation for
-the VLM/Omni leg, a model-compute failure distinct from backend loss, an
-SGLang-side abort log line (this backend logs none), and GPU-level confirmation
-that decode stopped. Both model revisions remain `UNKNOWN`. Audio-only evidence
-does not complete every Phase 2 or Phase 3 gate.
+These cases remain `NOT_COVERED`: a model-compute failure distinct from backend
+loss, an SGLang-side abort log line (this backend logs none), and GPU-level
+confirmation that decode stopped. Both model revisions remain `UNKNOWN`.
+Audio-only evidence does not complete every Phase 2 or Phase 3 gate.
+ASR partials through the unified chat route and VLM/Omni GPU abort confirmation
+are covered by the unified run above.
 
 ## Run the audio test pipeline
 

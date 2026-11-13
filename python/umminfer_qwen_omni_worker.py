@@ -7,9 +7,15 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
+import queue
 import signal
+import sys
+import threading
+import time
 from types import SimpleNamespace
+import urllib.error
 import urllib.request
 
 
@@ -73,13 +79,55 @@ class QwenOmniWorker(MLXStage):
         self.upstream_model = upstream_model
         self.request_timeout = request_timeout
         self.log_requests = log_requests
+        self._backend_request_id = None
+        # SGLang keys rid_to_state by rid. Coordinator ids restart with each
+        # server process, so a reused id would collide with a rid the backend
+        # still holds. A per-process tag keeps every submitted rid unique.
+        self.backend_tag = str(os.getpid())
+        # A blocked upstream read yields an empty response so the stage loop
+        # can observe an abort between tokens, as the ASR stage already does.
+        self.poll_interval = 0.1
 
     def open_upstream(self, path, payload=None):
         data = None if payload is None else json.dumps(payload).encode()
         request = urllib.request.Request(
             self.model_path + path, data=data,
             headers={"Content-Type": "application/json"})
-        return urllib.request.urlopen(request, timeout=self.request_timeout)
+        try:
+            return urllib.request.urlopen(request, timeout=self.request_timeout)
+        except urllib.error.HTTPError as exc:
+            # Keep the backend's reason. A bare "HTTP Error 400" hides which
+            # field the SGLang protocol rejected.
+            detail = exc.read(4096).decode("utf-8", "replace")
+            raise RuntimeError(
+                f"SGLang HTTP {exc.code}: {detail}") from exc
+
+    def abort_url(self):
+        """SGLang serves /abort_request at the origin, not under the /v1 base."""
+        root = self.model_path
+        return (root[:-3] if root.endswith("/v1") else root) + "/abort_request"
+
+    def request_abort(self, request_id):
+        """Ask SGLang to stop this rid on the GPU scheduler.
+
+        A local response close drops one HTTP client and stops no GPU work.
+        The confirmation is not this call's 200: the reader thread sees the
+        generate stream end with finish_reason "abort".
+        """
+        print(f"SGLANG_ABORT_REQUEST rid={request_id}", flush=True)
+        request = urllib.request.Request(
+            self.abort_url(),
+            data=json.dumps({"rid": request_id}).encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=10.0) as reply:
+                print(f"SGLANG_ABORT_ACCEPTED rid={request_id} http={reply.status}",
+                      flush=True)
+                return True
+        except Exception as exc:  # noqa: BLE001 - report, never mask the cancel
+            print(f"SGLang abort_request failed for {request_id}: {exc}",
+                  file=sys.stderr, flush=True)
+            return False
 
     def load(self):
         if self.generate is not None:
@@ -126,12 +174,19 @@ class QwenOmniWorker(MLXStage):
         stream = params.get("stream", False)
         if not isinstance(stream, bool):
             raise ValueError("stream must be a boolean")
+        # SGLang registers this rid for the upstream request. POST
+        # /abort_request needs the same value to stop this request on the
+        # scheduler. Request threads keep their own value.
+        request_id = f"{message['request_id']}@{self.backend_tag}"
+        self._backend_request_id = request_id
+        self.local.backend_request_id = request_id
         if self.log_requests:
-            print(f"Qwen Omni request {message['request_id']} received "
+            print(f"Qwen Omni request {request_id} received "
                   f"messages={json.dumps(summarize_images(messages), ensure_ascii=False)}",
                   flush=True)
         payload = {
             "model": self.upstream_model,
+            "rid": request_id,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": float(temperature),
@@ -153,53 +208,122 @@ class QwenOmniWorker(MLXStage):
 
     def generate_upstream(self, payload, max_tokens, temperature):
         del max_tokens, temperature  # Already validated and encoded in payload.
-        response = self.open_upstream("/chat/completions", payload)
-        usage = None
-        finish_reason = None
-        done = False
-        data_lines = []
+        request_id = getattr(self.local, "backend_request_id",
+                             self._backend_request_id)
+        # The stage loop closes this generator when it observes an abort. If the
+        # read lived here, that close would abandon the HTTP stream before
+        # SGLang could send its finish_reason=abort frame. A request thread owns
+        # the read instead, exactly as the ASR stage owns its SGLang stream, so
+        # the confirmation is still observed after the cancel.
+        events = queue.Queue()
+        end = object()
+        response_holder = {}
+        state = {"usage": None, "finish": None, "done": False,
+                 "confirmed": False, "failed": False,
+                 "abort_requested": threading.Event()}
+
+        def read():
+            usage = None
+            finish_reason = None
+            done = False
+            data_lines = []
+            try:
+                response = self.open_upstream("/chat/completions", payload)
+                response_holder["response"] = response
+                for raw_line in response:
+                    line = raw_line.decode("utf-8").rstrip("\r\n")
+                    if not line:
+                        if not data_lines:
+                            continue
+                        data = "\n".join(data_lines)
+                        data_lines = []
+                        if data == "[DONE]":
+                            done = True
+                            break
+                        event = json.loads(data)
+                        if not isinstance(event, dict):
+                            raise ValueError("SGLang SSE event must be a map")
+                        if event.get("error") is not None:
+                            raise RuntimeError(f"SGLang error: {event['error']}")
+                        if isinstance(event.get("usage"), dict):
+                            usage = event["usage"]
+                        text = ""
+                        for choice in event.get("choices", []):
+                            reason = choice.get("finish_reason")
+                            if reason is not None:
+                                finish_reason = reason
+                                if reason == "abort":
+                                    state["confirmed"] = True
+                            delta = choice.get("delta") or {}
+                            content = delta.get("content")
+                            if content is not None and not isinstance(content, str):
+                                raise ValueError("SGLang delta content must be text")
+                            if content:
+                                text += content
+                        events.put(SimpleNamespace(text=text,
+                                                   generation_tokens=None,
+                                                   finish_reason=None))
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                if not done and not state["abort_requested"].is_set():
+                    raise RuntimeError("SGLang stream ended before [DONE]")
+            except Exception as exc:  # noqa: BLE001 - delivered to the consumer
+                state["failed"] = True
+                events.put(exc)
+            finally:
+                state["usage"] = usage
+                state["finish"] = finish_reason
+                state["done"] = done
+                events.put(end)
+
+        thread = threading.Thread(target=read, name="qwen-omni-stream",
+                                  daemon=True)
+        thread.start()
+        completed = False
         try:
-            for raw_line in response:
-                line = raw_line.decode("utf-8").rstrip("\r\n")
-                if not line:
-                    if not data_lines:
-                        continue
-                    data = "\n".join(data_lines)
-                    data_lines = []
-                    if data == "[DONE]":
-                        done = True
-                        break
-                    event = json.loads(data)
-                    if not isinstance(event, dict):
-                        raise ValueError("SGLang SSE event must be a map")
-                    if event.get("error") is not None:
-                        raise RuntimeError(f"SGLang error: {event['error']}")
-                    if isinstance(event.get("usage"), dict):
-                        usage = event["usage"]
-                    text = ""
-                    for choice in event.get("choices", []):
-                        reason = choice.get("finish_reason")
-                        if reason is not None:
-                            finish_reason = reason
-                        delta = choice.get("delta") or {}
-                        content = delta.get("content")
-                        if content is not None and not isinstance(content, str):
-                            raise ValueError("SGLang delta content must be text")
-                        if content:
-                            text += content
-                    yield SimpleNamespace(text=text, generation_tokens=None,
-                                          finish_reason=None)
-                elif line.startswith("data:"):
-                    data_lines.append(line[5:].lstrip())
-            if not done:
+            while True:
+                try:
+                    item = events.get(timeout=self.poll_interval)
+                except queue.Empty:
+                    # Empty responses let the stage loop observe an abort.
+                    yield SimpleNamespace(text="")
+                    continue
+                if item is end:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+            completed = True
+            if not state["done"]:
                 raise RuntimeError("SGLang stream ended before [DONE]")
+            if state["usage"] is None:
+                raise RuntimeError("SGLang stream did not report usage")
+            generated_tokens = state["usage"].get("completion_tokens")
+            yield SimpleNamespace(text="", generation_tokens=generated_tokens,
+                                  finish_reason=state["finish"])
         finally:
-            response.close()
-        if usage is None:
-            raise RuntimeError("SGLang stream did not report usage")
-        generated_tokens = usage.get("completion_tokens")
-        yield SimpleNamespace(text="", generation_tokens=generated_tokens,
-                              finish_reason=finish_reason)
+            if not completed and not state["failed"]:
+                state["abort_requested"].set()
+                self.request_abort(request_id)
+            thread.join(10)
+            response = response_holder.get("response")
+            if thread.is_alive():
+                # The abort did not end the stream. Close the local connection
+                # so the reader thread cannot outlive its request.
+                if response is not None:
+                    response.close()
+                thread.join(2)
+            if not completed:
+                confirmed = state["confirmed"]
+                print(f"SGLANG_ABORT_{'CONFIRMED' if confirmed else 'UNCONFIRMED'} "
+                      f"rid={request_id} finish={'abort' if confirmed else 'none'}",
+                      flush=True)
+                if self.perf_log is not None:
+                    self.write_perf({"event": "gpu_abort",
+                                     "request_id": request_id,
+                                     "confirmed": confirmed})
+            if response is not None:
+                response.close()
 
 
 def main():

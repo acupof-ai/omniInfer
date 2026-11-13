@@ -1052,7 +1052,8 @@ class OpenAIApi::Impl {
         return;
       }
       for (auto it = options.begin(); it != options.end(); ++it) {
-        if (it.key() != "include_usage") {
+        if (it.key() != "include_usage" &&
+            it.key() != "include_asr_partials") {
           reject("unsupported stream_options field: " + it.key());
           return;
         }
@@ -1063,6 +1064,17 @@ class OpenAIApi::Impl {
       }
       if (options.value("include_usage", false)) {
         reject("stream_options.include_usage is not implemented by this server");
+        return;
+      }
+      if (options.contains("include_asr_partials") &&
+          !options["include_asr_partials"].is_boolean()) {
+        reject("stream_options.include_asr_partials must be a boolean");
+        return;
+      }
+      // The unified ASR leg is the only stream that can produce partials. In
+      // other modes the field would be silently ignored, so reject it.
+      if (options.value("include_asr_partials", false) && !unified_engine_) {
+        reject("stream_options.include_asr_partials requires unified mode");
         return;
       }
     }
@@ -1102,6 +1114,12 @@ class OpenAIApi::Impl {
           return;
         }
         inputs["audio"] = Value::bin(std::move(pcm));
+        // Opt-in ASR increment output. Absent by default, so the default event
+        // contract is unchanged: one asr_final, then VLM deltas.
+        if (body.contains("stream_options") &&
+            body["stream_options"].value("include_asr_partials", false)) {
+          inputs["asr_partials"] = Value(true);
+        }
         // session_id is a grouping label, not conversation history. It reaches
         // the engine so every event of every request in the group carries it.
         if (body.contains("session_id") && !body["session_id"].is_null()) {

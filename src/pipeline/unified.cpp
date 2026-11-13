@@ -257,6 +257,17 @@ std::string UnifiedEngine::submit(StagePayload payload) {
   Value original_inputs = inputs;
   auto vlm_params = payload.request.params;
   auto vlm_metadata = payload.request.metadata;
+  // ASR partials are opt-in per request: inputs.asr_partials is set only when
+  // the caller asked for increment output. Without it the ASR leg keeps the
+  // aggregated request and the event stream stays asr_final -> vlm_delta.
+  bool asr_partials = false;
+  if (const Value* requested = original_inputs.find("asr_partials");
+      requested != nullptr) {
+    if (!requested->is_bool()) {
+      throw ProtocolError("asr_partials must be a boolean");
+    }
+    asr_partials = requested->as_bool();
+  }
   if (const Value* audio = inputs.find("audio"); audio != nullptr) {
     if (!audio->is_bin() || audio->as_bin().empty() || audio->as_bin().size() % 2 != 0) {
       throw ProtocolError("unified audio must be nonempty PCM16 with complete samples");
@@ -264,9 +275,10 @@ std::string UnifiedEngine::submit(StagePayload payload) {
     Value::Map asr_inputs;
     asr_inputs["audio"] = *audio;
     payload.request.inputs = Value(std::move(asr_inputs));
-    // Qwen ASR is one aggregated response. Public streaming applies to the
-    // unified event stream and the VLM leg, not to the ASR backend request.
-    payload.request.params["stream"] = Value(false);
+    // The ASR backend streams only when the caller opted in. A partial event
+    // is a delta; the final transcript still comes from the completion and
+    // replaces the concatenated partials.
+    payload.request.params["stream"] = Value(asr_partials);
     payload.request.params["temperature"] = Value(0.0);
   }
 
@@ -497,7 +509,7 @@ Value UnifiedEngine::build_vlm_inputs(const std::string& transcript,
   if (original_inputs.is_map()) {
     for (const auto& [key, value] : original_inputs.as_map()) {
       if (key != "messages" && key != "modalities" && key != "session_id" &&
-          key != "audio") {
+          key != "audio" && key != "asr_partials") {
         out[key] = value;
       }
     }
