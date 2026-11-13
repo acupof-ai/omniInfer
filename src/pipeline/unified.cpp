@@ -58,23 +58,21 @@ struct UnifiedEngine::CallbackGate {
   explicit CallbackGate(UnifiedEngine* owner) : engine(owner) {}
 
   template <typename Arg>
-  void dispatch(const Arg& arg, void (UnifiedEngine::*method)(const Arg&),
-                const std::function<void(const Arg&)>& previous) {
+  void dispatch(const Arg& arg, void (UnifiedEngine::*method)(const Arg&)) {
     UnifiedEngine* target = nullptr;
-    std::function<void(const Arg&)> fallback;
     {
       std::lock_guard<std::mutex> lock(mu);
       target = engine;
       if (target != nullptr) {
         ++active;
       } else {
-        fallback = previous;
+        // Copied sinks outlive the engine. Queue their work in the gate so
+        // retirement and reentry cannot bypass the active-engine callbacks.
+        fallback_queue.emplace_back(arg);
       }
     }
     if (target == nullptr) {
-      // The Coordinator may have copied this sink before retirement. The gate
-      // keeps both the copy and the previous sink alive after engine teardown.
-      if (fallback) fallback(arg);
+      drain_fallback();
       return;
     }
     struct ActiveGuard {
@@ -88,24 +86,61 @@ struct UnifiedEngine::CallbackGate {
   }
 
   void stream(const StreamMessage& msg) {
-    dispatch(msg, &UnifiedEngine::handle_stream, previous_stream);
+    dispatch(msg, &UnifiedEngine::handle_stream);
   }
   void complete(const RequestInfo& info) {
-    dispatch(info, &UnifiedEngine::handle_complete, previous_complete);
+    dispatch(info, &UnifiedEngine::handle_complete);
   }
   void retire() {
-    std::unique_lock<std::mutex> lock(mu);
-    engine = nullptr;
-    cv.wait(lock, [&] { return active == 0; });
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      engine = nullptr;
+      cv.wait(lock, [&] { return active == 0; });
+    }
+    drain_fallback();
   }
 
+  void drain_fallback() {
+    std::unique_lock<std::mutex> lock(mu);
+    if (active != 0 || fallback_dispatching) return;
+    fallback_dispatching = true;
+    try {
+      while (!fallback_queue.empty()) {
+        FallbackItem item = std::move(fallback_queue.front());
+        fallback_queue.pop_front();
+        lock.unlock();
+        if (const auto* msg = std::get_if<StreamMessage>(&item)) {
+          if (previous_stream) previous_stream(*msg);
+        } else {
+          const auto& info = std::get<RequestInfo>(item);
+          if (previous_complete) previous_complete(info);
+        }
+        lock.lock();
+      }
+    } catch (...) {
+      if (!lock.owns_lock()) lock.lock();
+      fallback_dispatching = false;
+      throw;
+    }
+    fallback_dispatching = false;
+  }
+
+  using FallbackItem = std::variant<StreamMessage, RequestInfo>;
   std::mutex mu;
   std::condition_variable cv;
   UnifiedEngine* engine;
   size_t active = 0;
+  std::deque<FallbackItem> fallback_queue;
+  bool fallback_dispatching = false;
   std::function<void(const StreamMessage&)> previous_stream;
   std::function<void(const RequestInfo&)> previous_complete;
 };
+
+bool unified_retirement_waiting_for_test(const UnifiedEngine& engine) {
+  std::lock_guard<std::mutex> lock(engine.callback_gate_->mu);
+  return engine.callback_gate_->engine == nullptr &&
+         engine.callback_gate_->active != 0;
+}
 
 const char* to_string(UnifiedModality modality) {
   switch (modality) {

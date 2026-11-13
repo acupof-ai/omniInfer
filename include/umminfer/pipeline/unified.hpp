@@ -130,6 +130,7 @@ class UnifiedEngine {
  private:
   enum class Phase { kAsr, kVlm, kDone };
   struct CallbackGate;
+  friend bool unified_retirement_waiting_for_test(const UnifiedEngine& engine);
 
   struct Record {
     std::string session_id;

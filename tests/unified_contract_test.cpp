@@ -1223,6 +1223,185 @@ void test_destructor_synchronizes_inflight_callback() {
         "a copied sink did not forward safely after engine destruction");
 }
 
+struct RetiredSinkProbe {
+  std::mutex mu;
+  std::vector<std::string> calls;
+  bool stream_active = false;
+  bool overlapped = false;
+  bool nested = false;
+  std::thread::id stream_thread;
+  std::function<void()> stream_action;
+  std::promise<void> stream_entered;
+  std::future<void> stream_entered_future = stream_entered.get_future();
+  std::promise<void> release_stream;
+  std::shared_future<void> release_stream_future = release_stream.get_future().share();
+
+  void stream(const StreamMessage&) {
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      calls.push_back("stream");
+      stream_active = true;
+      stream_thread = std::this_thread::get_id();
+    }
+    stream_entered.set_value();
+    if (stream_action) stream_action();
+    release_stream_future.wait();
+    std::lock_guard<std::mutex> lock(mu);
+    stream_active = false;
+  }
+
+  void complete(const RequestInfo&) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (stream_active) {
+      overlapped = true;
+      if (std::this_thread::get_id() == stream_thread) nested = true;
+    }
+    calls.push_back("complete");
+  }
+
+  size_t call_count() {
+    std::lock_guard<std::mutex> lock(mu);
+    return calls.size();
+  }
+
+  void release() { release_stream.set_value(); }
+
+  void check_order(const char* tag) {
+    std::vector<std::string> order;
+    bool saw_overlap = false;
+    bool saw_nested = false;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      order = calls;
+      saw_overlap = overlapped;
+      saw_nested = nested;
+    }
+    std::cerr << tag << "=";
+    for (const auto& call : order) std::cerr << call << ",";
+    std::cerr << " OVERLAP=" << saw_overlap << " NESTED=" << saw_nested << "\n";
+    check(order == std::vector<std::string>{"stream", "complete"},
+          "retired forwarded completion overtook the stream callback");
+    check(!saw_overlap, "retired completion overlapped the active stream callback");
+    check(!saw_nested, "retired completion nested inside the stream callback");
+  }
+};
+
+StreamMessage retired_stream_message() {
+  StreamMessage msg;
+  msg.request_id = "retired-stream";
+  msg.from_stage = "asr";
+  msg.chunk = text_chunk("after", false);
+  return msg;
+}
+
+RequestInfo retired_complete_info() {
+  RequestInfo info;
+  info.request_id = "retired-complete";
+  info.state = "aborted";
+  return info;
+}
+
+// The copied completion arrives after retire() has nulled the engine but while
+// the active previous_stream callback is still blocked.
+void test_retire_wait_fallback_order() {
+  RetiredSinkProbe probe;
+  Harness h("retirewait");
+  h.coordinator.on_stream = [&](const StreamMessage& msg) { probe.stream(msg); };
+  h.coordinator.on_complete = [&](const RequestInfo& info) { probe.complete(info); };
+  auto engine = std::make_unique<UnifiedEngine>(h.coordinator, UnifiedConfig{});
+  h.start_pump();
+  const std::string id = engine->submit(audio_request());
+  check(h.next_submit(h.asr_recv).has_value(), "retire-wait ASR submit missing");
+  h.stream(id, "asr", text_chunk("partial", false));
+  probe.stream_entered_future.wait();
+  const auto copied_complete = h.coordinator.on_complete;
+  UnifiedEngine* engine_ptr = engine.get();
+
+  std::promise<void> destroyed;
+  auto destroyed_future = destroyed.get_future();
+  std::thread destroyer([&] {
+    engine.reset();
+    destroyed.set_value();
+  });
+  bool retiring = false;
+  wait_until([&] {
+    retiring = unified_retirement_waiting_for_test(*engine_ptr);
+    return retiring;
+  }, "retire did not wait for the active forwarded stream");
+  if (!retiring) {
+    probe.release();
+    destroyed_future.wait();
+    destroyer.join();
+    return;
+  }
+
+  std::promise<void> complete_returned;
+  auto complete_returned_future = complete_returned.get_future();
+  std::thread fallback([&] {
+    copied_complete(retired_complete_info());
+    complete_returned.set_value();
+  });
+  complete_returned_future.wait();
+  check(probe.call_count() == 1,
+        "fallback completion ran before the active stream returned");
+  probe.release();
+  destroyed_future.wait();
+  fallback.join();
+  destroyer.join();
+  probe.check_order("RETIRE_WAIT_ORDER");
+}
+
+// Two copied sinks race after destruction. The completion caller may return
+// after enqueueing, but its old sink must not run until stream is released.
+void test_retired_cross_thread_order() {
+  RetiredSinkProbe probe;
+  Harness h("retiredthreads");
+  h.coordinator.on_stream = [&](const StreamMessage& msg) { probe.stream(msg); };
+  h.coordinator.on_complete = [&](const RequestInfo& info) { probe.complete(info); };
+  auto engine = std::make_unique<UnifiedEngine>(h.coordinator, UnifiedConfig{});
+  const auto copied_stream = h.coordinator.on_stream;
+  const auto copied_complete = h.coordinator.on_complete;
+  engine.reset();
+
+  std::thread stream_thread([&] { copied_stream(retired_stream_message()); });
+  probe.stream_entered_future.wait();
+  std::promise<void> complete_returned;
+  auto complete_returned_future = complete_returned.get_future();
+  std::thread complete_thread([&] {
+    copied_complete(retired_complete_info());
+    complete_returned.set_value();
+  });
+  complete_returned_future.wait();
+  check(probe.call_count() == 1,
+        "post-retirement completion overlapped the blocked stream");
+  probe.release();
+  stream_thread.join();
+  complete_thread.join();
+  probe.check_order("RETIRED_THREAD_ORDER");
+}
+
+// A retired stream sink reenters completion on the same thread. Reentry must
+// enqueue behind the active callback rather than recursively invoke the old sink.
+void test_retired_same_thread_reentry() {
+  RetiredSinkProbe probe;
+  Harness h("retiredreenter");
+  h.coordinator.on_stream = [&](const StreamMessage& msg) { probe.stream(msg); };
+  h.coordinator.on_complete = [&](const RequestInfo& info) { probe.complete(info); };
+  auto engine = std::make_unique<UnifiedEngine>(h.coordinator, UnifiedConfig{});
+  const auto copied_stream = h.coordinator.on_stream;
+  const auto copied_complete = h.coordinator.on_complete;
+  engine.reset();
+
+  probe.release();
+  probe.stream_action = [&] {
+    copied_complete(retired_complete_info());
+    check(probe.call_count() == 1,
+          "retired completion recursively entered the old sink");
+  };
+  copied_stream(retired_stream_message());
+  probe.check_order("RETIRED_REENTRANT_ORDER");
+}
+
 }  // namespace
 
 int main() {
@@ -1249,5 +1428,8 @@ int main() {
   test_forwarded_sink_cancel_order(true);
   test_construction_after_pump_start_rejected();
   test_destructor_synchronizes_inflight_callback();
+  test_retire_wait_fallback_order();
+  test_retired_cross_thread_order();
+  test_retired_same_thread_reentry();
   return g_failures == 0 ? 0 : 1;
 }
