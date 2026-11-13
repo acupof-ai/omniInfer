@@ -56,7 +56,7 @@ CommandOptions command_options(const std::string& command) {
              "abort", "realtime-port", "ipc-dir", "upstream-kind", "upstream-base-url",
              "upstream-model", "upstream-api-key", "upstream-variant", "vlm-entry",
              "vlm-entry-endpoint"},
-            {"demo"},
+            {"demo", "session-history"},
             {}};
   }
   // --next, --peer and --peer-gpu carry one name=value pair each and repeat.
@@ -186,6 +186,7 @@ void print_usage(std::ostream& out) {
       << "      [--entry name --entry-endpoint ipc:///tmp/x/in] "
          "[--completion ipc:///tmp/x/done] [--abort ipc:///tmp/x/abort]\n"
          "      [--vlm-entry name --vlm-entry-endpoint ipc:///tmp/x/vlm]  ASR -> VLM chat\n"
+         "      [--session-history]  enable opt-in multi-turn history (in-process, 256 sessions x 8 turns / 16384 chars)\n"
          "      [--realtime-port 30001]  enable the ASR WebSocket listener\n"
       << "      [--demo]  run one in-process echo stage (development only)\n"
       << "  umm-infer stage --name N --recv EP --coordinator EP --abort EP "
@@ -367,6 +368,8 @@ int run_serve(const Flags& flags) {
     UnifiedConfig unified_config;
     unified_config.asr_stage = entry_name;
     unified_config.vlm_stage = vlm_name;
+    // Off by default: without this switch session_id stays a grouping label.
+    unified_config.session_history.enabled = flags.count("session-history") != 0;
     unified_engine = std::make_unique<UnifiedEngine>(coordinator, unified_config);
     api.set_unified_engine(*unified_engine, vlm_name);
   }

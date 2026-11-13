@@ -268,6 +268,18 @@ std::string UnifiedEngine::submit(StagePayload payload) {
     }
     asr_partials = requested->as_bool();
   }
+  bool history_requested = false;
+  if (const Value* requested = original_inputs.find("session_history");
+      requested != nullptr) {
+    if (!requested->is_bool()) {
+      throw ProtocolError("session_history must be a boolean");
+    }
+    history_requested = requested->as_bool();
+    if (history_requested && !config_.session_history.enabled) {
+      throw ProtocolError(
+          "session_history requires engine session history to be enabled");
+    }
+  }
   if (const Value* audio = inputs.find("audio"); audio != nullptr) {
     if (!audio->is_bin() || audio->as_bin().empty() || audio->as_bin().size() % 2 != 0) {
       throw ProtocolError("unified audio must be nonempty PCM16 with complete samples");
@@ -285,11 +297,18 @@ std::string UnifiedEngine::submit(StagePayload payload) {
   // Read from original_inputs: the audio branch above replaced inputs with the
   // PCM-only ASR map, so inputs no longer holds the session label.
   std::string session_id;
+  bool explicit_session = false;
   if (const Value* session = original_inputs.find("session_id");
       session != nullptr && session->is_str() && !session->as_str().empty()) {
     session_id = session->as_str();
+    explicit_session = true;
   } else {
     session_id = "session-" + std::to_string(session_counter_++);
+  }
+  // A unique per-request label can never match another request, so accepting
+  // the opt-in there would silently do nothing.
+  if (history_requested && !explicit_session) {
+    throw ProtocolError("session_history requires an explicit session_id");
   }
 
   std::lock_guard<std::mutex> lock(mu_);
@@ -300,6 +319,7 @@ std::string UnifiedEngine::submit(StagePayload payload) {
   admission_.push_back(request_id);
   Record record;
   record.session_id = std::move(session_id);
+  record.history_requested = history_requested;
   record.original_inputs = std::move(original_inputs);
   record.vlm_params = std::move(vlm_params);
   record.vlm_metadata = std::move(vlm_metadata);
@@ -509,7 +529,7 @@ Value UnifiedEngine::build_vlm_inputs(const std::string& transcript,
   if (original_inputs.is_map()) {
     for (const auto& [key, value] : original_inputs.as_map()) {
       if (key != "messages" && key != "modalities" && key != "session_id" &&
-          key != "audio" && key != "asr_partials") {
+          key != "audio" && key != "asr_partials" && key != "session_history") {
         out[key] = value;
       }
     }
@@ -572,11 +592,86 @@ void UnifiedEngine::start_vlm_locked(const std::string& request_id,
   vlm_payload.request_id = record.vlm_id;
   vlm_payload.request.inputs =
       build_vlm_inputs(record.transcript, record.original_inputs);
+  if (record.history_requested) {
+    vlm_payload.request.inputs["messages"] = Value(
+        with_session_history_locked(
+            record, vlm_payload.request.inputs["messages"].as_array()));
+  }
   vlm_payload.request.params = record.vlm_params;
   vlm_payload.request.metadata = record.vlm_metadata;
   record.phase = Phase::kVlm;
   record.public_info.current_stage = kVlmStageId;
   coordinator_.submit(vlm_payload, config_.vlm_stage);
+}
+
+Value::Array UnifiedEngine::with_session_history_locked(
+    const Record& record, const Value::Array& current_messages) {
+  Value::Array messages;
+  const auto it = session_history_.find(record.session_id);
+  if (it != session_history_.end()) {
+    for (const SessionTurn& turn : it->second) {
+      Value::Map user;
+      user["role"] = Value("user");
+      user["content"] = Value(turn.user);
+      Value::Map assistant;
+      assistant["role"] = Value("assistant");
+      assistant["content"] = Value(turn.assistant);
+      messages.push_back(Value(std::move(user)));
+      messages.push_back(Value(std::move(assistant)));
+    }
+  }
+  for (const Value& message : current_messages) messages.push_back(message);
+  return messages;
+}
+
+void UnifiedEngine::record_session_turn_locked(const Record& record) {
+  const bool is_new_session =
+      session_history_.find(record.session_id) == session_history_.end();
+  std::deque<SessionTurn>& turns = session_history_[record.session_id];
+  turns.push_back(SessionTurn{record.transcript, record.vlm_text});
+  size_t chars = 0;
+  for (const SessionTurn& turn : turns) {
+    chars += turn.user.size() + turn.assistant.size();
+  }
+  // Oldest turns leave first until both bounds hold. A single turn larger than
+  // the character budget is itself evicted: an unbounded turn must never stay.
+  while ((turns.size() > config_.session_history.max_turns ||
+          chars > config_.session_history.max_chars) &&
+         !turns.empty()) {
+    chars -= turns.front().user.size() + turns.front().assistant.size();
+    turns.pop_front();
+  }
+  if (turns.empty()) {
+    session_history_.erase(record.session_id);
+    if (!is_new_session) {
+      // ponytail: linear deque scan; max_sessions (256) bounds the cost.
+      for (auto it = session_order_.begin(); it != session_order_.end(); ++it) {
+        if (*it == record.session_id) {
+          session_order_.erase(it);
+          break;
+        }
+      }
+    }
+    return;
+  }
+  // Track most-recent-turn order: an existing session moves to the back.
+  if (!is_new_session) {
+    // ponytail: linear deque scan; max_sessions (256) bounds the cost.
+    for (auto it = session_order_.begin(); it != session_order_.end(); ++it) {
+      if (*it == record.session_id) {
+        session_order_.erase(it);
+        break;
+      }
+    }
+  }
+  session_order_.push_back(record.session_id);
+  // Global session cap: drop the session with the oldest last turn.
+  while (session_history_.size() > config_.session_history.max_sessions &&
+         !session_order_.empty()) {
+    const std::string oldest = std::move(session_order_.front());
+    session_order_.pop_front();
+    session_history_.erase(oldest);
+  }
 }
 
 UnifiedEvent UnifiedEngine::finish_locked(const std::string& request_id,
@@ -683,6 +778,9 @@ void UnifiedEngine::handle_complete(const RequestInfo& info) {
           dispatch_queue_.push_back(finish_locked(
               unified_id, record, UnifiedEvent::Kind::kComplete, {},
               info.result));
+          // Only a successful terminal enters history. Cancelled and failed
+          // requests never reach here, so no failed output becomes context.
+          if (record.history_requested) record_session_turn_locked(record);
         }
       }
     }

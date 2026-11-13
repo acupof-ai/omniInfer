@@ -82,6 +82,21 @@ struct UnifiedConfig {
   // Hard backpressure: requests past this many in-flight are rejected at
   // submission instead of being buffered without limit.
   size_t max_in_flight = 32;
+  // Opt-in multi-turn history. Disabled by default: session_id stays a grouping
+  // label. When enabled, a request must also set inputs.session_history=true;
+  // only requests carrying an explicit session_id then share history. The store
+  // is process-local, guarded by the engine mutex, and dies with the engine.
+  struct SessionHistory {
+    bool enabled = false;
+    // Completed turns kept per session. Oldest turns are evicted first.
+    size_t max_turns = 8;
+    // Hard character budget per session across transcript and answer text.
+    // Oldest turns leave first until the budget holds.
+    size_t max_chars = 16384;
+    // Hard cap on distinct sessions retained. The session whose last recorded
+    // turn is oldest is evicted first.
+    size_t max_sessions = 256;
+  } session_history;
 };
 
 // Thrown by UnifiedEngine::submit when the admission limit is reached.
@@ -113,9 +128,12 @@ class UnifiedEngine {
   // The ASR leg then receives only that audio with stream=false/temperature=0;
   // the VLM leg keeps the original sampling parameters and receives the image
   // parts (at most one) plus the ASR transcript as text.
-  // inputs.session_id is optional. It is a grouping label: every event of every
-  // request carrying it reports the same session_id, and requests in one
-  // session stay independent (own request id, own seq, own terminal, no history).
+  // inputs.session_id is optional. It is a grouping label by default: every
+  // event of every request carrying it reports the same session_id, and
+  // requests in one session stay independent (own request id, own seq, own
+  // terminal, no history). When config_.session_history.enabled is true, a
+  // request may additionally set inputs.session_history=true; the VLM prompt of
+  // later requests in the same session then carries prior completed turns.
   // Returns the Coordinator-allocated request id. Throws ProtocolError on a
   // bad contract (including video) and QueueFullError on backpressure.
   std::string submit(StagePayload payload);
@@ -131,6 +149,8 @@ class UnifiedEngine {
   // Returns only unified state: unified id, public stage id, and unified result.
   std::optional<RequestInfo> info(const std::string& request_id);
   size_t in_flight() const;
+  // Whether the engine was constructed with session history enabled.
+  bool history_enabled() const { return config_.session_history.enabled; }
 
   // Fires for every ASR partial/final and VLM delta, in sequence order.
   std::function<void(const UnifiedEvent&)> on_event;
@@ -152,6 +172,9 @@ class UnifiedEngine {
     // wins the race against abort is still required to settle as kCancelled
     // and must not start the VLM leg.
     bool cancel_requested = false;
+    // The request opted into multi-turn history. Its turn is only recorded on
+    // a successful terminal; cancelled and failed requests leave no history.
+    bool history_requested = false;
     std::string transcript;  // partials concatenated; final replaces them
     std::string vlm_text;
     std::string vlm_id;
@@ -160,10 +183,22 @@ class UnifiedEngine {
     Value::Map vlm_metadata;
   };
 
+  // One completed user/assistant turn kept in process-local session history.
+  struct SessionTurn {
+    std::string user;
+    std::string assistant;
+  };
+
   void handle_stream(const StreamMessage& msg);
   void handle_complete(const RequestInfo& info);
   void drain_dispatch();
   void start_vlm_locked(const std::string& request_id, Record& record);
+  // Returns the current messages with prior completed turns of
+  // record.session_id prepended as user/assistant messages.
+  Value::Array with_session_history_locked(
+      const Record& record, const Value::Array& current_messages);
+  // Stores the finished turn and enforces the turn and character bounds.
+  void record_session_turn_locked(const Record& record);
   UnifiedEvent finish_locked(const std::string& request_id, Record& record,
                              UnifiedEvent::Kind kind, std::string error,
                              Value result);
@@ -187,6 +222,13 @@ class UnifiedEngine {
   std::deque<DispatchItem> dispatch_queue_;
   bool dispatching_ = false;  // guarded by mu_; reentrant callbacks only queue
   std::atomic<uint64_t> session_counter_{0};
+  // Process-local, in-memory history. No persistence: engine destruction or
+  // process restart drops every turn.
+  std::map<std::string, std::deque<SessionTurn>> session_history_;
+  // Insertion order of sessions with retained turns; front is the oldest.
+  // Entries for sessions that emptied through self-eviction are stale and are
+  // skipped when the global cap is enforced.
+  std::deque<std::string> session_order_;
 };
 
 }  // namespace umminfer

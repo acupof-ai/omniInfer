@@ -155,6 +155,7 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | Real VLM worker | `umminfer_qwen_omni_worker.py` | Real `qwen3-omni` streamed text and image input verified on H20B |
 | Cross-model orchestration | `UnifiedEngine`, `serve --vlm-entry-endpoint` | Public HTTP/SSE and real CLI ASR -> VLM verified on H20B |
 | Shared session across modalities | `session_id` on `/v1/chat/completions` | Implemented as a grouping label; sequential, concurrent, error, and cancel cases verified on H20B |
+| Optional multi-turn session history | `serve --session-history`, request `session_history=true` | Implemented; in-process bounded store, deterministic local contract tests pass; real H20B multi-turn validation `NOT_RUN` |
 | Unified multimodal end-to-end acceptance | `chat --audio`, `/v1/chat/completions` | Real joint image+audio, same-session reuse, cancel, failure, and recovery verified on H20B; full Phase 2/3 gates `NOT_COVERED` |
 | H20B verification | Two SGLang workers | Accessible; Qwen ASR GPU 1 and Qwen Omni GPU 0 verified; CUDA build, IPC, sanitizer, and stress verified 2026-11-14 on GPUs 2 and 3 |
 
@@ -421,10 +422,53 @@ characters. It is a grouping label, not conversation history:
 - requests in one session may run one after another or concurrently;
 - no transcript, answer, or message history crosses between requests.
 
-There is no multi-turn context in this mode. A client that needs history must
-send it as its own state. A server without a unified engine rejects a non-null
-`session_id` with HTTP 400 `session_id requires unified mode`; it is never
-accepted and dropped.
+There is no multi-turn context in this mode by default. A client that needs
+history without the opt-in must send it as its own state. A server without a
+unified engine rejects a non-null `session_id` with HTTP 400
+`session_id requires unified mode`; it is never accepted and dropped.
+
+### Optional multi-turn session history
+
+History is off by default and has two opt-in gates. The server process starts
+with the `--session-history` switch, and a request then sets the top-level
+boolean `session_history` together with a nonempty `session_id`:
+
+```json
+{"session_id": "conv-1", "session_history": true, "messages": [...]}
+```
+
+Rules and limits:
+
+- default behavior is unchanged: without the switch, or without
+  `session_history=true`, `session_id` stays a grouping label and no history
+  crosses requests;
+- a non-unified server rejects `session_history` with HTTP 400
+  `session_history requires unified mode`; a unified server started without the
+  switch rejects it with HTTP 400 `session_history is not enabled on this
+  server`; a missing `session_id` is rejected with HTTP 400
+  `session_history requires a nonempty session_id`;
+- only a request that reaches a successful `complete` terminal enters history;
+  cancelled and failed requests leave no turn, so failed output never becomes
+  context;
+- each stored turn is the final ASR transcript (user) and the aggregated VLM
+  answer (assistant), prepended to the next VLM prompt as plain-text
+  user/assistant messages ahead of the current user turn;
+- the store is process-local memory inside `UnifiedEngine`, guarded by the
+  engine mutex. It holds at most 8 turns and 16384 characters per session and
+  at most 256 sessions; the oldest turn or least recently used session is
+  evicted first, and an oversized single turn evicts itself. There is no
+  database and no persistence: engine destruction or process restart drops
+  every turn;
+- every request keeps its own request id, its own gap-free `seq` from 0, and
+  its own terminal. Concurrent requests in one session never observe each
+  other's uncommitted turns.
+
+Real H20B multi-turn validation of this feature is `NOT_RUN`. It needs a
+server started with `--session-history`, two sequential requests sharing one
+`session_id` with `session_history=true`, and a check of the VLM worker prompt
+log proving the second prompt contains the first turn. Local deterministic
+contract coverage is in `tests/unified_contract_test.cpp`
+(`test_session_history_*`, `test_public_http_session_history`).
 
 SSE remains `chat.completion.chunk`. A chunk can carry a `unified` object with
 `kind`, `stage`, `seq`, `session_id`, `is_final`, and `text`. Assistant `content`

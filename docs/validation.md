@@ -324,6 +324,41 @@ worker logs `SGLANG_ABORT_CONFIRMED ... finish=abort`; the next request
 completes. `tests/sglang_abort_probe.py` records the backend-only confirmation:
 `/abort_request` 200 and a raw SSE `finish_reason="abort"` frame.
 
+## 5d. Optional multi-turn session history
+
+The deterministic local contract is the C++ unified test binary, which uses
+bound PUSH/PULL sockets and no model worker:
+
+```sh
+zig build unified-test -Ddeps-prefix=/opt/homebrew \
+  -Dcurl-prefix=/opt/homebrew/opt/curl
+```
+
+It covers history ordering, session isolation, independent request id/seq/
+terminal, concurrency, cancel/error exclusion, per-session turn and character
+eviction, the global session cap, default-off behavior at both gates, the
+non-unified and disabled-engine HTTP 400 responses, and history loss across an
+engine restart. These are contract tests, not real-model validation.
+
+Real H20B multi-turn validation is **NOT_RUN**. The required procedure and
+conditions:
+
+1. Start the server with the feature switch, alongside the real Qwen ASR and
+   Qwen-Omni workers: add `--session-history` to the existing
+   `serve --vlm-entry ...` command from section 5c.
+2. Send two sequential `/v1/chat/completions` requests sharing one
+   `session_id`, each with `"session_history": true` and real audio.
+3. Inspect the Omni worker prompt log for the second `:vlm` leg: it must
+   contain the first turn's transcript as a prior `user` message and the first
+   answer as a prior `assistant` message, ahead of the second transcript.
+4. Confirm both requests keep distinct request ids, per-request gap-free `seq`
+   from 0, and one terminal each; then send one failing and one cancelled
+   request in the same session and confirm neither appears in the next prompt.
+
+This run needs H20B access and both SGLang backends, which are unavailable in
+the Apple Silicon worktree. No result is claimed until that run is recorded
+under an evidence directory with the worker prompt log attached.
+
 ## 8. CUDA build, IPC, sanitizer and stress on H20B
 
 Run these on a CUDA host with at least two free GPUs. On a shared host, select
@@ -369,4 +404,6 @@ zero-copy device-tensor transfer, or multi-host IPC.
 - Immediate cancellation inside MLX prefill or a model call.
 - CUDA execution and CUDA IPC on this Apple Silicon environment.
 - Production ASR accuracy and generalization: TinyCTC is an inference test model.
+- Multi-turn session history on real H20B workers: local contract tests pass,
+  the real two-turn run is `NOT_RUN` (section 5d).
 - Full OpenAI Realtime compatibility: that API is not implemented.

@@ -1026,7 +1026,7 @@ class OpenAIApi::Impl {
     static const std::set<std::string> kAllowedFields = {
         "model", "messages", "stream", "temperature", "max_tokens",
         "max_completion_tokens", "top_p", "seed", "stop", "response_format",
-        "stream_options", "session_id"};
+        "stream_options", "session_id", "session_history"};
     for (auto it = body.begin(); it != body.end(); ++it) {
       if (!kAllowedFields.count(it.key()) && !it.value().is_null()) {
         reject("unsupported field: " + it.key());
@@ -1040,6 +1040,25 @@ class OpenAIApi::Impl {
         !unified_engine_) {
       reject("session_id requires unified mode");
       return;
+    }
+    if (body.contains("session_history") && !body["session_history"].is_null()) {
+      if (!body["session_history"].is_boolean()) {
+        reject("session_history must be a boolean");
+        return;
+      }
+      // Mirrors session_id: the field has no meaning outside unified mode, so
+      // it is rejected there instead of being accepted and dropped.
+      if (!unified_engine_) {
+        reject("session_history requires unified mode");
+        return;
+      }
+      // A unified engine started without the history switch must not accept
+      // the opt-in: default behavior stays a grouping label.
+      if (body["session_history"].get<bool>() &&
+          !unified_engine_->history_enabled()) {
+        reject("session_history is not enabled on this server");
+        return;
+      }
     }
     if (body.contains("stream_options") && !body["stream_options"].is_null()) {
       const json& options = body["stream_options"];
@@ -1130,6 +1149,20 @@ class OpenAIApi::Impl {
             return;
           }
           inputs["session_id"] = Value(body["session_id"].get<std::string>());
+        }
+        // Opt-in multi-turn history. Without it the default contract is
+        // unchanged and session_id stays a grouping label.
+        if (body.contains("session_history") &&
+            !body["session_history"].is_null()) {
+          if (body["session_history"].get<bool>() &&
+              !(body.contains("session_id") &&
+                body["session_id"].is_string() &&
+                !body["session_id"].get<std::string>().empty())) {
+            reject("session_history requires a nonempty session_id");
+            return;
+          }
+          inputs["session_history"] =
+              Value(body["session_history"].get<bool>());
         }
       }
     } catch (const std::exception& exc) {

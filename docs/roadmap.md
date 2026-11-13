@@ -33,6 +33,22 @@ external dependency, such as hardware access or credentials, is missing.
 [Validation](validation.md) uses `BLOCKED` and `NOT_COVERED` for the same
 purpose.
 
+### Current integration status — 2026-11-14
+
+Optional multi-turn session history landed on 2026-11-14. `session_id` remains
+a grouping label by default. A server started with `--session-history` accepts
+the per-request `session_history=true` opt-in and prepends prior completed
+turns of the same session to the next VLM prompt. The store is in-process,
+bounded to 8 turns and 16384 characters per session and 256 sessions overall,
+with oldest-first eviction, mutex-guarded, and not persisted: a process
+restart drops all history. Only successful `complete` terminals enter history; cancelled and
+failed requests leave no turn. Deterministic local contract tests cover
+ordering, session isolation, independent request id/seq/terminal, concurrency,
+cancel/error exclusion, both eviction bounds, the default-off contract, the
+non-unified HTTP 400, and restart loss. Real H20B multi-turn validation is
+`NOT_RUN`: it needs a `--session-history` server and a two-turn run whose VLM
+worker prompt log shows the first turn inside the second prompt.
+
 ### Current integration status — 2026-11-13
 
 Phases 0–3 are **partial**, not complete. The integrated branch exposes the
