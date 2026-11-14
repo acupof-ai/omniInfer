@@ -12,6 +12,11 @@ remote `wss://` is not supported. Apple's system libcurl 8.7.1 does not support
 WebSocket; use Homebrew libcurl and pass its prefix explicitly. The realtime
 server also requires libwebsockets.
 
+On Linux, check `curl-config --protocols` for `ws` and `wss`. Ubuntu 24.04
+ships libcurl 8.5.0 without them. Build curl 8.5.0 with `--enable-websockets`
+into a separate prefix and pass it with `-Dcurl-prefix`; do not replace the
+system libcurl. [Validation](validation.md) section 3a gives the commands.
+
 The build needs the same dependencies as the root README:
 
 ```sh

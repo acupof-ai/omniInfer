@@ -112,10 +112,49 @@ Expected results:
   checks cumulative partials, PING/PONG interleaving, one terminal event, and
   cancellation. The cancelled request must show `SGLANG_ABORT_CONFIRMED` with
   `finish=abort` in the stage log: that is the backend's own acknowledgement,
-  not a local socket close.
+  not a local socket close. On H20B the test passes with a locally built
+  WebSocket-enabled libcurl; section 3a gives the build recipe and the result.
 
 Check each script's argument help if its local stage defaults differ from your
 checkout. Do not use `--skip-real` when validating the end-to-end journey.
+
+### 3a. H20B realtime live run
+
+The H20B container ships libcurl 8.5.0 without the `ws` protocol, so the
+realtime client refused to start. Build libcurl 8.5.0 from source with
+`--enable-websockets` into a dedicated prefix, then pass that prefix to the
+build. Do not replace the system library.
+
+```sh
+PREFIX=/path/to/curl-prefix
+curl -fsSLO http://archive.ubuntu.com/ubuntu/pool/main/c/curl/curl_8.5.0.orig.tar.gz
+tar xzf curl_8.5.0.orig.tar.gz && cd curl-8.5.0
+./configure --prefix="$PREFIX" --enable-websockets \
+  --with-openssl --with-zlib --disable-ldap --disable-ldaps --disable-manual
+make -j8 && make install
+cd /path/to/umminfer
+zig build -Doptimize=ReleaseFast -Dcurl-prefix="$PREFIX" \
+  -Ddeps-prefix=/path/to/deps
+```
+
+`curl-config --protocols` must list `ws` and `wss`. On H20B 2026-11-14 a
+dedicated `qwen3-asr` backend ran on GPU 5, port 31005. It needed
+`LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat` because the installed driver
+535.161.08 is older than the container CUDA 13 build. The live test passed:
+
+| Check | Result |
+| --- | --- |
+| Startup | `PASS real_startup` with dedicated free ports |
+| Incremental partials | `PASS real_incremental_partials partials=7`, final text `甚至出现交易几乎停滞的情况。`, one terminal |
+| Control frames | `PASS real_control_frame_interleaving pings=419 pongs=188`, PING/PONG interleaved with data |
+| Cancel | `PASS real_cancel_disconnect in_flight=0` |
+| Backend abort | `PASS real_gpu_abort_confirmed` with `SGLANG_ABORT_REQUEST`, `SGLANG_ABORT_CONFIRMED`, `finish=abort` |
+| Recovery | `PASS real_request_after_cancel`; a later stream completed |
+
+Evidence is in `/tmp/umminfer-phase6-realtime-h20b-evidence/`: build command and
+`curl-config` output, libcurl and binary SHA256, raw frame JSON with payload
+hashes, stage abort lines, capped server, stage and backend logs, and
+`SHA256SUMS`.
 
 ## 4. Exercise network retry and stall behavior
 

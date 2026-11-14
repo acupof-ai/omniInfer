@@ -361,10 +361,19 @@ type. Evidence is in `/tmp/umminfer-phase5-cuda-stress-evidence/`. Still
 `NOT_COVERED`: CUDA relay under real model load, zero-copy device-tensor
 transfer, and multi-host IPC.
 
+A third window on 2026-11-14 covered realtime live in the same container. The
+container libcurl 8.5.0 had no `ws` protocol, so the run used libcurl 8.5.0
+built from source with `--enable-websockets` in a dedicated prefix. A dedicated
+`qwen3-asr` backend ran on GPU 5, port 31005. The real CLI, realtime server and
+Qwen3-ASR stage passed incremental partials, PING/PONG interleaving, cancel,
+GPU abort, and a later request. Evidence is in
+`/tmp/umminfer-phase6-realtime-h20b-evidence/`; the recipe and result table are
+in [Validation](validation.md) section 3a.
+
 ## Next priorities
 
-1. Add real ASR partial output and realtime partial coverage before marking the
-   streaming gates complete.
+1. Run the realtime live gate on a host whose system libcurl supports
+   WebSocket, so the dedicated curl prefix is not needed.
 2. Add joint image+audio input and session reuse, then run their Phase 2 gates.
 3. Record model revisions, weights hashes, reproducibility, and complete resource
    attribution for Phase 3; run the Mac profile separately.
@@ -382,7 +391,8 @@ These are not repeated from the README limits list.
 - Session reuse and the Mac unified profile. Unified ASR partials, joint
   image+audio, and VLM/Omni GPU abort confirmation are covered by the unified
   H20B run; realtime partials, ASR GPU abort, and real-client control-frame
-  interleaving are covered on the realtime route.
+  interleaving are covered by the realtime live run on H20B 2026-11-14
+  (validation.md section 3a).
 - A first-party HTTP 429 with `Retry-After` from this server.
 - A successful upstream forward through the proxy. The in-tree tests prove
   configuration, route gating, and a connect failure only.
