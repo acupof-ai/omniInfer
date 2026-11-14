@@ -155,7 +155,7 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | Real VLM worker | `umminfer_qwen_omni_worker.py` | Real `qwen3-omni` streamed text and image input verified on H20B |
 | Cross-model orchestration | `UnifiedEngine`, `serve --vlm-entry-endpoint` | Public HTTP/SSE and real CLI ASR -> VLM verified on H20B |
 | Shared session across modalities | `session_id` on `/v1/chat/completions` | Implemented as a grouping label; sequential, concurrent, error, and cancel cases verified on H20B |
-| Optional multi-turn session history | `serve --session-history`, request `session_history=true` | Implemented; in-process bounded store, deterministic local contract tests pass; real H20B multi-turn validation `NOT_RUN` |
+| Optional multi-turn session history | `serve --session-history`, request `session_history=true` | Real H20B two-turn, cancel/error exclusion, and default-off validation passed 2026-11-14; evidence in `/tmp/umminfer-phase5-final-h20b-evidence/live/` |
 | Unified multimodal end-to-end acceptance | `chat --audio`, `/v1/chat/completions` | Real joint image+audio, same-session reuse, cancel, failure, and recovery verified on H20B; full Phase 2/3 gates `NOT_COVERED` |
 | H20B verification | Two SGLang workers | Accessible; Qwen ASR GPU 1 and Qwen Omni GPU 0 verified; CUDA build, IPC, sanitizer, and stress verified 2026-11-14 on GPUs 2 and 3 |
 
@@ -413,6 +413,13 @@ PCM only; it never sees the image or the instruction. The VLM receives the
 instruction, the original `image_url` part, and the final transcript as the last
 `text` part. It keeps the public sampling and streaming parameters.
 
+`image_url.url` may be a `data:` URL or a remote `http(s)` URL. The engine does
+not fetch it: it forwards the URL unchanged to the VLM worker, and the SGLang
+backend fetches the bytes. On H20B 2026-11-14 a local HTTP server served
+`man_ironing.png`; the worker log held that URL, the server recorded the GET
+with the input SHA256, and the answer described the man ironing a blue garment
+while the same request without the image answered that no image was present.
+
 The optional top-level `session_id` is a nonempty string of at most 128
 characters. It is a grouping label, not conversation history:
 
@@ -463,12 +470,18 @@ Rules and limits:
   its own terminal. Concurrent requests in one session never observe each
   other's uncommitted turns.
 
-Real H20B multi-turn validation of this feature is `NOT_RUN`. It needs a
-server started with `--session-history`, two sequential requests sharing one
-`session_id` with `session_history=true`, and a check of the VLM worker prompt
-log proving the second prompt contains the first turn. Local deterministic
-contract coverage is in `tests/unified_contract_test.cpp`
-(`test_session_history_*`, `test_public_http_session_history`).
+Real H20B multi-turn validation passed on 2026-11-14. Two sequential requests
+in one session with `session_history=true` produced a second `:vlm` prompt that
+held the first transcript as a prior `user` message and the first answer as a
+prior `assistant` message. Both requests kept distinct request ids, their own
+gap-free `seq` from 0, and one terminal each. A cancelled turn and a failed
+turn left no entry: the next prompt contained neither transcript. A request
+without `session_history` on the same server carried no prior turn, and a
+server started without `--session-history` rejected the opt-in with HTTP 400.
+Evidence is in `/tmp/umminfer-phase5-final-h20b-evidence/live/`
+(`tests/unified_remote_image_history_live.py`). Local deterministic contract
+coverage is in `tests/unified_contract_test.cpp` (`test_session_history_*`,
+`test_public_http_session_history`).
 
 SSE remains `chat.completion.chunk`. A chunk can carry a `unified` object with
 `kind`, `stage`, `seq`, `session_id`, `is_final`, and `text`. Assistant `content`

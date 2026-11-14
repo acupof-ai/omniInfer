@@ -340,24 +340,76 @@ eviction, the global session cap, default-off behavior at both gates, the
 non-unified and disabled-engine HTTP 400 responses, and history loss across an
 engine restart. These are contract tests, not real-model validation.
 
-Real H20B multi-turn validation is **NOT_RUN**. The required procedure and
-conditions:
+Real H20B multi-turn validation passed on 2026-11-14 with
+`tests/unified_remote_image_history_live.py`. The harness starts the real
+server twice: once without `--session-history` for the default gate, then with
+the switch and a fresh worker pair. It serves `man_ironing.png` from a local
+HTTP server and drives the default gate, two successful turns, a cancel, a
+failed VLM leg, a follow-up turn, and a request with no opt-in. One extra
+request without the image checks that the image answer is not generic.
 
-1. Start the server with the feature switch, alongside the real Qwen ASR and
-   Qwen-Omni workers: add `--session-history` to the existing
-   `serve --vlm-entry ...` command from section 5c.
-2. Send two sequential `/v1/chat/completions` requests sharing one
-   `session_id`, each with `"session_history": true` and real audio.
-3. Inspect the Omni worker prompt log for the second `:vlm` leg: it must
-   contain the first turn's transcript as a prior `user` message and the first
-   answer as a prior `assistant` message, ahead of the second transcript.
-4. Confirm both requests keep distinct request ids, per-request gap-free `seq`
-   from 0, and one terminal each; then send one failing and one cancelled
-   request in the same session and confirm neither appears in the next prompt.
+```sh
+UMMINFER_LIVE_OPT_IN=1 python3 -I tests/unified_remote_image_history_live.py \
+  --server ./zig-out/bin/umm-infer \
+  --asr-backend http://127.0.0.1:31000 \
+  --omni-backend http://127.0.0.1:31001 \
+  --audio-zh asr_zh.wav --audio-en asr_en_16k.wav \
+  --image man_ironing.png --public-host 127.0.0.1 \
+  --evidence-dir /tmp/umminfer-phase5-final-h20b-evidence/live
+```
 
-This run needs H20B access and both SGLang backends, which are unavailable in
-the Apple Silicon worktree. No result is claimed until that run is recorded
-under an evidence directory with the worker prompt log attached.
+`asr_en_16k.wav` is the repository recording converted to the contract format
+with `ffmpeg -i asr_en.wav -ar 16000 -ac 1 -sample_fmt s16 -c:a pcm_s16le`;
+the original is 48 kHz 24-bit and the server correctly rejects it.
+
+Expected result, recorded three times on H20B:
+
+| Check | Expected |
+| --- | --- |
+| Remote image URL | Default server: complete; the Omni log holds the `http://` URL; the local server records one GET with the input SHA256; the answer names the man and the ironing/garment; the same request without the image answers that no image was present |
+| Default gate | Server without `--session-history` returns HTTP 400 `session_history is not enabled on this server` for the opt-in |
+| Turn 1 | Complete, distinct request id, gap-free `seq`, one terminal, prompt has no prior turn |
+| Turn 2 | Prompt is `[user: turn-1 transcript, assistant: turn-1 answer, user: current]`; distinct request id; gap-free `seq`; one terminal |
+| Cancel | Exactly one `cancelled` terminal; `/abort` 200; the worker logs `SGLANG_ABORT_CONFIRMED rid=<id>:vlm@... finish=abort`; the prompt had the committed turn |
+| Error | Exactly one `error` terminal for the failed VLM leg after a valid ASR transcript |
+| Turn 3 | Complete; contains the committed turns and neither the cancelled nor the failed transcript |
+| History off | Request without `session_history` on the history-enabled server has one prompt message and no prior turn |
+
+The worker prompt log, raw SSE frames, health responses, image access log, input
+SHA256 values, commands, and `SHA256SUMS` are in
+`/tmp/umminfer-phase5-final-h20b-evidence/live/`.
+
+## 5e. Backend decode stop and the GPU-counter boundary
+
+`tests/sglang_abort_probe.py` sends one long streaming chat request to SGLang,
+reads its SSE frames, samples the backend scheduler counter `/v1/loads` before,
+during and after the request, then posts `/abort_request`:
+
+```sh
+python3 -I tests/sglang_abort_probe.py \
+  --base-url http://172.17.0.2:31001 --model qwen3-omni \
+  --out /tmp/umminfer-phase5-final-h20b-evidence/backend/abort-repeat-1.json
+```
+
+Expected result, recorded on H20B 2026-11-14 in 10 consecutive runs:
+`/abort_request` 200; the generate stream ends with `finish_reason="abort"`;
+`num_running_reqs` goes 0 -> 1 -> 0; `counter_decode_stopped=true`. The raw
+frames and counter samples are in the evidence directory.
+
+That counter is the SGLang scheduler's view of the running batch, not a GPU
+hardware counter. The running servers were started without `--enable-metrics`,
+so `/metrics` returns 404. `dcgmi` is not installed, and `nvidia-smi pmon` on
+this H20 driver reports `-` for the per-process SM column. GPU-counter-level
+attribution of the decode stop is therefore `NOT_COVERED`.
+
+Failure injection inside real model compute is also `NOT_COVERED`. SGLang
+0.5.15's only relevant switch is `enable_nan_detection`, off by default; its
+sampler replaces NaN logits with -1e5 or raises when `crash_on_warnings()` is
+set (`python/sglang/srt/layers/sampler.py`). It is a detector, not an injector.
+The source has no `inject_fault`/`force_nan` hook. Enabling it or causing a CUDA
+fault would require restarting or patching the shared backends, which this run
+does not do. A request that fails because the VLM cannot fetch its image is a
+request-level error, not an internal compute fault, and is not counted here.
 
 ## 8. CUDA build, IPC, sanitizer and stress on H20B
 
@@ -404,6 +456,13 @@ zero-copy device-tensor transfer, or multi-host IPC.
 - Immediate cancellation inside MLX prefill or a model call.
 - CUDA execution and CUDA IPC on this Apple Silicon environment.
 - Production ASR accuracy and generalization: TinyCTC is an inference test model.
-- Multi-turn session history on real H20B workers: local contract tests pass,
-  the real two-turn run is `NOT_RUN` (section 5d).
+- GPU hardware-counter attribution of a decode stop. The running SGLang servers
+  were started without `--enable-metrics`, so `/metrics` returns 404; `dcgmi` is
+  not installed and `nvidia-smi pmon` reports no per-process SM value on this
+  H20 driver. Evidence is limited to the backend scheduler counter
+  `/v1/loads` and the `finish_reason=abort` frame (section 5e).
+- Injection of a failure inside real model compute. SGLang has only a NaN
+  detector (`enable_nan_detection`, off by default) and no documented injection
+  hook. Enabling it or forcing a CUDA fault would require restarting or
+  patching the shared backends, which is outside this run's scope (section 5e).
 - Full OpenAI Realtime compatibility: that API is not implemented.

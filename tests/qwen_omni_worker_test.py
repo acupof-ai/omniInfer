@@ -178,6 +178,9 @@ class WorkerProtocolTests(unittest.TestCase):
             messages = [{"role": "user", "content": [
                 {"type": "text", "text": "describe"},
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA"}},
+                # A remote URL is forwarded unchanged; SGLang fetches it.
+                {"type": "image_url", "image_url": {
+                    "url": "http://172.17.0.1:18080/man_ironing.png"}},
             ]}]
             sender.send(pack_message(self.submit(stream=True, messages=messages,
                                                  max_new_tokens=7, temperature=0.25)))

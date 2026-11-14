@@ -196,12 +196,14 @@ StagePayload image_part_request(const std::string& url = "data:image/png;base64,
 
 // One request carrying real PCM for the ASR leg and one image part for the VLM
 // leg. The image rides on the original messages; the ASR leg never sees it.
-StagePayload joint_request(const std::string& session_id = "") {
+StagePayload joint_request(const std::string& session_id = "",
+                           const std::string& image_url = "") {
   StagePayload payload;
   Value::Map message;
   message["role"] = Value("user");
   Value::Array content;
-  content.push_back(image_part());
+  content.push_back(image_part(image_url.empty() ? "data:image/png;base64,AA"
+                                                 : image_url));
   content.push_back(Value(part("input_audio")));
   message["content"] = Value(std::move(content));
   Value::Array messages;
@@ -1044,6 +1046,42 @@ void test_joint_image_audio() {
             events.front().kind == UnifiedEvent::Kind::kAsrFinal &&
             events.back().kind == UnifiedEvent::Kind::kComplete,
         "joint event order is not asr_final .. complete");
+  engine.release(id);
+}
+
+// A remote HTTP image URL is a protocol value the engine must forward
+// verbatim. The engine never fetches it; only the VLM worker does.
+void test_joint_image_remote_url() {
+  Harness h("jointurl");
+  UnifiedEngine engine(h.coordinator, UnifiedConfig{});
+  h.start_pump();
+  EventLog log;
+  engine.on_event = [&](const UnifiedEvent& event) { log.add(event); };
+
+  const std::string url = "http://172.17.0.1:18080/man_ironing.png";
+  const std::string id = engine.submit(joint_request("", url));
+  auto asr_submit = h.next_submit(h.asr_recv);
+  check(asr_submit.has_value(), "ASR stage received no submit");
+  h.complete(id, "asr", true, text_result("what is on screen"));
+  auto vlm_submit = h.next_submit(h.vlm_recv);
+  check(vlm_submit.has_value(), "VLM stage received no submit");
+  if (vlm_submit) {
+    StagePayload payload = StagePayload::from_value(vlm_submit->data);
+    const Value& content = *payload.request.inputs.find("messages")
+                                ->as_array()
+                                .at(0)
+                                .find("content");
+    check(content.is_array() && content.as_array().size() == 2,
+          "the remote-URL VLM prompt is not image part + transcript text part");
+    if (content.is_array() && content.as_array().size() == 2) {
+      const Value& image = content.as_array()[0];
+      check(image.find("type")->as_str() == "image_url" &&
+                image.find("image_url")->find("url")->as_str() == url,
+            "the VLM lost or rewrote the remote image URL");
+    }
+  }
+  h.complete(id + ":vlm", "vlm", true, text_result("a man ironing"));
+  check(engine.wait(id, 5.0), "remote-URL joint request did not complete");
   engine.release(id);
 }
 
@@ -2877,6 +2915,7 @@ int main() {
   test_queue_cap_backpressure();
   test_duplicate_final_and_out_of_order();
   test_joint_image_audio();
+  test_joint_image_remote_url();
   test_media_contract_errors();
   test_session_reuse();
   test_session_reuse_concurrent();

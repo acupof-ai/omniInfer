@@ -45,9 +45,13 @@ restart drops all history. Only successful `complete` terminals enter history; c
 failed requests leave no turn. Deterministic local contract tests cover
 ordering, session isolation, independent request id/seq/terminal, concurrency,
 cancel/error exclusion, both eviction bounds, the default-off contract, the
-non-unified HTTP 400, and restart loss. Real H20B multi-turn validation is
-`NOT_RUN`: it needs a `--session-history` server and a two-turn run whose VLM
-worker prompt log shows the first turn inside the second prompt.
+non-unified HTTP 400, and restart loss. Real H20B multi-turn validation passed
+on 2026-11-14: the second `:vlm` prompt held the first transcript and answer,
+both requests kept independent request ids/seq/terminals, a cancelled and a
+failed turn left no entry, and the default gate stayed off. Evidence is in
+`/tmp/umminfer-phase5-final-h20b-evidence/live/`. Remote `http(s)` image URLs
+were also validated on H20B with the repository image served from a local HTTP
+server.
 
 ### Current integration status — 2026-11-13
 
@@ -68,9 +72,13 @@ sends PING control frames during the stream, and cancellation asks SGLang to
 abort and records its `finish_reason=abort`. On 2026-11-13 the unified chat
 route also passed opt-in ASR partials and a VLM-leg GPU abort with SGLang
 `finish_reason=abort`; that evidence is in
-`/tmp/umminfer-phase5-streaming-abort-evidence/`. The remaining gates are
-explicit: a model-compute failure distinct from backend loss and the Mac
-unified profile are `NOT_COVERED`. Model
+`/tmp/umminfer-phase5-streaming-abort-evidence/`. A later run on 2026-11-14
+added scheduler-counter evidence for that stop: `/v1/loads` reported
+`num_running_reqs` 0 -> 1 -> 0 across 10 aborts. GPU hardware-counter
+attribution and injection of a failure inside real model compute remain
+`NOT_COVERED`, with the reasons in
+[validation](validation.md#5e-backend-decode-stop-and-the-gpu-counter-boundary);
+the Mac unified profile is also `NOT_COVERED`. Model
 revisions are `UNKNOWN`; weights hashes, full resource attribution, and output
 reproducibility are not a complete Phase 3 record. CUDA build, IPC, sanitizer,
 and stress ran separately on H20B on 2026-11-14 and passed on dedicated GPUs 2
