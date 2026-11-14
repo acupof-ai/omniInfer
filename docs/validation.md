@@ -418,28 +418,83 @@ The worker prompt log, raw SSE frames, health responses, image access log, input
 SHA256 values, commands, and `SHA256SUMS` are in
 `/tmp/umminfer-phase5-final-h20b-evidence/live/`.
 
-## 5e. Backend decode stop and the GPU-counter boundary
+## 5e. Backend decode stop: scheduler, SSE, and GPU hardware evidence
 
-`tests/sglang_abort_probe.py` sends one long streaming chat request to SGLang,
-reads its SSE frames, samples the backend scheduler counter `/v1/loads` before,
-during and after the request, then posts `/abort_request`:
+Three distinct evidence levels are recorded for one abort. They answer
+different questions and are not interchangeable.
 
-```sh
-python3 -I tests/sglang_abort_probe.py \
-  --base-url http://172.17.0.2:31001 --model qwen3-omni \
-  --out /tmp/umminfer-phase5-final-h20b-evidence/backend/abort-repeat-1.json
-```
+1. Scheduler abort. `tests/sglang_abort_probe.py` samples the backend
+   scheduler counter `/v1/loads` before, during and after the request, then
+   posts `/abort_request`:
 
-Expected result, recorded on H20B 2026-11-14 in 10 consecutive runs:
-`/abort_request` 200; the generate stream ends with `finish_reason="abort"`;
-`num_running_reqs` goes 0 -> 1 -> 0; `counter_decode_stopped=true`. The raw
-frames and counter samples are in the evidence directory.
+   ```sh
+   python3 -I tests/sglang_abort_probe.py \
+     --base-url http://172.17.0.2:31001 --model qwen3-omni \
+     --out /tmp/umminfer-phase5-final-h20b-evidence/backend/abort-repeat-1.json
+   ```
 
-That counter is the SGLang scheduler's view of the running batch, not a GPU
-hardware counter. The running servers were started without `--enable-metrics`,
-so `/metrics` returns 404. `dcgmi` is not installed, and `nvidia-smi pmon` on
-this H20 driver reports `-` for the per-process SM column. GPU-counter-level
-attribution of the decode stop is therefore `NOT_COVERED`.
+   Recorded on H20B 2026-11-14 in 10 consecutive runs: `/abort_request` 200;
+   `num_running_reqs` goes 0 -> 1 -> 0; `counter_decode_stopped=true`. This is
+   the scheduler's view of the running batch, not a GPU hardware counter.
+
+2. SSE abort. The generate stream ends with `finish_reason="abort"`. This is a
+   protocol frame. It proves the backend told the client the request ended, not
+   that the GPU stopped executing kernels.
+
+3. GPU hardware stop. `tests/gpu_abort_evidence.py` plus
+   `tests/gpu_decode_stop_evidence.sh` run on a dedicated GPU 2 against an
+   independent SGLang instance (the shared GPU 0/1 backends are never
+   restarted). Two independent hardware instruments record the stop, each with
+   request id and wall-clock markers:
+
+   - CUPTI kernel timeline. SGLang's own `torch.profiler` (Kineto) subscribes
+     to the CUPTI Activity API inside the scheduler process while the probe
+     sends one streaming request and aborts it. A monotonic-clock calibration
+     maps the probe markers onto the trace. The 2026-11-14 trace records 26
+     `step[DECODE bs=1]` spans and 11,573 CUDA kernels before the abort
+     (59.85 ms GPU-active), then a bounded scheduler teardown of 1,754 kernels
+     (7.97 ms) between the abort POST and the abort frame, and then zero CUDA
+     kernels for a 2.83 s idle window. The teardown is bounded and its timing
+     is read directly from the trace: two `step[DECODE bs=1]` spans start
+     about 64.333 ms and 64.392 ms after the abort POST and both end before
+     the abort frame (which arrives 129.382 ms after the POST). These are
+     steps the scheduler still launched after the abort arrived, so the trace
+     must not be read as "no new decode step starts after the abort POST".
+     What stops is the sustained decode stream: every teardown span finishes
+     before the abort frame, and no CUDA kernel runs in the window that starts
+     0.2 s after the abort frame.
+   - DCGM hardware counters. `dcgmi dmon -i 2 -e 1001,1002,1004,1005`
+     (graphics/SM/tensor/DRAM activity) samples at 100 ms during a second
+     probe. Decode-phase `sm_active` reaches 0.033; after a 0.5 s teardown
+     grace window, 55 post-abort samples have `sm_active` max 0.0 and mean
+     0.0.
+
+   Run:
+
+   ```sh
+   tests/gpu_decode_stop_evidence.sh <repo-checkout-dir>
+   ```
+
+   The verdict gates are in the analyzer and covered by its `selfcheck`
+   subcommand. Raw traces, probes, calibration, DCGM rows, commands,
+   environment, the failed nsys attempts with an explanation, and
+   `SHA256SUMS` are under `/tmp/umminfer-phase6-gpu-evidence/` (not a
+   committed artifact). Text logs are capped at 64 KiB.
+
+### Why not Nsight Systems
+
+External `nsys profile -t cuda,nvtx` was tried first with both the image
+default Nsight Systems 2023.4.4 and a user-space 2026.4.1 (the 2023.4 build
+predates CUDA 13). Both capture model-load kernels and then stop delivering
+every CUPTI event, kernel and runtime API alike, once SGLang's
+multiprocessing-spawn scheduler enters its steady-state event loop at about
+36.6 s. The abort happens later, so those traces contain no decode kernel. A
+minimal spawn + sleep(45) + kernel reproducer traces fully under the same
+nsys, which localizes the failure to the SGLang scheduler runtime under
+external CUPTI injection on the CUDA 13 forward-compat driver (580 user-state
+libcuda on a 535 kernel driver), not to delayed CUDA use or tool age. The two
+nsys reports are retained under `nsys-failed/`. Kineto runs inside the
+scheduler process and is not affected.
 
 Failure injection inside real model compute is measured in section 5f with an
 independent SGLang copy on GPU 3. SGLang 0.5.15's only relevant switch is
@@ -548,9 +603,14 @@ zero-copy device-tensor transfer, or multi-host IPC.
 - Immediate cancellation inside MLX prefill or a model call.
 - CUDA execution and CUDA IPC on this Apple Silicon environment.
 - Production ASR accuracy and generalization: TinyCTC is an inference test model.
-- GPU hardware-counter attribution of a decode stop. The running SGLang servers
-  were started without `--enable-metrics`, so `/metrics` returns 404; `dcgmi` is
-  not installed and `nvidia-smi pmon` reports no per-process SM value on this
-  H20 driver. Evidence is limited to the backend scheduler counter
-  `/v1/loads` and the `finish_reason=abort` frame (section 5e).
+- GPU hardware evidence for a decode stop: **PASS on H20B 2026-11-14** on
+  dedicated GPU 2. A SGLang torch.profiler/Kineto CUPTI trace shows 26 decode
+  steps and 11,573 model CUDA kernels before the abort, then a bounded
+  teardown whose two DECODE spans start about 64.33/64.39 ms after the abort
+  POST and end before the abort frame, then zero kernels for 2.83 s after the
+  frame plus a 0.2 s grace; a parallel DCGM run shows decode `sm_active` up to
+  0.033 and 55 idle post-abort samples. The scheduler counter `/v1/loads` and
+  the `finish_reason=abort` frame remain separate, weaker evidence levels
+  (section 5e). Evidence and SHA256SUMS are under
+  `/tmp/umminfer-phase6-gpu-evidence/`.
 - Full OpenAI Realtime compatibility: that API is not implemented.

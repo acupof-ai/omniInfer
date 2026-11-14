@@ -646,6 +646,30 @@ Evidence, including frames, worker logs, health, input SHA256, commands, env and
 not a committed artifact. SGLang source evidence for caller `rid` and the
 graceful-abort frame is in `backend-code-evidence.txt` in that directory.
 
+### GPU hardware decode-stop evidence, recorded on 2026-11-14
+
+The scheduler counter and the SSE abort frame are not hardware evidence. A
+dedicated GPU 2 and an independent SGLang instance (the shared GPU 0/1
+backends were not touched) carry two hardware instruments, driven by
+`tests/gpu_decode_stop_evidence.sh` and `tests/gpu_abort_evidence.py`:
+
+| Instrument | What it proves | Recorded result |
+| --- | --- | --- |
+| SGLang `torch.profiler` (Kineto via the CUPTI Activity API) | Model CUDA kernel timeline of the scheduler, joined to request id and markers by a monotonic-clock calibration | 26 `step[DECODE]` spans and 11,573 model kernels before the abort (59.85 ms GPU-active); bounded teardown of 1,754 kernels (7.97 ms) whose two DECODE spans start ~64.33/64.39 ms after the abort POST and end before the abort frame; zero CUDA kernels for 2.83 s after the frame plus a 0.2 s grace |
+| `dcgmi dmon -e 1001,1002,1004,1005` at 100 ms | DCGM SM/graphics/tensor/DRAM hardware counters | Decode `sm_active` up to 0.033; after a 0.5 s teardown grace window, 55 post-abort samples with `sm_active` max 0.0, mean 0.0 |
+
+The analyzer prints `HARDWARE_DECODE_STOPPED=True` and
+`DCGM_DECODE_STOPPED=True`; its verdict gates have a stdlib `selfcheck`
+subcommand covering pass and fail cases. External Nsight Systems could not
+record this workload: both 2023.4 and 2026.4.1 stop emitting CUPTI events
+when the spawned scheduler reaches its steady state on the CUDA 13
+forward-compat driver. The failed traces and the reason are kept in
+`nsys-failed/`. Raw traces, probes, calibration, DCGM rows, commands,
+environment and `SHA256SUMS` are under
+`/tmp/umminfer-phase6-gpu-evidence/`; text logs are capped at 64 KiB and the
+directory is not a committed artifact. Details and the three evidence levels
+are in [validation](docs/validation.md#5e-backend-decode-stop-scheduler-sse-and-gpu-hardware-evidence).
+
 ### Realtime streaming and ASR abort, recorded on 2026-11-13
 
 The realtime streaming run added seven cumulative `transcription.segment`

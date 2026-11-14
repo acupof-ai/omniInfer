@@ -74,9 +74,16 @@ route also passed opt-in ASR partials and a VLM-leg GPU abort with SGLang
 `finish_reason=abort`; that evidence is in
 `/tmp/umminfer-phase5-streaming-abort-evidence/`. A later run on 2026-11-14
 added scheduler-counter evidence for that stop: `/v1/loads` reported
-`num_running_reqs` 0 -> 1 -> 0 across 10 aborts. GPU hardware-counter
-attribution remains `NOT_COVERED`, with the reasons in
-[validation](validation.md#5e-backend-decode-stop-and-the-gpu-counter-boundary).
+`num_running_reqs` 0 -> 1 -> 0 across 10 aborts. On 2026-11-14 GPU hardware
+evidence reached `PASS` on dedicated GPU 2: a SGLang torch.profiler/Kineto
+CUPTI trace records 26 decode steps and 11,573 model kernels before the
+abort, a bounded teardown whose two DECODE spans start about 64.33/64.39 ms
+after the abort POST and end before the abort frame, then zero CUDA kernels
+for 2.83 s after the frame, and a
+parallel DCGM run records decode `sm_active` up to 0.033 followed by 55 idle
+post-abort samples. Scheduler counter, SSE frame, and GPU kernel stop are
+three separate evidence levels documented in
+[validation](validation.md#5e-backend-decode-stop-scheduler-sse-and-gpu-hardware-evidence).
 Injection of a real decode NaN passed on 2026-11-14 on dedicated GPU 3: the
 public unified path returned one `error` with the correct stage and
 `in_flight=0`, then recovered. See
