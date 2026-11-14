@@ -231,6 +231,13 @@ algorithm code exists now.
 
 ## Open decisions that block real training
 
+Phase 2 (`rl-phase2.md`) resolved these for the architecture validation with
+one concrete choice each: group-relative REINFORCE, a small real GSM8K slice,
+an exact-match reward, and a GPU-4-pinned separate worker. Business-scale
+versions of the same four decisions (PPO/DPO/GRPO in production, the full
+dataset, a business reward, production compute) remain open and are not
+claimed. The text below is the phase-1 record.
+
 These are user inputs. Phase 1 deliberately does not invent defaults.
 
 1. **Training objective.** PPO, DPO, GRPO or another algorithm is not

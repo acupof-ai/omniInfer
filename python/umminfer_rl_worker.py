@@ -22,6 +22,10 @@ import os
 import sys
 from pathlib import Path
 
+# Some interpreters' -I mode omits the script directory from sys.path; the
+# worker imports the sibling trainer module, so pin the directory explicitly.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 WORKER_PROTOCOL_VERSION = 1
 CHECKPOINT_SCHEMA_VERSION = 1
 
@@ -129,15 +133,22 @@ class CheckpointStore:
         return latest_sequence, previous_hash
 
     def write_checkpoint(self, *, trajectory_path, record_count,
-                         trajectory_sha256, reward_name):
+                         trajectory_sha256, reward_name,
+                         algorithm=None, weights_ref=None,
+                         weights_sha256=None, hyperparameters=None,
+                         metrics=None):
         sequence = self.next_sequence
         manifest = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "worker_protocol_version": WORKER_PROTOCOL_VERSION,
             "sequence": sequence,
-            # Explicit nulls: no algorithm or weights exist in phase 1.
-            "algorithm": None,
-            "weights_ref": None,
+            # Phase 1 leaves algorithm/weights null; a real train_step fills
+            # them. Hyperparameters arrive with the first real algorithm.
+            "algorithm": algorithm,
+            "weights_ref": weights_ref,
+            "weights_sha256": weights_sha256,
+            "hyperparameters": hyperparameters,
+            "metrics": metrics,
             "reward": {"name": reward_name},
             "source": {
                 "trajectory_path": str(trajectory_path),
@@ -171,6 +182,11 @@ class TrainingWorker:
 
     def __init__(self, state_dir):
         self.store = CheckpointStore(state_dir)
+        # The trainer is created on the first train_step and kept resident, so
+        # optimizer state carries across steps. None until a real algorithm
+        # runs; phase-1 ``train`` never touches torch.
+        self._trainer = None
+        self._trainer_key = None
 
     def handle(self, request):
         req_type = request.get("type")
@@ -179,6 +195,8 @@ class TrainingWorker:
                     "worker_protocol_version": WORKER_PROTOCOL_VERSION}
         if req_type == "train":
             return self._handle_train(request)
+        if req_type == "train_step":
+            return self._handle_train_step(request)
         # Unknown fields on known messages are ignored; only an unknown verb
         # is an error, so adding optional fields later needs no version bump.
         return {"type": "error", "task_id": request.get("task_id"),
@@ -203,6 +221,67 @@ class TrainingWorker:
         return {"type": "train_result", "task_id": task_id, "status": "ok",
                 "sequence": sequence, "checkpoint_path": str(path),
                 "worker_protocol_version": WORKER_PROTOCOL_VERSION}
+
+    def _handle_train_step(self, request):
+        """Real RL update: validate the scored export, run one optimizer step.
+
+        The trainer stays resident between requests so optimizer state carries
+        across steps. A config change on a later request is rejected, not
+        silently applied to a trainer built with different hyperparameters.
+        """
+        task_id = request.get("task_id")
+        try:
+            trajectory_path = request["trajectory_path"]
+            model_path = request["model_path"]
+            hyperparameters = dict(request.get("hyperparameters") or {})
+            records = validate_trajectory(trajectory_path)
+            self._require_scores(records)
+            reward_name = _reward_name(records)
+            trainer_key = (model_path, json.dumps(
+                hyperparameters, sort_keys=True))
+            if self._trainer is None:
+                from umminfer_rl_train import ReinforceTrainer
+                self._trainer = ReinforceTrainer(model_path, **hyperparameters)
+                self._trainer_key = trainer_key
+            elif self._trainer_key != trainer_key:
+                raise ValueError(
+                    "trainer config is fixed for this state directory; "
+                    "open a new one for different model/hyperparameters")
+            metrics = self._trainer.train_step(records)
+            sequence = self.store.next_sequence
+            weights_path = (Path(self.store.checkpoint_dir.parent)
+                            / "weights" / f"weights-{sequence:08d}.pt")
+            weights_path.parent.mkdir(parents=True, exist_ok=True)
+            self._trainer.save_weights(weights_path)
+            sequence, path = self.store.write_checkpoint(
+                trajectory_path=trajectory_path,
+                record_count=len(records),
+                trajectory_sha256=sha256_file(trajectory_path),
+                reward_name=reward_name,
+                algorithm=self._trainer.config["algorithm"],
+                weights_ref=str(weights_path),
+                weights_sha256=sha256_file(weights_path),
+                hyperparameters=self._trainer.config,
+                metrics=metrics)
+        except KeyError as exc:
+            return {"type": "error", "task_id": task_id,
+                    "error": f"missing field: {exc.args[0]}"}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError,
+                RuntimeError, ImportError) as exc:
+            return {"type": "error", "task_id": task_id, "error": str(exc)}
+        return {"type": "train_step_result", "task_id": task_id,
+                "status": "ok", "sequence": sequence,
+                "checkpoint_path": str(path),
+                "weights_path": str(weights_path), "metrics": metrics,
+                "worker_protocol_version": WORKER_PROTOCOL_VERSION}
+
+    @staticmethod
+    def _require_scores(records):
+        for index, record in enumerate(records):
+            block = record.get("reward")
+            if not isinstance(block, dict) or block.get("score") is None:
+                raise ValueError(
+                    f"record {index}: train_step needs a numeric reward score")
 
 
 def main(argv=None):

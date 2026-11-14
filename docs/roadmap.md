@@ -303,6 +303,16 @@ learning, without putting training inside the serving process.
 | Isolation | Training load does not degrade serving latency in the measured window, or the degradation is measured and reported. |
 | No unverified claim | No phase claims an RL result that has not run on real models and recorded hardware. |
 
+**Phase 6 step 2 — real optimizer-step validation (2026-11-14).** The
+architecture above was exercised end to end on H20B GPU 4 with a real
+0.5B causal LM, real GSM8K rollouts, a verifiable exact-match reward, and
+real REINFORCE/AdamW updates in the separate worker process. Non-zero
+gradients, measured weight deltas, two hash-chained checkpoints and
+before/after evaluation are recorded as evidence. This validates the
+training architecture; it is not a business model-training result. Scope,
+limits and the replay precision boundary are in
+[rl-phase2](rl-phase2.md).
+
 ## Model support plan
 
 These entries are not current deliverables. Their acceptance procedure,

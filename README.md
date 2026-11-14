@@ -158,6 +158,7 @@ shared-memory relay; it carries inline data in ZeroMQ messages.
 | Optional multi-turn session history | `serve --session-history`, request `session_history=true` | Real H20B two-turn, cancel/error exclusion, and default-off validation passed 2026-11-14; evidence in `/tmp/umminfer-phase5-final-h20b-evidence/live/` |
 | Unified multimodal end-to-end acceptance | `chat --audio`, `/v1/chat/completions` | Real joint image+audio, same-session reuse, cancel, failure, and recovery verified on H20B; full Phase 2/3 gates `NOT_COVERED` |
 | H20B verification | Two SGLang workers | Accessible; Qwen ASR GPU 1 and Qwen Omni GPU 0 verified; CUDA build, IPC, sanitizer, and stress verified 2026-11-14 on GPUs 2 and 3 |
+| Real RL optimizer-step validation | `umminfer_rl_*.py` | Real Qwen2.5-0.5B rollouts on GSM8K, verifiable exact-match reward, separate-worker REINFORCE AdamW steps, non-zero gradients and weight deltas, two hash-chained checkpoints; architecture validation only, not business training; see [rl-phase2](docs/rl-phase2.md) |
 
 TinyCTC has deterministic initialized weights; it is not a speech recognizer.
 The MLX-LM chat path is text-only inference, not a VLM. The Mac and H20B
@@ -944,5 +945,5 @@ tests/{mlx_smoke.py,mlx_stage_test.py,mlx_*_perf.py,client_benchmark.py}
 tests/{qwen_omni_live.py,h3_live.py,h3_image_live.py,live_common.py}
 tests/rl_architecture_test.py
 tests/tla/{RequestLifecycle.tla,RequestLifecycle.cfg}
-docs/{cuda-ipc.md,external_stage.md,mlx.md,client.md,roadmap.md,validation.md,rl.md}
+docs/{cuda-ipc.md,external_stage.md,mlx.md,client.md,roadmap.md,validation.md,rl.md,rl-phase2.md}
 ```
