@@ -75,10 +75,14 @@ route also passed opt-in ASR partials and a VLM-leg GPU abort with SGLang
 `/tmp/umminfer-phase5-streaming-abort-evidence/`. A later run on 2026-11-14
 added scheduler-counter evidence for that stop: `/v1/loads` reported
 `num_running_reqs` 0 -> 1 -> 0 across 10 aborts. GPU hardware-counter
-attribution and injection of a failure inside real model compute remain
-`NOT_COVERED`, with the reasons in
-[validation](validation.md#5e-backend-decode-stop-and-the-gpu-counter-boundary);
-the Mac unified profile is also `NOT_COVERED`. Model
+attribution remains `NOT_COVERED`, with the reasons in
+[validation](validation.md#5e-backend-decode-stop-and-the-gpu-counter-boundary).
+Injection of a real decode NaN passed on 2026-11-14 on dedicated GPU 3: the
+public unified path returned one `error` with the correct stage and
+`in_flight=0`, then recovered. See
+[validation 5f](validation.md#5f-real-model-compute-nan-failure-recorded-on-2026-11-14)
+and `/tmp/umminfer-phase6-compute-failure-evidence/`.
+The Mac unified profile is also `NOT_COVERED`. Model
 revisions are `UNKNOWN`; weights hashes, full resource attribution, and output
 reproducibility are not a complete Phase 3 record. CUDA build, IPC, sanitizer,
 and stress ran separately on H20B on 2026-11-14 and passed on dedicated GPUs 2

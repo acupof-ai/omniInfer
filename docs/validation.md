@@ -441,14 +441,67 @@ so `/metrics` returns 404. `dcgmi` is not installed, and `nvidia-smi pmon` on
 this H20 driver reports `-` for the per-process SM column. GPU-counter-level
 attribution of the decode stop is therefore `NOT_COVERED`.
 
-Failure injection inside real model compute is also `NOT_COVERED`. SGLang
-0.5.15's only relevant switch is `enable_nan_detection`, off by default; its
-sampler replaces NaN logits with -1e5 or raises when `crash_on_warnings()` is
-set (`python/sglang/srt/layers/sampler.py`). It is a detector, not an injector.
-The source has no `inject_fault`/`force_nan` hook. Enabling it or causing a CUDA
-fault would require restarting or patching the shared backends, which this run
-does not do. A request that fails because the VLM cannot fetch its image is a
-request-level error, not an internal compute fault, and is not counted here.
+Failure injection inside real model compute is measured in section 5f with an
+independent SGLang copy on GPU 3. SGLang 0.5.15's only relevant switch is
+`enable_nan_detection`, off by default; its sampler replaces NaN logits with
+-1e5 or raises when `crash_on_warnings()` is set
+(`python/sglang/srt/layers/sampler.py`). It is a detector, not an injector, so
+the copy adds a decode-time activation corruption and lets the real sampler
+detect it. The shared backends on GPUs 0 and 1 stay unmodified.
+
+## 5f. Real model-compute NaN failure, recorded on 2026-11-14
+
+`tests/unified_compute_failure_live.py` drives one fault leg through the public
+unified HTTP/SSE path. `tests/sglang_nan_injection.py` patches a copy of
+SGLang 0.5.15 (`/sgl-workspace/sglang`) at
+`srt/layers/logits_processor.py`. On the first decode forward after the trigger
+file exists, the copy multiplies the final hidden states by NaN on the GPU, so
+the real LM-head matmul produces NaN logits. The copy runs on GPU 3 with
+`--enable-nan-detection`, `SGLANG_IS_IN_CI=1` (which makes `crash_on_warnings()`
+raise), and `--disable-cuda-graph`: CUDA graph replay skips the Python logits
+path.
+
+The server is the ReleaseFast binary; both workers are the committed Python
+scripts. All three come from c8ce8a2. The ASR backend is port 43100 for the ASR
+leg; the Omni backend is port 43101 for the VLM leg. The other leg uses the unmodified shared backend on
+31000/31001.
+
+```sh
+UMMINFER_LIVE_OPT_IN=1 python3 -I tests/unified_compute_failure_live.py \
+  --leg asr --backend-port 43100 --other-backend http://127.0.0.1:31001 \
+  --server ./zig-out/bin/umm-infer --repo . --audio asr_zh.wav \
+  --image man_ironing.png --evidence-dir /tmp/phase6-asr
+```
+
+| Check | ASR leg | VLM leg |
+| --- | --- | --- |
+| Injection point | `(1, 1024) bfloat16 cuda:0` | `(1, 2048) bfloat16 cuda:0` |
+| SGLang detector | `Detected errors during sampling! NaN in the logits.` then `ValueError` | same |
+| Scheduler | `Scheduler hit an exception` traceback at `sampler.py:89` | same |
+| Backend exit | exited on its own after the traceback | same |
+| Public terminal | exactly one `error`, `stage=asr`, seq 0 | `asr_final` seq 0, then one `error`, `stage=vlm`, seq 1 |
+| Success events | no `asr_final`, `asr_partial`, `vlm_delta`, `complete` | no `vlm_delta`, no `complete` |
+| `in_flight` after fault | 0 | 0 |
+| Recovery | restart the same copy without a trigger; one `complete`; `in_flight=0` | same |
+
+The error frame is `{"error":{"code":500,"message":"Remote end closed connection
+without response","type":"generation_error"}}`. The public server stayed up
+across both legs. Only the fault backend restarted for recovery.
+
+All checks pass: 16 in the ASR leg and 17 in the VLM leg (the VLM leg also
+asserts that the healthy ASR final is present). Each `result.json` records
+`passed=true`.
+
+Evidence: `/tmp/umminfer-phase6-compute-failure-evidence/` with per-leg
+`result.json`, raw SSE for baseline/fault/recovery, capped backend and worker
+logs (each at most 64 KiB), `environment.txt`, and `SHA256SUMS`. The copy's
+patch is `logits_processor.patch`; the injection tool is committed as
+`tests/sglang_nan_injection.py`. The evidence directory is not a committed
+artifact.
+
+This covers a NaN produced inside the real decode path and detected by SGLang's
+own sampler. It does not cover a CUDA hardware fault, a NaN in a tensor that
+sampling never reads, or a fault that leaves the backend alive.
 
 ## 8. CUDA build, IPC, sanitizer and stress on H20B
 
@@ -500,8 +553,4 @@ zero-copy device-tensor transfer, or multi-host IPC.
   not installed and `nvidia-smi pmon` reports no per-process SM value on this
   H20 driver. Evidence is limited to the backend scheduler counter
   `/v1/loads` and the `finish_reason=abort` frame (section 5e).
-- Injection of a failure inside real model compute. SGLang has only a NaN
-  detector (`enable_nan_detection`, off by default) and no documented injection
-  hook. Enabling it or forcing a CUDA fault would require restarting or
-  patching the shared backends, which is outside this run's scope (section 5e).
 - Full OpenAI Realtime compatibility: that API is not implemented.

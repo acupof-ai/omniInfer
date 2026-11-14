@@ -621,10 +621,10 @@ tests cover both cases and the cancellation test fails on the pre-fix source.
 
 Recorded evidence is under `/tmp/umminfer-phase4-cancel-failure-evidence/`
 (`results/`, `workers/`, `server/`, `backend/`, `tests/`, `SHA256SUMS`); it is
-not a committed artifact. Still `NOT_COVERED`: an SGLang-side abort line (this
-backend logs none), GPU-level confirmation that decode stopped, and a failure
-inside model compute rather than loss of the backend process. Both model
-revisions remain `UNKNOWN`.
+not a committed artifact. `NOT_COVERED` for that run: an SGLang-side abort line
+(this backend logs none) and GPU-level confirmation that decode stopped. A real
+decode NaN failure inside model compute passed later on 2026-11-14 (see the
+section below). Both model revisions remain `UNKNOWN`.
 
 ### Unified ASR partials and VLM abort, recorded on 2026-11-13
 
@@ -658,12 +658,29 @@ request succeeded. Functional evidence is under
 teardown regression matrix is under
 `/tmp/umminfer-phase4-streaming-supervisor/rework/`.
 
-These cases remain `NOT_COVERED`: a model-compute failure distinct from backend
-loss, an SGLang-side abort log line (this backend logs none), and GPU-level
-confirmation that decode stopped. Both model revisions remain `UNKNOWN`.
+These cases remain `NOT_COVERED`: an SGLang-side abort log line (this backend
+logs none) and GPU-level confirmation that decode stopped. Both model revisions
+remain `UNKNOWN`.
 Audio-only evidence does not complete every Phase 2 or Phase 3 gate.
 ASR partials through the unified chat route and VLM/Omni GPU abort confirmation
 are covered by the unified run above.
+
+### Real model-compute NaN failure, recorded on 2026-11-14
+
+`tests/unified_compute_failure_live.py` injected NaN into a real decode step of
+an independent SGLang copy on dedicated GPU 3. `tests/sglang_nan_injection.py`
+corrupts the final hidden states before the LM head; the real matmul then emits
+NaN logits, and SGLang's own sampler raises with `--enable-nan-detection` and
+`--disable-cuda-graph`. The shared backends on GPUs 0 and 1 were not touched.
+
+| Case | Result |
+| --- | --- |
+| ASR leg | one `error`, `stage=asr`, no `asr_final`/`vlm_delta`/`complete`, `in_flight=0`; backend log `PHASE6_NAN_INJECT ... (1, 1024)` then `Detected errors during sampling! NaN in the logits.` |
+| VLM leg | one `asr_final`, then one `error`, `stage=vlm`, no `vlm_delta`/`complete`, `in_flight=0`; backend log `PHASE6_NAN_INJECT ... (1, 2048)` then the same detector line |
+| Recovery | the same copy restarted with no trigger completed with `in_flight=0` in both legs |
+
+Evidence is under `/tmp/umminfer-phase6-compute-failure-evidence/`, with raw SSE,
+capped backend logs, health, commands, and `SHA256SUMS`.
 
 ## Run the audio test pipeline
 
